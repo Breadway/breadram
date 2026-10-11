@@ -81,12 +81,68 @@ timeout, bounded retries with exponential backoff, a response size limit, and a
 circuit breaker that opens after repeated failures and fails fast, so a dead
 endpoint is not hammered. TLS and socket handling belong to the `Transport`.
 
-**An operation states its effect and its confirmation.** `AdapterOperation`
-carries `expected_host_ram_delta` and `expected_device_ram_delta`, whether it is
-reversible, and a read-only `Confirmation`. Policy uses the delta: an operation
-expected to raise host memory is refused while the host is pressured, which is
-exactly why a provider offload (sleep) is not chosen under host pressure even
-when the provider supports it.
+**An operation states its effect, its consequence, and its confirmation.**
+`AdapterOperation` carries `expected_host_ram_delta` and
+`expected_device_ram_delta`, whether it is reversible, a `note`, and a read-only
+`Confirmation`. Policy uses the delta: an operation expected to raise host memory
+is refused while the host is pressured, which is exactly why a provider offload
+(sleep) is not chosen under host pressure even when the provider supports it. The
+`note` is what a person is told: a release that costs a cold start, or an offload
+that moves memory rather than freeing it, is never reported as free.
+
+**A confirmation must check something.** `Confirmation::contains` requires a
+substring to appear and `Confirmation::absent` requires one to be gone, so an
+effect that is the *disappearance* of something is expressible. A confirmation
+that checks neither is never a success, because an unverifiable check cannot
+establish that the operation took effect.
+
+## The Ollama adapter
+
+`breadram-core/src/adapter/ollama.rs` is the reference implementation for a
+model server, and the shape another runtime should copy. It talks to one
+configured endpoint and can produce exactly three URLs:
+
+| Purpose | Request |
+| --- | --- |
+| Inventory | `GET /api/ps` |
+| Diagnostics | `GET /api/version` |
+| Release | `POST /api/generate` with `{"model": ..., "keep_alive": 0}` |
+
+It never pulls a model, deletes a model file, or calls an inference endpoint.
+That is a property of the code rather than a promise: those three paths are the
+only ones it can build.
+
+**Version support is behavioural.** A build is supported when `/api/ps` answers
+with a parseable body; one that does not is reported unsupported with the reason.
+The reported version is kept for diagnostics, since a version number is not what
+decides whether the inventory works.
+
+**Memory is reported in two parts.** Each loaded model reports its total size and
+the part held in device memory. The difference is reported as model bytes on the
+host, never as host RAM usage: a memory-mapped model shares its pages with the
+page cache, so its file size is not the memory it costs.
+
+**Being loaded is not being idle.** A listed model is always `Active`, whatever
+its reported expiry says, because a model that is loaded can still be serving a
+long request. Idleness comes from the serving coordination contract: either an
+empty model list observed continuously, or complete request tracking through
+`begin_request`/`end_request`/`cancel_request`, in which case a resident but
+unused model is idle and that is exactly the state worth relieving.
+
+**Keep-alive policy is preserved.** A model is released only when it is not
+operator-pinned *and* the reported expiry reads as an ordinary keep-alive. No
+reported expiry, an expiry that does not parse, and a residency beyond
+`DEFAULT_MAX_BOUNDED_KEEP_ALIVE_MS` are all treated as a policy choice to keep
+the model loaded. `release_refusals()` names the reason for each one so a model
+left in memory is explained rather than skipped in silence, and
+`with_max_bounded_keep_alive` moves the horizon for a deployment that really does
+want to release a long-keep-alive model.
+
+This is the one place an adapter reads a wall clock, because a service expresses
+an expiry in wall-clock time. Everything that decides whether inference is
+happening uses monotonic milliseconds supplied by the caller, and
+`with_reference_time` exists so a test can fix the instant the policy is read
+against.
 
 ## Adding a runtime
 
@@ -98,3 +154,6 @@ when the provider supports it.
    `AdapterCapability` and bump `CAPABILITY_PROBE_VERSION`; policy does not change.
 4. Provide a `Transport` for the real endpoint. `ScriptedTransport` covers tests
    and `RecordingSleeper` lets you assert the backoff without waiting.
+5. State what a release costs in the operation's `note`, and make the evidence
+   for it provable to a reader: `adapter::ollama` and `adapter::mock` are the two
+   worked examples, and every rule above has a test that pins it.

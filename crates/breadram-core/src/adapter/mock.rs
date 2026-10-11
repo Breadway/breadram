@@ -139,10 +139,11 @@ impl WorkloadAdapter for MockAdapter {
                     expected_host_ram_delta: -(self.host_ram_bytes as i64),
                     expected_device_ram_delta: 0,
                     reversible: true,
-                    confirmation: Confirmation {
-                        request: ProbeRequest::get(format!("{url}/status")),
-                        expect_body_contains: "unloaded".to_string(),
-                    },
+                    note: "the mock frees nothing of its own; its effect is simulated".to_string(),
+                    confirmation: Confirmation::contains(
+                        ProbeRequest::get(format!("{url}/status")),
+                        "unloaded",
+                    ),
                 })
             }
             ActionKind::SleepModel if self.capabilities.supports(AdapterCapability::SleepModel) => {
@@ -159,10 +160,11 @@ impl WorkloadAdapter for MockAdapter {
                     expected_host_ram_delta: self.device_ram_bytes as i64,
                     expected_device_ram_delta: -(self.device_ram_bytes as i64),
                     reversible: true,
-                    confirmation: Confirmation {
-                        request: ProbeRequest::get(format!("{url}/status")),
-                        expect_body_contains: "sleeping".to_string(),
-                    },
+                    note: "the mock moves nothing; a real offload trades device memory for host memory".to_string(),
+                    confirmation: Confirmation::contains(
+                        ProbeRequest::get(format!("{url}/status")),
+                        "sleeping",
+                    ),
                 })
             }
             _ => None,
@@ -234,7 +236,12 @@ mod tests {
         assert!(operation.expected_host_ram_delta < 0);
         assert!(operation.reversible);
         assert_eq!(operation.request.method, OperationMethod::Post);
-        assert_eq!(operation.confirmation.expect_body_contains, "unloaded");
+        assert_eq!(
+            operation.confirmation.expect_body_contains.as_deref(),
+            Some("unloaded")
+        );
+        assert!(operation.confirmation.confirms(r#"{"status":"unloaded"}"#));
+        assert!(!operation.confirmation.confirms(r#"{"status":"loaded"}"#));
     }
 
     #[test]

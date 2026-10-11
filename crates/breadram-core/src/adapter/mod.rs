@@ -26,10 +26,12 @@
 
 pub mod capability;
 pub mod mock;
+pub mod ollama;
 pub mod probe;
 
 pub use capability::{AdapterCapabilities, AdapterCapability, CAPABILITY_PROBE_VERSION};
 pub use mock::MockAdapter;
+pub use ollama::{LoadedModel, OllamaAdapter, OllamaError, GENERATE_PATH, PS_PATH, VERSION_PATH};
 pub use probe::{
     classify, is_encrypted_or_loopback, Auth, CircuitConfig, Method, NoSleep, ProbeClient,
     ProbeError, ProbeRequest, RecordingSleeper, Redacted, Response, ScriptedTransport, Sleeper,
@@ -104,9 +106,54 @@ impl OperationRequest {
 pub struct Confirmation {
     /// A read-only probe, never a write.
     pub request: ProbeRequest,
-    /// A substring that must appear in the confirming response for the
-    /// operation to count as effective.
-    pub expect_body_contains: String,
+    /// A substring that must appear for the operation to count as effective.
+    pub expect_body_contains: Option<String>,
+    /// A substring that must **not** appear for the operation to count as
+    /// effective.
+    ///
+    /// Some effects are the absence of something: an unloaded model is
+    /// confirmed by the model no longer being listed, not by a phrase appearing.
+    /// A confirmation that checks neither is refused as unverifiable rather than
+    /// treated as successful.
+    pub expect_body_absent: Option<String>,
+}
+
+impl Confirmation {
+    /// A confirmation that requires a substring to appear.
+    pub fn contains(request: ProbeRequest, expected: impl Into<String>) -> Self {
+        Self {
+            request,
+            expect_body_contains: Some(expected.into()),
+            expect_body_absent: None,
+        }
+    }
+
+    /// A confirmation that requires a substring to be gone.
+    pub fn absent(request: ProbeRequest, unexpected: impl Into<String>) -> Self {
+        Self {
+            request,
+            expect_body_contains: None,
+            expect_body_absent: Some(unexpected.into()),
+        }
+    }
+
+    /// Whether a response body confirms the effect.
+    ///
+    /// An unverifiable confirmation, one that checks nothing, is never a
+    /// success.
+    pub fn confirms(&self, body: &str) -> bool {
+        match (&self.expect_body_contains, &self.expect_body_absent) {
+            (None, None) => false,
+            (contains, absent) => {
+                contains
+                    .as_ref()
+                    .is_none_or(|expected| body.contains(expected.as_str()))
+                    && absent
+                        .as_ref()
+                        .is_none_or(|unexpected| !body.contains(unexpected.as_str()))
+            }
+        }
+    }
 }
 
 /// A resource an adapter manages.
@@ -135,6 +182,13 @@ pub struct AdapterOperation {
     pub expected_device_ram_delta: i64,
     /// Whether the operation can be undone by the adapter.
     pub reversible: bool,
+    /// What a person should be told about performing it.
+    ///
+    /// A release is never free: unloading a model means the next request that
+    /// uses it pays a cold start, and a provider sleep means memory moves to the
+    /// host rather than disappearing. Stating that here keeps the consequence in
+    /// the operation instead of leaving an explanation to invent it.
+    pub note: String,
     /// How to check that it worked.
     pub confirmation: Confirmation,
 }
