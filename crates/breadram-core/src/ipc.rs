@@ -30,8 +30,9 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// Minor protocol version. Backward compatible additions bump this.
 ///
 /// 2 adds the swap and OOM diagnostic section and the per workload swap limits
-/// to the diagnostics report. Nothing was removed or renumbered.
-pub const PROTOCOL_MINOR: u16 = 2;
+/// to the diagnostics report. 3 adds the bounded trend samples. 4 adds the
+/// growth report paired with recorded relief. Nothing was removed or renumbered.
+pub const PROTOCOL_MINOR: u16 = 4;
 
 /// The largest single message, in bytes. Oversized messages are rejected.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -506,6 +507,13 @@ pub struct DiagnosticsPayload {
     /// The effective swap limit of each workload breadram can control.
     #[serde(default)]
     pub workload_swap: Vec<WorkloadSwap>,
+    /// Bounded numeric memory samples. Keys are daemon-local, not scope names.
+    #[serde(default)]
+    pub trends: Vec<crate::trends::TrendSample>,
+    /// One sustained-growth judgement per retained workload, paired with the
+    /// measured relief recorded for the same target.
+    #[serde(default)]
+    pub growth: Vec<crate::trends::GrowthReport>,
     /// Anything a human should know when reading this report.
     pub notes: Vec<String>,
 }
@@ -969,7 +977,7 @@ mod tests {
         // older minor must still be able to read a report from this build, and a
         // report written before the addition must still decode here, which is why
         // the fields are defaulted rather than required.
-        assert_eq!(PROTOCOL_MINOR, 2);
+        assert_eq!(PROTOCOL_MINOR, 4);
         let older = r#"{
             "mode": "monitor",
             "version": "0.1.0",

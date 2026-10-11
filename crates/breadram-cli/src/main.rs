@@ -22,6 +22,7 @@ use breadram_core::ipc::{
     EventPayload, PlanPayload, RulesPayload, StatusPayload, WorkloadsPayload,
 };
 use breadram_core::telemetry::{SwapKind, SwapLayout, WorkloadSwap};
+use breadram_core::trends::{Growth, GrowthReport};
 use breadram_core::{CapabilityReport, ManagementMode};
 use clap::{Parser, Subcommand};
 
@@ -80,6 +81,8 @@ enum Command {
     Actions,
     /// Show a diagnostic bundle for a bug report.
     Diagnostics,
+    /// Export bounded numeric workload memory samples from the daemon.
+    Trends,
     /// Change the management mode.
     Mode {
         /// The mode to switch to: monitor or automatic.
@@ -207,6 +210,17 @@ async fn run(cli: &Cli, socket: &Path) -> Result<(), CliError> {
         Command::Diagnostics => {
             let diagnostics = client.diagnostics().await?;
             emit(cli.json, &diagnostics, human_diagnostics)
+        }
+        Command::Trends => {
+            let diagnostics = client.diagnostics().await?;
+            if cli.json {
+                print_json(&diagnostics.trends)
+            } else {
+                print(format!(
+                    "{} memory samples retained; use --json for numeric export. Target keys are daemon-local; growth is not a leak verdict.",
+                    diagnostics.trends.len()
+                ))
+            }
         }
         Command::Mode { persist, .. } => {
             let mode = mode.expect("the mode was parsed before the socket was opened");
@@ -656,6 +670,7 @@ fn human_diagnostics(diagnostics: &DiagnosticsPayload) -> String {
     ];
     lines.extend(human_swap(&diagnostics.swap));
     lines.extend(human_workload_swap(&diagnostics.workload_swap));
+    lines.extend(human_growth(&diagnostics.growth));
     lines.extend(human_capabilities(&diagnostics.capabilities));
     if !memory.notes.is_empty() {
         lines.push("memory notes:".to_string());
@@ -666,6 +681,36 @@ fn human_diagnostics(diagnostics: &DiagnosticsPayload) -> String {
         lines.extend(diagnostics.notes.iter().map(|note| format!("  {note}")));
     }
     lines.join("\n")
+}
+
+fn human_growth(growth: &[GrowthReport]) -> Vec<String> {
+    if growth.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("growth:     {} workload series", growth.len())];
+    for report in growth {
+        let verdict = match &report.growth {
+            Growth::Sustained {
+                increase_bytes,
+                interval_ms,
+                measured,
+            } => format!(
+                "sustained +{} over {} ms ({})",
+                human_bytes(*increase_bytes),
+                interval_ms,
+                if *measured { "measured" } else { "estimated" }
+            ),
+            Growth::NotSustained => "not sustained".to_string(),
+            Growth::Unknown => "unknown".to_string(),
+        };
+        lines.push(format!(
+            "  series {:#018x}: {} (recorded relief {})",
+            report.target_key,
+            verdict,
+            human_delta(report.recorded_relief_bytes)
+        ));
+    }
+    lines
 }
 
 fn human_applied(applied: &AppliedPayload) -> String {
