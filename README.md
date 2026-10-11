@@ -20,10 +20,12 @@ does not change system state. `automatic` mode is opt in.
 
 ## Current state
 
-This repository is at RAM-1, the project contract and workspace bootstrap. The
-daemon and CLI build and run, but they are bootstrap binaries: they parse
-arguments, print the contract, and exit. Telemetry, workload identity, the
-daemon lifecycle and IPC, and configuration land in RAM-2 through RAM-5.
+The M1 foundation is implemented: telemetry, workload inventory, validated
+configuration, and the daemon with its versioned local IPC. The daemon monitors
+memory and workloads and serves a status snapshot over an owner only Unix
+socket; the CLI reads it. Pressure policy, controls, model adapters, job
+admission, and desktop integration are still to come, so the daemon currently
+observes and reports rather than acting.
 
 ## Compatibility limits
 
@@ -46,9 +48,15 @@ cargo build --workspace
 Run the daemon and client:
 
 ```
-cargo run -p breadramd -- --mode monitor
+cargo run -p breadramd -- --mode monitor          # or --profile desktop
 cargo run -p breadram-cli -- status
+cargo run -p breadram-cli -- --json capabilities
+cargo run -p breadram-cli -- watch
 ```
+
+The daemon listens on `$XDG_RUNTIME_DIR/breadram.sock` unless `--socket` is
+given, and the socket is owner only. `breadram` exits 0 on success, 1 when the
+daemon is unavailable or returns an error, and 2 for a usage error.
 
 ## Layout
 
