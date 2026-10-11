@@ -74,15 +74,26 @@ impl RuleMatch {
 }
 
 /// A workload's scheduling priority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
     /// First to yield under pressure.
     Background,
     /// The default.
+    #[default]
     Normal,
     /// Last to yield, and shielded from automatic action.
     Protected,
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Priority::Background => "background",
+            Priority::Normal => "normal",
+            Priority::Protected => "protected",
+        })
+    }
 }
 
 /// A named rule.
@@ -126,6 +137,97 @@ pub fn resolve_priority(rules: &[Rule], workload: &Workload) -> Priority {
     select_rule(rules, workload).map_or(Priority::Normal, |rule| rule.priority)
 }
 
+/// Explain priority without treating a missing focus hint as idle evidence.
+pub fn priority_with_source(
+    rules: &[Rule],
+    workload: &Workload,
+    active_hint: Option<&str>,
+    serves_protected: bool,
+) -> (Priority, String) {
+    if let Some(rule) = select_rule(rules, workload) {
+        return (rule.priority, format!("explicit rule {}", rule.name));
+    }
+    if serves_protected {
+        return (
+            Priority::Protected,
+            "dependency of a protected workload".into(),
+        );
+    }
+    if let Some(hint) = active_hint {
+        return (Priority::Protected, format!("active workload hint: {hint}"));
+    }
+    (
+        Priority::Normal,
+        "standalone default; missing activity is not idle".into(),
+    )
+}
+
+/// Promotion is immediate for safety; demotion waits for stable absence.
+/// Clock reversal resets the wait rather than manufacturing elapsed time.
+#[derive(Default)]
+pub struct HintDebouncer {
+    active: bool,
+    absent_since_ms: Option<u64>,
+}
+impl HintDebouncer {
+    pub fn update(&mut self, observed_active: bool, now_ms: u64, dwell_ms: u64) -> bool {
+        if observed_active {
+            self.active = true;
+            self.absent_since_ms = None;
+        } else if self.active {
+            let since = self.absent_since_ms.get_or_insert(now_ms);
+            if now_ms < *since {
+                *since = now_ms;
+            }
+            if now_ms.saturating_sub(*since) >= dwell_ms {
+                self.active = false;
+                self.absent_since_ms = None;
+            }
+        }
+        self.active
+    }
+
+    /// Whether the hint is currently held active.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+/// Per-scope debounced activity hints for the whole host.
+///
+/// Promotion is immediate, so work that starts is never reclaimed; demotion
+/// waits for stable absence, so one missing reading cannot demote a workload and
+/// then re-promote it, which would oscillate reclaim and reload.
+#[derive(Default)]
+pub struct HintState {
+    per_scope: std::collections::BTreeMap<String, HintDebouncer>,
+}
+
+impl HintState {
+    /// Fold one observation into the hint for a scope and report whether it is
+    /// active now.
+    pub fn update(
+        &mut self,
+        scope: &str,
+        observed_active: bool,
+        now_ms: u64,
+        dwell_ms: u64,
+    ) -> bool {
+        self.per_scope.entry(scope.to_string()).or_default().update(
+            observed_active,
+            now_ms,
+            dwell_ms,
+        )
+    }
+
+    /// Whether the scope is currently held active.
+    pub fn is_active(&self, scope: &str) -> bool {
+        self.per_scope
+            .get(scope)
+            .is_some_and(HintDebouncer::is_active)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +255,41 @@ mod tests {
             priority,
             budget_bytes: None,
         }
+    }
+
+    #[test]
+    fn explicit_rule_overrides_activity_and_dependencies() {
+        let w = workload("app", "unit:app.service");
+        let rules = vec![rule(
+            "user",
+            RuleMatch::Scope {
+                value: w.id.scope.clone(),
+            },
+            Priority::Background,
+        )];
+        assert_eq!(
+            priority_with_source(&rules, &w, Some("audio"), true).0,
+            Priority::Background
+        );
+        assert_eq!(
+            priority_with_source(&[], &w, None, true).0,
+            Priority::Protected
+        );
+        assert_eq!(
+            priority_with_source(&[], &w, None, false).0,
+            Priority::Normal
+        );
+    }
+    #[test]
+    fn rapid_focus_changes_cannot_demote_and_backwards_clock_restarts_wait() {
+        let mut hints = HintDebouncer::default();
+        assert!(hints.update(true, 100, 50));
+        assert!(hints.update(false, 110, 50));
+        assert!(hints.update(true, 120, 50));
+        assert!(hints.update(false, 130, 50));
+        assert!(hints.update(false, 10, 50));
+        assert!(hints.update(false, 59, 50));
+        assert!(!hints.update(false, 60, 50));
     }
 
     #[test]
@@ -224,5 +361,18 @@ mod tests {
         )];
         assert!(select_rule(&rules, &workload("app.service", "unit:app.service")).is_some());
         assert!(select_rule(&rules, &workload("app.service", "unit:other.service")).is_none());
+    }
+
+    #[test]
+    fn a_hint_promotes_at_once_and_demotes_only_after_stable_absence() {
+        let mut hints = HintState::default();
+        assert!(hints.update("exe:build", true, 100, 50));
+        assert!(hints.is_active("exe:build"));
+        // One quiet reading does not demote, so a missing sample cannot oscillate.
+        assert!(hints.update("exe:build", false, 110, 50));
+        assert!(hints.is_active("exe:build"));
+        // Stable absence demotes.
+        assert!(!hints.update("exe:build", false, 160, 50));
+        assert!(!hints.is_active("exe:build"));
     }
 }

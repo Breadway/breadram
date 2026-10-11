@@ -19,9 +19,11 @@
 //! 4. It must not be cooling down, rate limited, or already known to be
 //!    ineffective against this target.
 
-use crate::config::{resolve_priority, select_rule, ActionKind, Config, Priority};
+use crate::config::{
+    priority_with_source, resolve_priority, select_rule, ActionKind, Config, Priority,
+};
 use crate::inventory::{ControlLevel, Workload, WorkloadId};
-use crate::policy::activity::ActivitySource;
+use crate::policy::activity::{ActivityEvidence, ActivitySource};
 use crate::policy::history::PolicyHistory;
 use crate::policy::state::PressureState;
 use crate::telemetry::MemorySnapshot;
@@ -137,7 +139,7 @@ pub fn plan(input: PlannerInput<'_>, channel: PlanChannel) -> Plan {
     };
 
     let mut actions: Vec<PlannedAction> = Vec::new();
-    for workload in ordered_candidates(workloads, config) {
+    for workload in ordered_candidates(workloads, config, activity) {
         if actions.len() >= max_actions {
             explanation.push(format!(
                 "escalation bound of {max_actions} actions reached for {state}"
@@ -145,6 +147,22 @@ pub fn plan(input: PlannerInput<'_>, channel: PlanChannel) -> Plan {
             break;
         }
         let scope = workload.id.scope.clone();
+
+        // A live activity hint protects the workload even without a rule: work
+        // that is actually running must not be reclaimed, and the reason is
+        // explained rather than silently dropped.
+        let (effective, source) = explain_priority(
+            config,
+            workload,
+            activity,
+            serves_protected(config, workload, workloads),
+        );
+        if effective == Priority::Protected {
+            explanation.push(format!(
+                "{scope}: {source}, so it is protected from action; activity is not idle"
+            ));
+            continue;
+        }
 
         if history.is_cooling_down(&workload.id, now, config.timing.cooldown_ms) {
             explanation.push(format!("{scope}: in cooldown, skipped"));
@@ -218,19 +236,87 @@ fn finish(
 /// Ordering is deterministic: background before normal, then the largest
 /// current usage, then the scope key, so identical inputs always produce an
 /// identical plan.
-fn ordered_candidates<'a>(workloads: &'a [Workload], config: &Config) -> Vec<&'a Workload> {
+fn ordered_candidates<'a>(
+    workloads: &'a [Workload],
+    config: &Config,
+    activity: &dyn ActivitySource,
+) -> Vec<&'a Workload> {
     let mut candidates: Vec<&Workload> = workloads
         .iter()
         .filter(|workload| workload.control == ControlLevel::Eligible)
         .filter(|workload| !is_action_protected(config, workload))
         .collect();
     candidates.sort_by(|left, right| {
-        priority_rank(resolve_priority(&config.rules, left))
-            .cmp(&priority_rank(resolve_priority(&config.rules, right)))
+        let (left_priority, _) = explain_priority(
+            config,
+            left,
+            activity,
+            serves_protected(config, left, workloads),
+        );
+        let (right_priority, _) = explain_priority(
+            config,
+            right,
+            activity,
+            serves_protected(config, right, workloads),
+        );
+        priority_rank(left_priority)
+            .cmp(&priority_rank(right_priority))
             .then_with(|| usage(right).cmp(&usage(left)))
             .then_with(|| left.id.scope.cmp(&right.id.scope))
     });
     candidates
+}
+
+/// The activity hint for a workload, or `None` when nothing proves it active.
+///
+/// Only real `Active` evidence is a hint. Unknown and idle evidence is not, so a
+/// missing reading can never demote or protect a workload.
+fn active_hint(activity: &dyn ActivitySource, workload: &Workload) -> Option<&'static str> {
+    match activity.evidence(&workload.id) {
+        ActivityEvidence::Active => Some("active workload evidence"),
+        ActivityEvidence::Idle { .. } | ActivityEvidence::Unknown => None,
+    }
+}
+
+/// Explain a workload's effective priority and why it applies.
+///
+/// Explicit rules win, then a dependency of a protected workload, then a live
+/// activity hint, then the standalone normal default. A missing hint is never
+/// read as idle, and a live hint always protects the workload from action.
+pub fn explain_priority(
+    config: &Config,
+    workload: &Workload,
+    activity: &dyn ActivitySource,
+    serves_protected: bool,
+) -> (Priority, String) {
+    priority_with_source(
+        &config.rules,
+        workload,
+        active_hint(activity, workload),
+        serves_protected,
+    )
+}
+
+/// Whether a workload serves a protected workload, inferred from cgroup nesting.
+///
+/// A workload whose cgroup path is an ancestor of a protected workload's cgroup
+/// path is serving it, so it is protected too rather than being reclaimed out
+/// from under the thing it serves. This is read from the cgroup tree the
+/// inventory already collected, not guessed: it holds only for `cgroup:` scopes,
+/// where nesting is real.
+pub fn serves_protected(config: &Config, workload: &Workload, workloads: &[Workload]) -> bool {
+    let Some(base) = workload.id.scope.strip_prefix("cgroup:") else {
+        return false;
+    };
+    let prefix = format!("{base}/");
+    workloads.iter().any(|other| {
+        is_action_protected(config, other)
+            && other
+                .id
+                .scope
+                .strip_prefix("cgroup:")
+                .is_some_and(|path| path.starts_with(&prefix))
+    })
 }
 
 /// Whether a workload is shielded from automatic action entirely.
@@ -358,7 +444,7 @@ mod tests {
 
     use super::*;
     use crate::capability::CapabilityReport;
-    use crate::config::RuleMatch;
+    use crate::config::{Rule, RuleMatch};
     use crate::inventory::MemoryAccounting;
     use crate::policy::activity::ActivityEvidence;
     use crate::policy::history::{ActionOutcome, ActionRecord};
@@ -375,6 +461,12 @@ mod tests {
         fn idle(scope: &str, since_ms: u64) -> Self {
             let mut map = HashMap::new();
             map.insert(scope.to_string(), ActivityEvidence::Idle { since_ms });
+            Self(map)
+        }
+
+        fn active(scope: &str) -> Self {
+            let mut map = HashMap::new();
+            map.insert(scope.to_string(), ActivityEvidence::Active);
             Self(map)
         }
     }
@@ -915,5 +1007,95 @@ mod tests {
             .explanation
             .iter()
             .any(|line| line.contains("remaining in observation")));
+    }
+
+    #[test]
+    fn a_live_activity_hint_protects_a_workload_with_no_rule() {
+        let plans = run(
+            PressureState::Critical,
+            &[workload("build", "exe:build", 9 * GIB)],
+            &config(&[ActionKind::CgroupSoftLimit]),
+            &empty_history(),
+            &FixedActivity::active("exe:build"),
+        );
+        assert!(
+            plans.is_empty(),
+            "a workload with live activity must not be reclaimed: {:?}",
+            plans.explanation
+        );
+    }
+
+    #[test]
+    fn conflicting_rules_pick_the_most_specific_and_outrank_a_hint() {
+        // Two rules match the same workload. The more specific wins, and either
+        // beats a live activity hint, which is the precedence the card asks for.
+        let w = workload("build", "exe:build", 8 * GIB);
+        let mut config = config(&[]);
+        config.rules = vec![
+            Rule {
+                name: "broad".into(),
+                match_on: RuleMatch::Executable {
+                    value: "build".into(),
+                },
+                priority: Priority::Protected,
+                budget_bytes: None,
+            },
+            Rule {
+                name: "exact".into(),
+                match_on: RuleMatch::Scope {
+                    value: "exe:build".into(),
+                },
+                priority: Priority::Background,
+                budget_bytes: None,
+            },
+        ];
+        let (priority, source) =
+            explain_priority(&config, &w, &FixedActivity::active("exe:build"), false);
+        assert_eq!(
+            priority,
+            Priority::Background,
+            "the more specific rule wins"
+        );
+        assert!(source.starts_with("explicit rule"));
+    }
+
+    #[test]
+    fn a_workload_serving_a_protected_cgroup_is_protected() {
+        // A parent cgroup whose nested workload is protected is serving it, so
+        // it is protected too rather than being reclaimed out from under it. This
+        // is read from the cgroup tree, not guessed.
+        let parent = workload("parent", "cgroup:/app", 8 * GIB);
+        let child = workload("child", "cgroup:/app/protected", GIB);
+        let mut config = config(&[ActionKind::CgroupSoftLimit]);
+        config.protection.protected = vec!["cgroup:/app/protected".to_string()];
+        let workloads = vec![parent.clone(), child.clone()];
+
+        assert!(serves_protected(&config, &parent, &workloads));
+        assert!(!serves_protected(&config, &child, &workloads));
+
+        let (priority, source) = explain_priority(
+            &config,
+            &parent,
+            &FixedActivity::default(),
+            serves_protected(&config, &parent, &workloads),
+        );
+        assert_eq!(priority, Priority::Protected);
+        assert!(
+            source.contains("dependency"),
+            "the source names it: {source}"
+        );
+
+        // And the plan never reclaims the parent.
+        let plans = run(
+            PressureState::Critical,
+            &workloads,
+            &config,
+            &empty_history(),
+            &FixedActivity::default(),
+        );
+        assert!(plans
+            .actions
+            .iter()
+            .all(|action| action.target != parent.id));
     }
 }

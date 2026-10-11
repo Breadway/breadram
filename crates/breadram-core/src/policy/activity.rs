@@ -54,6 +54,34 @@ impl ActivitySource for UnknownActivity {
     }
 }
 
+/// An activity source that keeps a scope active until stable absence.
+///
+/// The inner source is the raw evidence (a provider answer, a compositor hint).
+/// When the debouncer for a scope still holds it active, this reports `Active`
+/// even if the raw reading has just gone quiet, so a single missing reading
+/// cannot demote and re-promote a workload and oscillate reclaim and reload.
+pub struct DebouncedActivity<'a> {
+    inner: &'a dyn ActivitySource,
+    hints: &'a crate::config::HintState,
+}
+
+impl<'a> DebouncedActivity<'a> {
+    /// Wrap a raw source with the host's debounced hints.
+    pub fn new(inner: &'a dyn ActivitySource, hints: &'a crate::config::HintState) -> Self {
+        Self { inner, hints }
+    }
+}
+
+impl ActivitySource for DebouncedActivity<'_> {
+    fn evidence(&self, workload: &WorkloadId) -> ActivityEvidence {
+        if self.hints.is_active(&workload.scope) {
+            ActivityEvidence::Active
+        } else {
+            self.inner.evidence(workload)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use breadram_core::config::ActionKind;
+use breadram_core::config::{ActionKind, Priority};
 use breadram_core::ipc::{
     ActionJournalRecord, ActionsPayload, AppliedPayload, ClientMessage, DiagnosticsPayload,
     ErrorCode, JournalSummary, MemoryBreakdown, OwnedValueRecord, PlanPayload,
@@ -214,6 +214,8 @@ fn workload(scope: &str, name: &str, cgroup: Option<u64>, rss: Option<u64>) -> W
         } else {
             "observe_only".to_string()
         },
+        priority: Priority::Normal,
+        priority_source: "standalone default; missing activity is not idle".to_string(),
     }
 }
 

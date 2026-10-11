@@ -11,7 +11,10 @@ pub mod rule;
 
 pub use credentials::{check_credential_permissions, Credentials, CREDENTIAL_FILE_MODE, REDACTED};
 pub use profile::Profile;
-pub use rule::{resolve_priority, select_rule, Priority, Rule, RuleMatch};
+pub use rule::{
+    priority_with_source, resolve_priority, select_rule, HintDebouncer, HintState, Priority, Rule,
+    RuleMatch,
+};
 
 use serde::{Deserialize, Serialize};
 
