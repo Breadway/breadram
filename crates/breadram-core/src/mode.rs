@@ -1,5 +1,6 @@
 //! How much the daemon is allowed to do.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
@@ -8,7 +9,8 @@ use std::str::FromStr;
 /// The mode is the top level safety switch. Anything the operator can do
 /// automatically has an explicit monitor-only equivalent that only explains
 /// what it would do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ManagementMode {
     /// Observe and explain only. Never change system state.
     #[default]
