@@ -18,6 +18,7 @@ pub mod capability;
 pub mod config;
 pub mod control;
 pub mod coordinator;
+pub mod events;
 pub mod execution;
 pub mod inventory;
 pub mod ipc;
