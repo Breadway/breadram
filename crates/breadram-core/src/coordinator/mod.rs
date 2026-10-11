@@ -32,7 +32,8 @@ pub mod journal;
 pub mod persist;
 
 pub use executor::{
-    AppliedChange, Confirmation, Executor, ExecutorError, MemoryObservation, Precondition,
+    AppliedChange, ChainedExecutor, Confirmation, Executor, ExecutorError, MemoryObservation,
+    Precondition,
 };
 pub use journal::{
     ActionJournal, JournalEntry, OwnedValue, OwnerToken, RestoreOutcome, RestoreResult,
@@ -347,6 +348,11 @@ impl Coordinator {
     ) -> ActionResult {
         let id = request.id();
         let scope = request.target.scope.clone();
+        // Why the action ran, and what it turned out to involve. An executor that
+        // has something to say about the consequence, such as the cold start a
+        // model release costs, has it recorded with the entry rather than only in
+        // the pass that reported it.
+        let mut journal_reason = request.reason.clone();
 
         macro_rules! finish {
             ($state:expr, $detail:expr, $effect:expr, $values:expr) => {{
@@ -364,7 +370,7 @@ impl Coordinator {
                     kind: Some(request.kind),
                     state: result.state,
                     at_ms: now_ms,
-                    reason: request.reason.clone(),
+                    reason: journal_reason.clone(),
                     effect: result.effect.clone(),
                     values: $values,
                 });
@@ -436,6 +442,9 @@ impl Coordinator {
                 let confirmation = executor.confirm(request);
                 let after = executor.observe(&request.target);
                 let note = change.note.clone();
+                if let Some(note) = &note {
+                    journal_reason = format!("{} ({note})", request.reason);
+                }
                 let values = self.own(change.values);
                 match confirmation {
                     Confirmation::Confirmed => finish!(

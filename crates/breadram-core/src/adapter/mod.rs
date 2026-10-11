@@ -25,22 +25,28 @@
 //!   recorded as unsupported rather than guessed at.
 
 pub mod capability;
+pub mod executor;
+pub mod http;
 pub mod mock;
 pub mod ollama;
 pub mod probe;
 
 pub use capability::{AdapterCapabilities, AdapterCapability, CAPABILITY_PROBE_VERSION};
+pub use executor::{AdapterExecutor, DEFAULT_OPERATION_TIMEOUT_MS, MAX_ERROR_EXCERPT_CHARS};
+pub use http::HttpTransport;
 pub use mock::MockAdapter;
 pub use ollama::{LoadedModel, OllamaAdapter, OllamaError, GENERATE_PATH, PS_PATH, VERSION_PATH};
 pub use probe::{
-    classify, is_encrypted_or_loopback, Auth, CircuitConfig, Method, NoSleep, ProbeClient,
-    ProbeError, ProbeRequest, RecordingSleeper, Redacted, Response, ScriptedTransport, Sleeper,
-    Transport, TransportError,
+    classify, is_encrypted_or_loopback, Auth, CircuitConfig, Method, NoSleep, OperationTransport,
+    ProbeClient, ProbeError, ProbeRequest, RecordingSleeper, Redacted, Response, ScriptedTransport,
+    Sleeper, Transport, TransportError,
 };
+pub use refresh_adapters as refresh;
 
 use crate::config::{ActionKind, Config, ProviderKind};
 use crate::inventory::{Workload, WorkloadId};
 use crate::policy::activity::{ActivityEvidence, ActivitySource};
+use crate::telemetry::fs::Clock;
 
 /// A method an operation may use.
 ///
@@ -193,6 +199,20 @@ pub struct AdapterOperation {
     pub confirmation: Confirmation,
 }
 
+/// The answer to one probe an adapter asked for.
+///
+/// An adapter cannot perform I/O, so it asks for the probes it needs and the
+/// caller returns the answers here. That keeps discovery bounded, keeps every
+/// credential in one place, and means an adapter with no observation of its own
+/// is simply an adapter that ignores these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    /// The request that was issued.
+    pub request: ProbeRequest,
+    /// What came back, or why nothing did.
+    pub result: Result<Response, ProbeError>,
+}
+
 /// The contract an optional runtime integration implements.
 ///
 /// Only the identity methods are required. Everything else has a conservative
@@ -215,9 +235,36 @@ pub trait WorkloadAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Record the answers to [`WorkloadAdapter::discover`], so this adapter's
+    /// view of its endpoint is current.
+    ///
+    /// The caller probes and hands the results back here before anything is
+    /// planned or executed. The default records nothing, which is right for an
+    /// adapter that needs no observation, and an adapter that needs one must say
+    /// so: an adapter that returns probes without recording their answers is
+    /// treated as never having observed anything, which is the safe direction.
+    ///
+    /// Returned notes are reported to the operator, so a read that failed is
+    /// visible rather than merely absent.
+    fn observe(&self, outcomes: &[ProbeOutcome], at_ms: u64) -> Vec<String> {
+        let _ = (outcomes, at_ms);
+        Vec::new()
+    }
+
     /// Read-only inventory of the resources this adapter manages.
     fn inventory(&self) -> Vec<ManagedResource> {
         Vec::new()
+    }
+
+    /// Whether [`WorkloadAdapter::inventory`] reflects a current reading.
+    ///
+    /// This is what separates "the provider holds nothing" from "the provider
+    /// could not be read": an empty inventory from a current reading is a
+    /// measurement of zero, and the same empty inventory from a failed read is
+    /// no measurement at all. The default is `false`, so an adapter that does
+    /// not say is treated as unmeasured rather than as holding nothing.
+    fn inventory_is_current(&self) -> bool {
+        false
     }
 
     /// Whether a workload is busy, idle, or unknown.
@@ -324,6 +371,27 @@ impl AdapterRegistry {
         self.adapters.iter().map(|adapter| adapter.name()).collect()
     }
 
+    /// The explicitly configured endpoints, sorted and de-duplicated.
+    ///
+    /// This is the allow list a transport is restricted to. Only endpoints that
+    /// were configured are ever in it: nothing is discovered or guessed, so a
+    /// request can only go where an operator said a provider is.
+    pub fn endpoints(&self) -> Vec<String> {
+        let mut endpoints: Vec<String> = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.endpoint().to_string())
+            .collect();
+        endpoints.sort();
+        endpoints.dedup();
+        endpoints
+    }
+
+    /// Every registered adapter, in registration order.
+    pub fn adapters(&self) -> impl Iterator<Item = &dyn WorkloadAdapter> {
+        self.adapters.iter().map(AsRef::as_ref)
+    }
+
     /// Every adapter that claims a workload.
     pub fn owners<'a>(&'a self, workload: &Workload) -> Vec<&'a dyn WorkloadAdapter> {
         self.adapters
@@ -352,6 +420,18 @@ impl AdapterRegistry {
         requests.sort_by(|left, right| left.url.cmp(&right.url));
         requests.dedup_by(|left, right| left.url == right.url);
         requests
+    }
+
+    /// Offer every probe answer to every adapter.
+    ///
+    /// Each adapter matches the outcomes on its own endpoint, so a shared
+    /// endpoint is asked once and every adapter that needs the answer gets it.
+    /// Notes come back in registration order.
+    pub fn observe(&self, outcomes: &[ProbeOutcome], at_ms: u64) -> Vec<String> {
+        self.adapters
+            .iter()
+            .flat_map(|adapter| adapter.observe(outcomes, at_ms))
+            .collect()
     }
 
     /// The best activity answer for a workload.
@@ -386,6 +466,35 @@ impl AdapterRegistry {
             workloads,
         }
     }
+}
+
+/// Read every configured endpoint once and record what came back.
+///
+/// The probes come from the adapters themselves, so only an explicitly
+/// configured endpoint is ever visited, and a shared endpoint is asked once. A
+/// read that failed is recorded as a failed reading rather than leaving the
+/// previous success in place, and the returned notes name what could not be
+/// read.
+pub fn refresh_adapters(
+    registry: &AdapterRegistry,
+    transport: &dyn Transport,
+    sleeper: &dyn Sleeper,
+    clock: &dyn Clock,
+    circuit: CircuitConfig,
+) -> Vec<String> {
+    let requests = registry.discovery_requests();
+    if requests.is_empty() {
+        return Vec::new();
+    }
+    let client = ProbeClient::new(transport, sleeper, clock, circuit, registry.endpoints());
+    let outcomes: Vec<ProbeOutcome> = requests
+        .iter()
+        .map(|request| ProbeOutcome {
+            request: request.clone(),
+            result: client.probe(request),
+        })
+        .collect::<Vec<ProbeOutcome>>();
+    registry.observe(&outcomes, clock.monotonic_ms())
 }
 
 /// The bridge from the adapter registry to the policy core.

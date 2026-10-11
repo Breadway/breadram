@@ -110,6 +110,28 @@ that no longer exists is skipped, and a file this build does not understand is
 reported and ignored rather than reinterpreted. Monitor mode never writes, so it
 never restores either: it reports leftover values instead of clearing them.
 
+### AD-12: Provider actions run through the same executor boundary
+
+A provider action is a write like any other, so it goes through
+`coordinator::Executor` rather than around it. `adapter::AdapterExecutor`
+implements that boundary for the provider-backed actions: it revalidates the
+capability and the workload generation, refuses a release that needs proven
+idleness when idleness is unknown or too recent, checks every URL against the
+configured endpoints before anything is sent, applies the operation through a
+bounded loopback transport, confirms the effect with a read-only probe, and
+reports the memory the provider holds before and after so the journalled effect
+is measured rather than asserted. `ChainedExecutor` keeps host controls and
+provider actions in one pass, dispatching by what each executor claims.
+
+Three consequences are structural. First, a provider is read before it is
+reasoned about: the daemon refreshes every configured endpoint each tick, so a
+policy decision is never based on a stale reading, and a failed read is recorded
+as a failure rather than left as an old success. Second, an executor that does
+not know how to measure returns nothing rather than zero, so "not measured" and
+"measured as zero" stay different in the journal. Third, nothing is undone
+blindly: a provider action is undone by the provider's own surface or not at
+all, and the executor reports that rather than guessing.
+
 ## Verification
 
 Every change must pass, from a clean checkout:

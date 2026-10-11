@@ -65,7 +65,10 @@ use crate::serving::{LeaseId, Leases, RequestMeta, TrackingCompleteness};
 
 use super::capability::{AdapterCapabilities, AdapterCapability, CAPABILITY_PROBE_VERSION};
 use super::probe::{classify, ProbeRequest, Response};
-use super::{AdapterOperation, Confirmation, ManagedResource, OperationRequest, WorkloadAdapter};
+use super::{
+    AdapterOperation, Confirmation, ManagedResource, OperationRequest, ProbeOutcome,
+    WorkloadAdapter,
+};
 
 /// The path that lists loaded models.
 pub const PS_PATH: &str = "/api/ps";
@@ -477,6 +480,24 @@ impl OllamaAdapter {
         Ok(state.loaded.values().cloned().collect())
     }
 
+    /// Record that a probe did not complete at all.
+    ///
+    /// No response exists to classify, so this is separate from
+    /// [`OllamaAdapter::observe_loaded`], but the effect on what may be acted on
+    /// is the same: a read that never happened proves nothing, so it clears the
+    /// loaded view and the idle clock rather than leaving the previous reading in
+    /// place.
+    pub fn note_probe_failure(&self, path: &str, reason: &str, now_ms: u64) {
+        let mut state = self.state();
+        state.observed_at_ms = Some(now_ms);
+        state.last_error = Some(reason.to_string());
+        if path == PS_PATH {
+            state.fresh = false;
+            state.loaded.clear();
+            state.idle_since_ms = None;
+        }
+    }
+
     /// Whether the last `/api/ps` read succeeded.
     pub fn is_fresh(&self) -> bool {
         self.state().fresh
@@ -518,6 +539,47 @@ impl WorkloadAdapter for OllamaAdapter {
         ]
     }
 
+    fn observe(&self, outcomes: &[ProbeOutcome], at_ms: u64) -> Vec<String> {
+        if !self.capabilities.observes(AdapterCapability::Discovery) {
+            // Nothing was asked for, so nothing is recorded: without the
+            // discovery capability no probe was issued and no reading exists.
+            return Vec::new();
+        }
+        let mut notes = Vec::new();
+        for outcome in outcomes {
+            // Only this adapter's own endpoint. A request for another provider
+            // is not this adapter's to read, however it is registered.
+            let Some(path) = outcome.request.url.strip_prefix(self.endpoint.as_str()) else {
+                continue;
+            };
+            match &outcome.result {
+                Ok(response) if path == VERSION_PATH => {
+                    if let Err(error) = self.observe_version(response, at_ms) {
+                        notes.push(format!("provider {} could not be read: {error}", self.name));
+                    }
+                }
+                Ok(response) if path == PS_PATH => {
+                    if let Err(error) = self.observe_loaded(response, at_ms) {
+                        notes.push(format!("provider {} could not be read: {error}", self.name));
+                    }
+                }
+                Ok(_) => notes.push(format!(
+                    "provider {} answered an unexpected path {path}",
+                    self.name
+                )),
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.note_probe_failure(path, &reason, at_ms);
+                    notes.push(format!(
+                        "provider {} could not be reached at {path}: {reason}",
+                        self.name
+                    ));
+                }
+            }
+        }
+        notes
+    }
+
     fn inventory(&self) -> Vec<ManagedResource> {
         if !self.capabilities.observes(AdapterCapability::Inventory) {
             return Vec::new();
@@ -538,6 +600,13 @@ impl WorkloadAdapter for OllamaAdapter {
                 idle: false,
             })
             .collect()
+    }
+
+    fn inventory_is_current(&self) -> bool {
+        // A successful `/api/ps` read is what makes the loaded set a reading
+        // rather than a leftover, so an empty set from a fresh read really does
+        // mean the service holds no models.
+        self.capabilities.observes(AdapterCapability::Inventory) && self.state().fresh
     }
 
     fn activity(&self, workload: &Workload) -> ActivityEvidence {
