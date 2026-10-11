@@ -649,6 +649,11 @@ fn human_diagnostics(diagnostics: &DiagnosticsPayload) -> String {
         format!("shared:     {}", human_optional_bytes(memory.shared_bytes)),
         format!("VRAM:       {}", human_optional_bytes(memory.vram_bytes)),
         format!(
+            "iGPU GTT:   used {}, total {}",
+            human_optional_bytes(memory.gtt_used_bytes),
+            human_optional_bytes(memory.gtt_total_bytes)
+        ),
+        format!(
             "swap rate:  pages in {}, out {}",
             human_optional_u64(memory.swap_pages_in),
             human_optional_u64(memory.swap_pages_out)

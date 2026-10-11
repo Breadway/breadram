@@ -192,6 +192,9 @@ pub struct OllamaAdapter {
     endpoint: String,
     scope: String,
     capabilities: AdapterCapabilities,
+    /// Whether this endpoint's device memory is really shared host memory, as on
+    /// an integrated GPU.
+    shared_device_memory: bool,
     pinned: Vec<String>,
     tracking: TrackingCompleteness,
     /// The wall-clock instant keep-alive policy is read against, in unix
@@ -219,6 +222,7 @@ impl OllamaAdapter {
             endpoint: endpoint.into(),
             scope: scope.into(),
             capabilities: AdapterCapabilities::observation_only(),
+            shared_device_memory: false,
             pinned: Vec::new(),
             tracking: TrackingCompleteness::Unknown,
             reference_unix_ms: now_unix_ms(),
@@ -264,6 +268,16 @@ impl OllamaAdapter {
     /// [`OllamaAdapter::capabilities_from_probes`].
     pub fn with_capabilities(mut self, capabilities: AdapterCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Mark this endpoint as running on an integrated GPU.
+    ///
+    /// A model's reported device memory is then attributed to host memory, since
+    /// on an iGPU it is a carve-out of system RAM rather than dedicated VRAM, and
+    /// counting it as separate device memory would hide where it really lives.
+    pub fn with_shared_device_memory(mut self, shared: bool) -> Self {
+        self.shared_device_memory = shared;
         self
     }
 
@@ -591,13 +605,26 @@ impl WorkloadAdapter for OllamaAdapter {
         state
             .loaded
             .values()
-            .map(|model| ManagedResource {
-                name: model.name.clone(),
-                host_ram_bytes: Some(model.host_model_bytes()),
-                device_ram_bytes: (model.size_vram_bytes > 0).then_some(model.size_vram_bytes),
-                // A loaded model is never reported as idle: being loaded is not
-                // evidence that nothing is being inferred.
-                idle: false,
+            .map(|model| {
+                // On an integrated GPU the "device" memory is a carve-out of host
+                // RAM, so the whole model is host memory and there is no separate
+                // device figure. On a discrete card the two stay separate.
+                let (host_ram_bytes, device_ram_bytes) = if self.shared_device_memory {
+                    (Some(model.size_bytes), None)
+                } else {
+                    (
+                        Some(model.host_model_bytes()),
+                        (model.size_vram_bytes > 0).then_some(model.size_vram_bytes),
+                    )
+                };
+                ManagedResource {
+                    name: model.name.clone(),
+                    host_ram_bytes,
+                    device_ram_bytes,
+                    // A loaded model is never reported as idle: being loaded is
+                    // not evidence that nothing is being inferred.
+                    idle: false,
+                }
             })
             .collect()
     }

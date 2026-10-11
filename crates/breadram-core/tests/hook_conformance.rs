@@ -269,6 +269,7 @@ fn a_configured_hook_flows_from_config_to_release() {
             scope: Some(scope.to_string()),
             credential_ref: None,
             allow_automation: true,
+            igpu: false,
             command: vec![program.display().to_string()],
             hook_timeout_ms: None,
             hook_max_output_bytes: None,

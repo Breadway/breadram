@@ -544,3 +544,33 @@ fn the_adapter_reports_its_provider_and_version() {
         .observe_version(&Response::new(200, "plain text"), 2_500)
         .is_err());
 }
+
+#[test]
+fn an_integrated_gpu_model_is_attributed_to_host_memory() {
+    // On an iGPU the model's reported device bytes are a carve-out of host RAM,
+    // so the whole model is host memory and there is no separate device figure.
+    // Reporting it as device memory would hide where it really lives and could
+    // let a relief decision treat the host as holding less than it does.
+    let response = two_models();
+    let adapter = OllamaAdapter::new("ollama", "http://127.0.0.1:11434", SCOPE)
+        .with_reference_time(FIXED_NOW_MS)
+        .with_shared_device_memory(true)
+        .with_capabilities(OllamaAdapter::capabilities_from_probes(&response));
+    adapter
+        .observe_loaded(&response, 1_000)
+        .expect("the recorded body parses");
+    let inventory = adapter.inventory();
+    let gpu = inventory
+        .iter()
+        .find(|resource| resource.name == "llama3:8b")
+        .expect("the GPU model");
+    assert_eq!(
+        gpu.host_ram_bytes,
+        Some(4_294_967_296),
+        "the whole model is host memory on an iGPU"
+    );
+    assert_eq!(
+        gpu.device_ram_bytes, None,
+        "there is no separate device memory on an iGPU"
+    );
+}

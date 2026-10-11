@@ -304,6 +304,8 @@ fn diagnostics() -> DiagnosticsPayload {
             swap_used_bytes: None,
             shared_bytes: None,
             vram_bytes: None,
+            gtt_used_bytes: Some(1024 * 1024 * 1024),
+            gtt_total_bytes: Some(4 * 1024 * 1024 * 1024),
             swap_pages_in: None,
             swap_pages_out: None,
             notes: vec![

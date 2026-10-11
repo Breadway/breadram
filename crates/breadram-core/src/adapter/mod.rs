@@ -373,8 +373,15 @@ impl AdapterRegistry {
                             provider.url.clone(),
                             scope.to_string(),
                         )
-                        .with_capabilities(capabilities),
+                        .with_capabilities(capabilities)
+                        .with_shared_device_memory(provider.igpu),
                     ));
+                    if provider.igpu {
+                        notes.push(format!(
+                            "provider {} runs on an integrated GPU: a model's reported device memory is attributed to host RAM, because on an iGPU it is a carve-out of system memory, not dedicated VRAM",
+                            provider.name
+                        ));
+                    }
                 }
                 ProviderKind::Hook => {
                     match HookSpec::from_endpoint(provider) {
@@ -668,6 +675,7 @@ mod tests {
                     scope: Some("unit:ollama.service".to_string()),
                     credential_ref: None,
                     allow_automation: true,
+                    igpu: false,
                     command: Vec::new(),
                     hook_timeout_ms: None,
                     hook_max_output_bytes: None,
@@ -679,6 +687,7 @@ mod tests {
                     scope: Some("unit:vllm.service".to_string()),
                     credential_ref: None,
                     allow_automation: true,
+                    igpu: false,
                     command: Vec::new(),
                     hook_timeout_ms: None,
                     hook_max_output_bytes: None,
@@ -690,6 +699,7 @@ mod tests {
                     scope: None,
                     credential_ref: None,
                     allow_automation: true,
+                    igpu: false,
                     command: Vec::new(),
                     hook_timeout_ms: None,
                     hook_max_output_bytes: None,
@@ -726,6 +736,7 @@ mod tests {
                 scope: Some("unit:ollama.service".to_string()),
                 credential_ref: None,
                 allow_automation: false,
+                igpu: false,
                 command: Vec::new(),
                 hook_timeout_ms: None,
                 hook_max_output_bytes: None,

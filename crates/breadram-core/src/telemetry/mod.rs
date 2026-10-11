@@ -15,6 +15,7 @@
 
 pub mod cgroup;
 pub mod fs;
+pub mod igpu;
 pub mod meminfo;
 pub mod psi;
 pub mod snapshot;
@@ -23,6 +24,7 @@ pub mod vmstat;
 
 pub use cgroup::{collect_cgroup, CgroupMemory, CgroupSnapshot};
 pub use fs::{Clock, FileSource, RealFs, SystemClock};
+pub use igpu::{collect_gtt, GttDevice, GttMemory, CAP_GPU_GTT, DRM_ROOT, MAX_CARDS};
 pub use meminfo::{parse_meminfo, MemInfo, MemInfoError};
 pub use psi::{parse_psi, PsiError, PsiLine, PsiReading};
 pub use snapshot::{

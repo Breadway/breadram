@@ -36,8 +36,8 @@ use breadram_core::policy::{
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
-    collect_cgroup_swap, collect_host, collect_swap, Clock, RealFs, SwapLayout, SystemClock,
-    WorkloadSwap,
+    collect_cgroup_swap, collect_gtt, collect_host, collect_swap, Clock, GttMemory, RealFs,
+    SwapLayout, SystemClock, WorkloadSwap, CAP_GPU_GTT,
 };
 use breadram_core::trends::{
     TrendHistory, TrendSample, KIND_HOST, KIND_PRESSURE, KIND_RECOVERY, KIND_WORKLOAD,
@@ -135,6 +135,8 @@ struct Published {
     workload_swap: Vec<WorkloadSwap>,
     /// The effective priority of each workload and why it applies.
     priorities: Vec<WorkloadPriority>,
+    /// Integrated GPU shared memory, read once per pass.
+    gtt: GttMemory,
 }
 
 /// The effective priority of a workload and the reason it applies, for the wire.
@@ -831,6 +833,9 @@ fn observe(
     // swappiness, swap files, fstab, and kernel parameters are the
     // administrator's, and breadram installs no second OOM manager.
     let swap = collect_swap(&fs);
+    // Integrated GPU shared memory is read once per pass, like the swap layout:
+    // it is reported and never changed.
+    let gtt = collect_gtt(&fs);
     let targets = discover_targets(&fs);
     let control_targets = targets.len();
     // A swap limit is only meaningful against the cgroup a workload is actually
@@ -906,6 +911,7 @@ fn observe(
         swap,
         workload_swap,
         priorities,
+        gtt,
     }
 }
 
@@ -931,6 +937,7 @@ fn unavailable(mode: ManagementMode, observed_at_ms: u64) -> Published {
         swap: SwapLayout::default(),
         workload_swap: Vec::new(),
         priorities: Vec::new(),
+        gtt: GttMemory::default(),
     }
 }
 
@@ -1448,6 +1455,25 @@ fn merged_capabilities(published: &Published) -> CapabilityReport {
     for capability in &published.status.capabilities.capabilities {
         merged.set(capability.name.clone(), capability.state.clone());
     }
+    // Integrated GPU shared memory is its own capability, so a missing iGPU is a
+    // reported gap rather than a silent zero.
+    let gtt_state = if published.gtt.used_bytes().is_some() {
+        breadram_core::capability::CapabilityState::Available
+    } else if published.gtt.present() {
+        breadram_core::capability::CapabilityState::Degraded {
+            reason: "an integrated GPU reports a GTT total but no used count, so its footprint is unknown"
+                .to_string(),
+        }
+    } else if published.gtt.drm_readable {
+        breadram_core::capability::CapabilityState::Unavailable {
+            reason: "no integrated GPU shared memory counter was found".to_string(),
+        }
+    } else {
+        breadram_core::capability::CapabilityState::Unavailable {
+            reason: "the drm class could not be read".to_string(),
+        }
+    };
+    merged.set(CAP_GPU_GTT.to_string(), gtt_state);
     merged
 }
 
@@ -1462,6 +1488,8 @@ fn memory_breakdown(published: &Published) -> MemoryBreakdown {
             swap_used_bytes: None,
             shared_bytes: None,
             vram_bytes: None,
+            gtt_used_bytes: None,
+            gtt_total_bytes: None,
             swap_pages_in: None,
             swap_pages_out: None,
             notes,
@@ -1483,7 +1511,8 @@ fn memory_breakdown(published: &Published) -> MemoryBreakdown {
         notes.push("swap activity counters are unavailable, so swap rate is unknown".to_string());
     }
     notes
-        .push("device memory is not measured: no adapter or provider reports VRAM yet".to_string());
+        .push("dedicated VRAM is not measured: no discrete-GPU adapter reports it yet".to_string());
+    notes.extend(published.gtt.notes());
     MemoryBreakdown {
         ram_total_bytes: Some(meminfo.total),
         ram_available_bytes: meminfo.available,
@@ -1491,6 +1520,8 @@ fn memory_breakdown(published: &Published) -> MemoryBreakdown {
         swap_used_bytes: meminfo.swap_used(),
         shared_bytes: meminfo.shmem,
         vram_bytes: None,
+        gtt_used_bytes: published.gtt.used_bytes(),
+        gtt_total_bytes: published.gtt.total_bytes(),
         swap_pages_in: snapshot.vmstat.pswpin,
         swap_pages_out: snapshot.vmstat.pswpout,
         notes,
@@ -1990,6 +2021,7 @@ mod tests {
                 scope: Some(SCOPE.to_string()),
                 credential_ref: None,
                 allow_automation: true,
+                igpu: false,
                 command: Vec::new(),
                 hook_timeout_ms: None,
                 hook_max_output_bytes: None,
@@ -2031,6 +2063,30 @@ mod tests {
                 .any(|note| note.contains("never changes global swappiness")),
             "{notes:?}"
         );
+    }
+
+    #[test]
+    fn integrated_gpu_memory_is_reported_separately_and_never_folded_into_host_ram() {
+        // The GTT figure is copied into the breakdown, never added to or
+        // subtracted from host available memory: on an iGPU it is a carve-out of
+        // the same host RAM, so folding it in would count it twice.
+        let mut published = unavailable(ManagementMode::Monitor, 1);
+        published.snapshot = collect_host(&RealFs, &SystemClock::new()).ok();
+        published.gtt = collect_gtt(&RealFs);
+        let breakdown = memory_breakdown(&published);
+
+        assert_eq!(breakdown.gtt_used_bytes, published.gtt.used_bytes());
+        assert_eq!(breakdown.gtt_total_bytes, published.gtt.total_bytes());
+        if let Some(snapshot) = &published.snapshot {
+            assert_eq!(
+                breakdown.ram_available_bytes, snapshot.meminfo.available,
+                "host available memory is untouched by the GTT figure"
+            );
+        }
+        assert!(breakdown
+            .notes
+            .iter()
+            .any(|note| note.contains("GTT") || note.contains("integrated GPU")));
     }
 
     #[test]

@@ -204,6 +204,14 @@ pub struct ProviderEndpoint {
     /// provides, do not depend on this; only a write does.
     #[serde(default)]
     pub allow_automation: bool,
+    /// Whether this endpoint runs on an integrated GPU.
+    ///
+    /// On an iGPU the "device" memory a model reports is a carve-out of host
+    /// RAM, so it is attributed to host memory rather than to dedicated device
+    /// memory. Off by default, which treats the endpoint as a discrete GPU or
+    /// CPU: the two figures stay separate.
+    #[serde(default)]
+    pub igpu: bool,
     /// The hook program and its arguments, for `hook` providers only.
     ///
     /// This is the only thing breadram ever executes for a hook: the command
@@ -1074,6 +1082,7 @@ budget_bytes = 2147483648
             scope: None,
             credential_ref: None,
             allow_automation: false,
+            igpu: false,
             command: Vec::new(),
             hook_timeout_ms: None,
             hook_max_output_bytes: None,

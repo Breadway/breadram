@@ -32,9 +32,9 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// 2 adds the swap and OOM diagnostic section and the per workload swap limits
 /// to the diagnostics report. 3 adds the bounded trend samples. 4 adds the
 /// growth report paired with recorded relief. 5 adds the per workload priority
-/// and its source. 6 adds the per workload effective memory limit. Nothing was
-/// removed or renumbered.
-pub const PROTOCOL_MINOR: u16 = 6;
+/// and its source. 6 adds the per workload effective memory limit. 7 adds
+/// integrated GPU shared memory. Nothing was removed or renumbered.
+pub const PROTOCOL_MINOR: u16 = 7;
 
 /// The largest single message, in bytes. Oversized messages are rejected.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -445,6 +445,13 @@ pub struct MemoryBreakdown {
     pub shared_bytes: Option<u64>,
     /// Device memory in bytes, when something can measure it.
     pub vram_bytes: Option<u64>,
+    /// Integrated GPU shared memory in use, distinct from host RAM and from
+    /// dedicated VRAM. Defaulted so an older peer still decodes.
+    #[serde(default)]
+    pub gtt_used_bytes: Option<u64>,
+    /// Integrated GPU shared memory total, when the driver reports one.
+    #[serde(default)]
+    pub gtt_total_bytes: Option<u64>,
     /// Pages swapped in since boot, when the kernel reports them.
     pub swap_pages_in: Option<u64>,
     /// Pages swapped out since boot, when the kernel reports them.
@@ -986,12 +993,12 @@ mod tests {
     #[test]
     fn a_diagnostics_payload_from_the_previous_minor_version_still_decodes() {
         // The swap section was added in minor version 2, the trend samples in 3, the
-        // growth report in 4, the per workload priority and source in 5, and the
-        // per workload effective memory limit in 6. A client that speaks an older
-        // minor must still be able to read a report from this build, and a report
-        // written before each addition must still decode here, which is why those
-        // fields are defaulted rather than required.
-        assert_eq!(PROTOCOL_MINOR, 6);
+        // growth report in 4, the per workload priority and source in 5, the per
+        // workload effective memory limit in 6, and integrated GPU shared memory in
+        // 7. A client that speaks an older minor must still be able to read a report
+        // from this build, and a report written before each addition must still
+        // decode here, which is why those fields are defaulted rather than required.
+        assert_eq!(PROTOCOL_MINOR, 7);
         let older = r#"{
             "mode": "monitor",
             "version": "0.1.0",
