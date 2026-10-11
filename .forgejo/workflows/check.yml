@@ -1,0 +1,32 @@
+name: CPU checks
+
+on:
+  push:
+    branches: ['main', 'feature/**', 'fix/**']
+
+jobs:
+  check:
+    runs-on: [self-hosted]
+    steps:
+      - name: Fresh checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout=$(mktemp -d "${RUNNER_TEMP:-/tmp}/breadram-ci.XXXXXX")
+          printf 'BREADRAM_CHECKOUT=%s\n' "$checkout" >> "$GITHUB_ENV"
+          git clone --no-checkout "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" "$checkout"
+          git -C "$checkout" checkout --detach "$GITHUB_SHA"
+      - name: Locked CPU verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$BREADRAM_CHECKOUT"
+          bash ci/check.sh
+      - name: Clean owned checkout
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${BREADRAM_CHECKOUT:-}" == "${RUNNER_TEMP:-/tmp}"/breadram-ci.* && -d "$BREADRAM_CHECKOUT" ]]; then
+            rm -rf -- "$BREADRAM_CHECKOUT"
+          fi

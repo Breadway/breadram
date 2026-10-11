@@ -38,11 +38,13 @@ use crate::policy::MIN_IDLE_MS;
 use crate::telemetry::fs::Clock;
 
 use super::capability::AdapterCapability;
+use super::hook::{is_hook_url, parse_release, parse_status, parse_wake, HookRunner, HookVerb};
 use super::probe::{
     CircuitConfig, OperationTransport, ProbeClient, ProbeError, ProbeRequest, Response, Sleeper,
     Transport, TransportError,
 };
 use super::{AdapterOperation, AdapterRegistry, ProbeOutcome};
+use crate::config::HookSpec;
 
 /// How long a provider operation is given before it is abandoned.
 pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 5_000;
@@ -93,6 +95,9 @@ pub struct AdapterExecutor<'a> {
     clock: &'a (dyn Clock + Sync),
     circuit: CircuitConfig,
     operation_timeout_ms: u64,
+    /// Runs hook programs. `None` outside the daemon, which refuses hook
+    /// operations rather than running them with no runner.
+    hooks: Option<&'a dyn HookRunner>,
 }
 
 impl<'a> AdapterExecutor<'a> {
@@ -117,6 +122,7 @@ impl<'a> AdapterExecutor<'a> {
             clock,
             circuit: CircuitConfig::default(),
             operation_timeout_ms: DEFAULT_OPERATION_TIMEOUT_MS,
+            hooks: None,
         }
     }
 
@@ -129,6 +135,15 @@ impl<'a> AdapterExecutor<'a> {
     /// Change how long an operation is given.
     pub fn with_operation_timeout(mut self, operation_timeout_ms: u64) -> Self {
         self.operation_timeout_ms = operation_timeout_ms;
+        self
+    }
+
+    /// Run hook operations through this runner.
+    ///
+    /// The daemon supplies the real process runner. Without one, hook
+    /// operations are refused rather than run by some default.
+    pub fn with_hook_runner(mut self, runner: &'a dyn HookRunner) -> Self {
+        self.hooks = Some(runner);
         self
     }
 
@@ -159,11 +174,16 @@ impl<'a> AdapterExecutor<'a> {
     ///
     /// This is checked before anything is sent, so a misconfigured operation is
     /// reported as a refusal rather than as a transport failure after the fact.
+    /// Hook URLs never reach the HTTP transport: they name a configured hook
+    /// program, so only the endpoint prefix check applies to them.
     fn check_url(&self, url: &str) -> Result<(), Refusal> {
         if !self.allows(url) {
             return Err(Refusal::Denied(format!(
                 "{url} is not under a configured provider endpoint, so breadram will not send a request there"
             )));
+        }
+        if is_hook_url(url) {
+            return Ok(());
         }
         if !super::is_encrypted_or_loopback(url) {
             return Err(Refusal::Denied(format!(
@@ -232,6 +252,12 @@ impl<'a> AdapterExecutor<'a> {
             }
             self.check_url(&operation.request.url)?;
             self.check_url(&operation.confirmation.request.url)?;
+            if is_hook_url(&operation.request.url) && self.hooks.is_none() {
+                return Err(Refusal::Denied(
+                    "the operation needs a hook runner, which this caller did not provide"
+                        .to_string(),
+                ));
+            }
             return Ok(operation);
         }
         Err(Refusal::Unsupported(reasons.join("; ")))
@@ -247,6 +273,122 @@ impl<'a> AdapterExecutor<'a> {
             result,
         };
         let _ = self.registry.observe(&[outcome], self.clock.monotonic_ms());
+    }
+
+    /// The hook owner and spec for a workload, when one exists.
+    fn hook_owner(&self, workload: &Workload) -> Option<(String, HookSpec)> {
+        self.registry
+            .owners(workload)
+            .into_iter()
+            .find_map(|adapter| {
+                adapter
+                    .hook_spec()
+                    .map(|spec| (adapter.name().to_string(), spec))
+            })
+    }
+
+    /// Carry out a hook release operation.
+    ///
+    /// The hook program runs with its configured bounds, and its answer
+    /// decides the outcome: a hook that declines reports a denial, a hook
+    /// that cannot be run reports a failure, and only `{"released": true}`
+    /// counts as applied. Confirmation still happens separately, through a
+    /// fresh status read.
+    fn apply_hook(
+        &self,
+        request: &crate::coordinator::ActionRequest,
+        operation: &AdapterOperation,
+    ) -> Result<AppliedChange, ExecutorError> {
+        let Some(runner) = self.hooks else {
+            return Err(ExecutorError::Denied(
+                "the operation needs a hook runner, which this caller did not provide".to_string(),
+            ));
+        };
+        let Some(workload) = self.workload(&request.target) else {
+            return Err(ExecutorError::Failed(format!(
+                "the target {} is no longer present",
+                request.target.scope
+            )));
+        };
+        let Some((_, spec)) = self.hook_owner(workload) else {
+            return Err(ExecutorError::Unsupported(format!(
+                "no configured hook owns {}, so nothing can release its memory",
+                workload.id.scope
+            )));
+        };
+        match runner.run(&spec, HookVerb::Release) {
+            Ok(body) => match parse_release(&body) {
+                Ok(release) if release.released => Ok(AppliedChange {
+                    values: Vec::new(),
+                    note: Some(operation_note(request, operation)),
+                }),
+                Ok(release) => {
+                    Err(ExecutorError::Denied(release.note.unwrap_or_else(|| {
+                        "the hook declined the release".to_string()
+                    })))
+                }
+                Err(reason) => Err(ExecutorError::Failed(format!(
+                    "the hook answer could not be read: {reason}"
+                ))),
+            },
+            Err(error) => Err(hook_error(error)),
+        }
+    }
+
+    /// Confirm a hook release with a fresh status read.
+    ///
+    /// The answer is recorded into the owning adapter before it is judged, so
+    /// the next reading of the target is the one the hook just gave. Only a
+    /// status that parses and reports not busy confirms the effect.
+    fn confirm_hook(
+        &self,
+        request: &crate::coordinator::ActionRequest,
+        _operation: &AdapterOperation,
+    ) -> Confirmation {
+        let now_ms = self.clock.monotonic_ms();
+        let Some(runner) = self.hooks else {
+            return Confirmation::NotYet {
+                reason: "the operation needs a hook runner, which this caller did not provide"
+                    .to_string(),
+            };
+        };
+        let Some(workload) = self.workload(&request.target) else {
+            return Confirmation::NotYet {
+                reason: format!("the target {} is no longer present", request.target.scope),
+            };
+        };
+        let owners = self.registry.owners(workload);
+        let Some(adapter) = owners.iter().find(|adapter| adapter.hook_spec().is_some()) else {
+            return Confirmation::NotYet {
+                reason: format!(
+                    "no configured hook owns {}, so there is nothing to read back",
+                    workload.id.scope
+                ),
+            };
+        };
+        let (Some(spec), name) = (adapter.hook_spec(), adapter.name().to_string()) else {
+            return Confirmation::NotYet {
+                reason: "the hook owner has no command to read back".to_string(),
+            };
+        };
+        let result = runner.run(&spec, HookVerb::Status);
+        let _ = adapter.note_hook_result(result.clone(), now_ms);
+        match result {
+            Ok(body) => match parse_status(&body) {
+                Ok(status) if !status.busy => Confirmation::Confirmed,
+                Ok(_) => Confirmation::NotYet {
+                    reason: format!(
+                        "hook {name} still reports busy, so the effect is not visible yet"
+                    ),
+                },
+                Err(reason) => Confirmation::NotYet {
+                    reason: format!("the effect could not be read back: {reason}"),
+                },
+            },
+            Err(error) => Confirmation::NotYet {
+                reason: format!("the effect could not be read back: {error}"),
+            },
+        }
     }
 }
 
@@ -273,6 +415,9 @@ impl Executor for AdapterExecutor<'_> {
             Refusal::Denied(reason) => ExecutorError::Denied(reason),
             Refusal::Gone(reason) => ExecutorError::Failed(reason),
         })?;
+        if is_hook_url(&operation.request.url) {
+            return self.apply_hook(request, &operation);
+        }
         match self
             .operations
             .send_operation(&operation.request, self.operation_timeout_ms)
@@ -316,6 +461,9 @@ impl Executor for AdapterExecutor<'_> {
             self.circuit,
             self.registry.endpoints(),
         );
+        if is_hook_url(&operation.confirmation.request.url) {
+            return self.confirm_hook(request, &operation);
+        }
         let result = probe.probe(&operation.confirmation.request);
         // The answer is recorded before it is judged, so the next reading of the
         // target is the one the provider just gave, whatever it said.
@@ -369,6 +517,63 @@ impl Executor for AdapterExecutor<'_> {
         Err(ExecutorError::Unsupported(format!(
             "a provider setting is not a daemon-owned value, so {key} is not writable through this executor"
         )))
+    }
+
+    fn undo(&self, request: &crate::coordinator::ActionRequest) -> Result<(), ExecutorError> {
+        let Some(workload) = self.workload(&request.target) else {
+            return Err(ExecutorError::Failed(format!(
+                "the target {} is no longer present",
+                request.target.scope
+            )));
+        };
+        let owners = self.registry.owners(workload);
+        let mut hook_seen = false;
+        for adapter in &owners {
+            let Some(spec) = adapter.hook_spec() else {
+                continue;
+            };
+            hook_seen = true;
+            if !adapter
+                .capabilities()
+                .supports(AdapterCapability::WakeModel)
+            {
+                continue;
+            }
+            let Some(runner) = self.hooks else {
+                return Err(ExecutorError::Denied(
+                    "waking the hook needs a hook runner, which this caller did not provide"
+                        .to_string(),
+                ));
+            };
+            match runner.run(&spec, HookVerb::Wake) {
+                Ok(body) => match parse_wake(&body) {
+                    Ok(wake) if wake.awake => return Ok(()),
+                    Ok(wake) => {
+                        return Err(ExecutorError::Denied(wake.note.unwrap_or_else(|| {
+                            format!("hook {} declined the wake", adapter.name())
+                        })));
+                    }
+                    Err(reason) => {
+                        return Err(ExecutorError::Failed(format!(
+                            "the hook answer could not be read: {reason}"
+                        )));
+                    }
+                },
+                Err(error) => return Err(hook_error(error)),
+            }
+        }
+        if hook_seen {
+            return Err(ExecutorError::Unsupported(format!(
+                "hook {} does not offer wake, so there is nothing to undo through",
+                owners
+                    .iter()
+                    .find_map(|adapter| { adapter.hook_spec().map(|_| adapter.name().to_string()) })
+                    .unwrap_or_else(|| workload.id.scope.clone())
+            )));
+        }
+        Err(ExecutorError::Unsupported(
+            "this executor cannot undo that action".to_string(),
+        ))
     }
 }
 
@@ -458,6 +663,30 @@ fn unconfirmed(confirmation: &super::Confirmation, body: &str) -> String {
     }
 }
 
+/// Map a hook failure onto the executor error it most resembles.
+///
+/// A hook that cannot be reached is disconnected; a hook that answers badly
+/// failed; a hook that refuses, whether by policy or by deadline, is denied
+/// or timed out. The mapping keeps the coordinator's retry and journal
+/// semantics identical for hooks and HTTP providers.
+fn hook_error(error: super::hook::HookError) -> ExecutorError {
+    use super::hook::HookError;
+    match error {
+        HookError::Timeout(ms) => {
+            ExecutorError::Timeout(format!("the hook did not answer within {ms} ms"))
+        }
+        HookError::Unsafe(reason) => ExecutorError::Denied(reason),
+        HookError::NonZero { status, excerpt } => {
+            ExecutorError::Denied(format!("hook exited with status {status}: {excerpt}"))
+        }
+        HookError::Io(reason) => ExecutorError::Disconnected(reason),
+        HookError::TooLarge(cap) => {
+            ExecutorError::Failed(format!("the hook printed more than {cap} bytes"))
+        }
+        HookError::Malformed(reason) => ExecutorError::Failed(reason),
+    }
+}
+
 /// A short, bounded piece of a provider's error body.
 fn excerpt(body: &str) -> String {
     let trimmed = body.trim();
@@ -485,6 +714,7 @@ mod tests {
         AdapterCapabilities, Confirmation as AdapterConfirmation, NoSleep, OllamaAdapter,
         ScriptedTransport,
     };
+    use crate::adapter::{HookError, HookRunner, HookSpec, HookVerb};
     use crate::config::{Config, ProviderEndpoint, ProviderKind};
     use crate::coordinator::ActionRequest;
     use crate::inventory::{ControlLevel, MemoryAccounting};
@@ -552,6 +782,9 @@ mod tests {
                 scope: Some(SCOPE.to_string()),
                 credential_ref: None,
                 allow_automation,
+                command: Vec::new(),
+                hook_timeout_ms: None,
+                hook_max_output_bytes: None,
             }],
             mode: ManagementMode::Automatic,
             ..Config::default()
@@ -928,5 +1161,325 @@ mod tests {
         assert!(unconfirmed(&absent, "llama3").contains("still reports llama3"));
         let contains = AdapterConfirmation::contains(ProbeRequest::get("u"), "ok");
         assert!(unconfirmed(&contains, "{}").contains("does not report ok"));
+    }
+
+    const HOOK_ENDPOINT: &str = "hook:trainer";
+    const HOOK_SCOPE: &str = "unit:trainer.service";
+
+    fn hook_workload() -> Workload {
+        Workload {
+            id: WorkloadId {
+                scope: HOOK_SCOPE.to_string(),
+                generation: 1,
+            },
+            name: "trainer.service".to_string(),
+            pids: vec![100],
+            accounting: MemoryAccounting::Cgroup {
+                current_bytes: Some(1024),
+            },
+            control: ControlLevel::Eligible,
+        }
+    }
+
+    fn hook_registry(allow_automation: bool) -> AdapterRegistry {
+        let config = Config {
+            providers: vec![ProviderEndpoint {
+                name: "trainer".to_string(),
+                kind: ProviderKind::Hook,
+                url: HOOK_ENDPOINT.to_string(),
+                scope: Some(HOOK_SCOPE.to_string()),
+                credential_ref: None,
+                allow_automation,
+                command: vec!["/usr/local/bin/breadram-hook-trainer".to_string()],
+                hook_timeout_ms: None,
+                hook_max_output_bytes: None,
+            }],
+            mode: ManagementMode::Automatic,
+            ..Config::default()
+        };
+        let (registry, notes) = AdapterRegistry::from_config(&config);
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("contributes nothing")),
+            "{notes:?}"
+        );
+        assert_eq!(registry.names(), vec!["trainer"]);
+        registry
+    }
+
+    /// A canned hook runner: one answer per verb, every call recorded.
+    #[derive(Default)]
+    struct FakeHooks {
+        status: std::sync::Mutex<Option<Result<String, HookError>>>,
+        release: std::sync::Mutex<Option<Result<String, HookError>>>,
+        wake: std::sync::Mutex<Option<Result<String, HookError>>>,
+        calls: std::sync::Mutex<Vec<HookVerb>>,
+    }
+
+    impl FakeHooks {
+        fn with_status(body: &str) -> Self {
+            Self {
+                status: std::sync::Mutex::new(Some(Ok(body.to_string()))),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl HookRunner for FakeHooks {
+        fn run(&self, _spec: &HookSpec, verb: HookVerb) -> Result<String, HookError> {
+            self.calls.lock().expect("not poisoned").push(verb);
+            let slot = match verb {
+                HookVerb::Status => &self.status,
+                HookVerb::Release => &self.release,
+                HookVerb::Wake => &self.wake,
+            };
+            slot.lock()
+                .expect("not poisoned")
+                .clone()
+                .unwrap_or_else(|| panic!("no {verb:?} answer scripted"))
+        }
+    }
+
+    fn hook_request() -> ActionRequest {
+        ActionRequest::new(
+            hook_workload().id.clone(),
+            ActionKind::UnloadIdleModel,
+            "testing",
+            60_000,
+        )
+    }
+
+    fn hook_executor<'a>(
+        registry: &'a AdapterRegistry,
+        workloads: &'a [Workload],
+        probes: &'a ScriptedTransport,
+        operations: &'a ScriptedTransport,
+        clock: &'a FixedClock,
+        hooks: Option<&'a FakeHooks>,
+    ) -> AdapterExecutor<'a> {
+        let base = AdapterExecutor::new(registry, workloads, probes, operations, &NoSleep, clock);
+        match hooks {
+            Some(runner) => base.with_hook_runner(runner),
+            None => base,
+        }
+    }
+
+    #[test]
+    fn a_hook_release_is_refused_without_a_runner() {
+        let registry = hook_registry(true);
+        let seeder = FakeHooks::with_status(r#"{"busy": false}"#);
+        registry.refresh_hooks(&seeder, 0);
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            None,
+        );
+        match executor.precondition(&hook_request()) {
+            Precondition::Denied { reason } => assert!(reason.contains("hook runner"), "{reason}"),
+            other => panic!("expected a denial, got {other:?}"),
+        }
+        assert_eq!(operations.operation_count(), 0);
+    }
+
+    #[test]
+    fn an_idle_hook_release_is_applied_and_confirmed() {
+        let registry = hook_registry(true);
+        let hooks = FakeHooks {
+            status: std::sync::Mutex::new(Some(Ok(
+                r#"{"busy": false, "host_ram_bytes": 1073741824}"#.to_string(),
+            ))),
+            release: std::sync::Mutex::new(Some(Ok(r#"{"released": true}"#.to_string()))),
+            ..FakeHooks::default()
+        };
+        registry.refresh_hooks(&hooks, 0);
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&hooks),
+        );
+        assert_eq!(executor.precondition(&hook_request()), Precondition::Ready);
+        let change = executor
+            .apply(&hook_request())
+            .expect("the hook accepts it");
+        let note = change.note.expect("a note");
+        assert!(note.contains("through its hook"), "{note}");
+        assert_eq!(operations.operation_count(), 0, "no HTTP request is sent");
+        match executor.confirm(&hook_request()) {
+            Confirmation::Confirmed => {}
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+        assert_eq!(
+            *hooks.calls.lock().expect("not poisoned"),
+            vec![HookVerb::Status, HookVerb::Release, HookVerb::Status]
+        );
+    }
+
+    #[test]
+    fn a_busy_hook_is_never_released() {
+        let registry = hook_registry(true);
+        let hooks = FakeHooks::with_status(r#"{"busy": true}"#);
+        registry.refresh_hooks(&hooks, 0);
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&hooks),
+        );
+        match executor.precondition(&hook_request()) {
+            Precondition::Denied { reason } => {
+                assert!(reason.contains("reports activity"), "{reason}")
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hook_that_declines_reports_a_denial() {
+        let registry = hook_registry(true);
+        let hooks = FakeHooks {
+            status: std::sync::Mutex::new(Some(Ok(r#"{"busy": false}"#.to_string()))),
+            release: std::sync::Mutex::new(Some(Ok(
+                r#"{"released": false, "note": "checkpoint in progress"}"#.to_string(),
+            ))),
+            ..FakeHooks::default()
+        };
+        registry.refresh_hooks(&hooks, 0);
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&hooks),
+        );
+        match executor.apply(&hook_request()) {
+            Err(ExecutorError::Denied(reason)) => {
+                assert!(reason.contains("checkpoint in progress"), "{reason}")
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_still_busy_hook_leaves_the_release_unconfirmed() {
+        let registry = hook_registry(true);
+        let hooks = FakeHooks {
+            status: std::sync::Mutex::new(Some(Ok(r#"{"busy": true}"#.to_string()))),
+            release: std::sync::Mutex::new(Some(Ok(r#"{"released": true}"#.to_string()))),
+            ..FakeHooks::default()
+        };
+        // Seed idle so the release resolves, then report busy again.
+        *hooks.status.lock().expect("not poisoned") = Some(Ok(r#"{"busy": false}"#.to_string()));
+        registry.refresh_hooks(&hooks, 0);
+        *hooks.status.lock().expect("not poisoned") = Some(Ok(r#"{"busy": true}"#.to_string()));
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&hooks),
+        );
+        executor
+            .apply(&hook_request())
+            .expect("the hook accepts it");
+        match executor.confirm(&hook_request()) {
+            Confirmation::NotYet { reason } => {
+                assert!(reason.contains("still reports busy"), "{reason}")
+            }
+            other => panic!("expected NotYet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hook_wake_runs_through_undo() {
+        let registry = hook_registry(true);
+        let hooks = FakeHooks {
+            status: std::sync::Mutex::new(Some(Ok(r#"{"busy": false}"#.to_string()))),
+            wake: std::sync::Mutex::new(Some(Ok(r#"{"awake": true}"#.to_string()))),
+            ..FakeHooks::default()
+        };
+        registry.refresh_hooks(&hooks, 0);
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&hooks),
+        );
+        executor.undo(&hook_request()).expect("the hook wakes");
+        assert_eq!(
+            *hooks.calls.lock().expect("not poisoned"),
+            vec![HookVerb::Status, HookVerb::Wake]
+        );
+    }
+
+    #[test]
+    fn undo_without_a_wake_capability_is_unsupported() {
+        let registry = hook_registry(false);
+        let hooks = FakeHooks::with_status(r#"{"busy": false}"#);
+        registry.refresh_hooks(&hooks, 0);
+        let workloads = [hook_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&hooks),
+        );
+        match executor.undo(&hook_request()) {
+            Err(ExecutorError::Unsupported(reason)) => {
+                assert!(reason.contains("does not offer wake"), "{reason}")
+            }
+            other => panic!("expected unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hook_url_outside_a_configured_endpoint_is_refused() {
+        let registry = hook_registry(true);
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = hook_executor(&registry, &[], &probes, &operations, &FixedClock(0), None);
+        let refusal = executor
+            .check_url("hook:other/release")
+            .expect_err("not configured");
+        assert!(
+            refusal.reason().contains("not under a configured"),
+            "{}",
+            refusal.reason()
+        );
+        assert!(executor.check_url("hook:trainer/release").is_ok());
     }
 }

@@ -126,6 +126,53 @@ pub struct Budget {
     pub max_bytes: u64,
 }
 
+/// The smallest hook timeout that is not obviously a typo (100 ms).
+pub const MIN_HOOK_TIMEOUT_MS: u64 = 100;
+/// The largest hook timeout before a stuck hook holds a monitor pass open
+/// for too long (30 s).
+pub const MAX_HOOK_TIMEOUT_MS: u64 = 30_000;
+/// The default hook timeout (5 s, matching provider operations).
+pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5_000;
+/// The smallest hook output cap that can hold a status document (4 KiB).
+pub const MIN_HOOK_OUTPUT_BYTES: usize = 4 * 1024;
+/// The largest hook output cap (1 MiB, matching the probe client).
+pub const MAX_HOOK_OUTPUT_BYTES: usize = 1024 * 1024;
+/// The default hook output cap (64 KiB).
+pub const DEFAULT_HOOK_OUTPUT_BYTES: usize = 64 * 1024;
+/// The most arguments a hook command may carry (program plus 15).
+pub const MAX_HOOK_ARGS: usize = 16;
+/// The longest a single hook argument may be (4 KiB).
+pub const MAX_HOOK_ARG_LEN: usize = 4 * 1024;
+
+/// How a cooperative hook is invoked.
+///
+/// A hook is an explicitly configured program plus its arguments, run with no
+/// shell, a cleared environment, a deadline, and a cap on how much output is
+/// read. The program reports a workload's busy state and carries out release
+/// and wake operations on request. Hook output is parsed as data and never
+/// executed: nothing a hook prints can change the command that runs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookSpec {
+    /// The program and its arguments. The first entry is an absolute path to
+    /// the executable; the remaining entries are passed verbatim.
+    pub command: Vec<String>,
+    /// How long one hook invocation may run, in milliseconds.
+    pub timeout_ms: u64,
+    /// How many output bytes are read before the invocation is refused.
+    pub max_output_bytes: usize,
+}
+
+impl HookSpec {
+    /// A spec with the default bounds around an explicit command.
+    pub fn with_command(command: Vec<String>) -> Self {
+        Self {
+            command,
+            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
+            max_output_bytes: DEFAULT_HOOK_OUTPUT_BYTES,
+        }
+    }
+}
+
 /// A configured provider endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderEndpoint {
@@ -154,6 +201,24 @@ pub struct ProviderEndpoint {
     /// provides, do not depend on this; only a write does.
     #[serde(default)]
     pub allow_automation: bool,
+    /// The hook program and its arguments, for `hook` providers only.
+    ///
+    /// This is the only thing breadram ever executes for a hook: the command
+    /// comes from this file, never from an inference endpoint or from
+    /// discovered process metadata. Any other provider kind with a command
+    /// configured is rejected.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// How long one hook invocation may run, in milliseconds.
+    ///
+    /// Defaults to 5 s when unset. Only read for `hook` providers.
+    #[serde(default)]
+    pub hook_timeout_ms: Option<u64>,
+    /// How many hook output bytes are read before the invocation is refused.
+    ///
+    /// Defaults to 64 KiB when unset. Only read for `hook` providers.
+    #[serde(default)]
+    pub hook_max_output_bytes: Option<usize>,
 }
 
 /// Which actions automation may take.
@@ -495,6 +560,18 @@ fn validate_endpoint(provider: &ProviderEndpoint) -> Result<(), ConfigError> {
         reason: reason.to_string(),
     };
 
+    if provider.kind == ProviderKind::Hook {
+        return validate_hook_endpoint(provider, &unsafe_endpoint);
+    }
+    if !provider.command.is_empty()
+        || provider.hook_timeout_ms.is_some()
+        || provider.hook_max_output_bytes.is_some()
+    {
+        return Err(unsafe_endpoint(
+            "hook command settings are only valid on a hook provider",
+        ));
+    }
+
     if let Some(rest) = provider.url.strip_prefix("unix:") {
         if rest.is_empty() {
             return Err(unsafe_endpoint("unix endpoint has no path"));
@@ -536,6 +613,129 @@ fn validate_endpoint(provider: &ProviderEndpoint) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+/// Validate a hook provider endpoint and its command.
+fn validate_hook_endpoint(
+    provider: &ProviderEndpoint,
+    unsafe_endpoint: &dyn Fn(&str) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let Some(name) = provider.url.strip_prefix("hook:") else {
+        return Err(unsafe_endpoint(
+            "a hook endpoint url must be hook:<name>, naming this provider",
+        ));
+    };
+    if name.is_empty() || name.contains('/') || name.contains(' ') {
+        return Err(unsafe_endpoint(
+            "a hook endpoint name must be a single token after hook:",
+        ));
+    }
+    if provider.credential_ref.is_some() {
+        return Err(unsafe_endpoint(
+            "a hook endpoint takes no credential, it runs a local program",
+        ));
+    }
+    let unsafe_owned = |reason: String| unsafe_endpoint(reason.as_str());
+    validate_hook_command(
+        &provider.command,
+        provider.hook_timeout_ms,
+        provider.hook_max_output_bytes,
+        &unsafe_owned,
+    )
+}
+
+/// Validate a hook command and its bounds.
+fn validate_hook_command(
+    command: &[String],
+    timeout_ms: Option<u64>,
+    max_output_bytes: Option<usize>,
+    unsafe_endpoint: &dyn Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    if command.is_empty() {
+        return Err(unsafe_endpoint(
+            "a hook provider needs a command: the program to run, as an argument array".to_string(),
+        ));
+    }
+    if command.len() > MAX_HOOK_ARGS {
+        return Err(unsafe_endpoint(format!(
+            "a hook command holds at most {MAX_HOOK_ARGS} arguments"
+        )));
+    }
+    for arg in command {
+        if arg.is_empty() {
+            return Err(unsafe_endpoint(
+                "a hook command argument must not be empty".to_string(),
+            ));
+        }
+        if arg.len() > MAX_HOOK_ARG_LEN {
+            return Err(unsafe_endpoint(format!(
+                "a hook command argument holds at most {MAX_HOOK_ARG_LEN} bytes"
+            )));
+        }
+        if arg.contains('\0') {
+            return Err(unsafe_endpoint(
+                "a hook command argument must not contain a NUL byte".to_string(),
+            ));
+        }
+    }
+    let program = &command[0];
+    if !program.starts_with('/') {
+        return Err(unsafe_endpoint(
+            "a hook program must be an absolute path, looked up in no directory".to_string(),
+        ));
+    }
+    if program.contains("..") {
+        return Err(unsafe_endpoint(
+            "a hook program path must not contain .. segments".to_string(),
+        ));
+    }
+    match timeout_ms {
+        Some(ms) if !(MIN_HOOK_TIMEOUT_MS..=MAX_HOOK_TIMEOUT_MS).contains(&ms) => {
+            return Err(unsafe_endpoint(format!(
+                "hook_timeout_ms must be between {MIN_HOOK_TIMEOUT_MS} and {MAX_HOOK_TIMEOUT_MS}"
+            )));
+        }
+        _ => {}
+    }
+    match max_output_bytes {
+        Some(bytes) if !(MIN_HOOK_OUTPUT_BYTES..=MAX_HOOK_OUTPUT_BYTES).contains(&bytes) => {
+            return Err(unsafe_endpoint(format!(
+                "hook_max_output_bytes must be between {MIN_HOOK_OUTPUT_BYTES} and {MAX_HOOK_OUTPUT_BYTES}"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl HookSpec {
+    /// Build the validated hook spec for a hook provider endpoint.
+    ///
+    /// Returns `None` for any other provider kind. For a hook provider this
+    /// always succeeds after [`validate`], so a failure here means the caller
+    /// skipped validation and the endpoint must not be attached.
+    pub fn from_endpoint(provider: &ProviderEndpoint) -> Option<Self> {
+        if provider.kind != ProviderKind::Hook {
+            return None;
+        }
+        if validate_hook_command(
+            &provider.command,
+            provider.hook_timeout_ms,
+            provider.hook_max_output_bytes,
+            &|_| ConfigError::Parse("unreachable".to_string()),
+        )
+        .is_err()
+        {
+            return None;
+        }
+        Some(Self {
+            command: provider.command.clone(),
+            timeout_ms: provider.hook_timeout_ms.unwrap_or(DEFAULT_HOOK_TIMEOUT_MS),
+            max_output_bytes: provider
+                .hook_max_output_bytes
+                .unwrap_or(DEFAULT_HOOK_OUTPUT_BYTES),
+        })
+    }
 }
 
 fn validate_rules(rules: &[Rule]) -> Result<(), ConfigError> {
@@ -807,9 +1007,75 @@ budget_bytes = 2147483648
 
     #[test]
     fn a_unix_endpoint_is_accepted() {
-        let text = "[[providers]]\nname = \"h\"\nkind = \"hook\"\n\
-                    url = \"unix:/run/breadram/hook.sock\"\nallow_automation = true\n";
+        let text = "[[providers]]\nname = \"o\"\nkind = \"ollama\"\n\
+                    url = \"unix:/run/ollama/ollama.sock\"\nallow_automation = false\n";
         assert!(Config::from_toml(text).is_ok());
+    }
+
+    #[test]
+    fn a_hook_endpoint_needs_a_hook_url_and_a_command() {
+        let good = "[[providers]]\nname = \"trainer\"\nkind = \"hook\"\n\
+                    url = \"hook:trainer\"\nscope = \"unit:trainer.service\"\n\
+                    command = [\"/usr/local/bin/breadram-hook-trainer\"]\n\
+                    allow_automation = true\n";
+        let config = Config::from_toml(good).expect("a hook endpoint is accepted");
+        let spec =
+            HookSpec::from_endpoint(&config.providers[0]).expect("a validated hook has a spec");
+        assert_eq!(spec.timeout_ms, DEFAULT_HOOK_TIMEOUT_MS);
+        assert_eq!(spec.max_output_bytes, DEFAULT_HOOK_OUTPUT_BYTES);
+
+        for bad in [
+            // No command: there is nothing to run.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"hook:h\"\n",
+            // A unix url is not a hook identity.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"unix:/run/breadram/hook.sock\"\n\
+             command = [\"/bin/hook\"]\n",
+            // An http url is not a hook identity either.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"http://127.0.0.1:9999\"\n\
+             command = [\"/bin/hook\"]\n",
+            // A relative program would be resolved against some directory.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"hook:h\"\n\
+             command = [\"bin/hook\"]\n",
+            // A hook timeout outside the bounds.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"hook:h\"\n\
+             command = [\"/bin/hook\"]\nhook_timeout_ms = 10\n",
+            // A hook output cap outside the bounds.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"hook:h\"\n\
+             command = [\"/bin/hook\"]\nhook_max_output_bytes = 10\n",
+            // A credential has no meaning for a local program.
+            "[[providers]]\nname = \"h\"\nkind = \"hook\"\nurl = \"hook:h\"\n\
+             command = [\"/bin/hook\"]\ncredential_ref = \"hook\"\n",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_toml(bad),
+                    Err(ConfigError::UnsafeEndpoint { .. })
+                ),
+                "rejected: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_command_settings_belong_to_hook_providers_only() {
+        let text = "[[providers]]\nname = \"o\"\nkind = \"ollama\"\n\
+                    url = \"http://127.0.0.1:11434\"\ncommand = [\"/bin/hook\"]\n";
+        assert!(matches!(
+            Config::from_toml(text),
+            Err(ConfigError::UnsafeEndpoint { .. })
+        ));
+        let unvalidated = ProviderEndpoint {
+            name: "h".to_string(),
+            kind: ProviderKind::Ollama,
+            url: "http://127.0.0.1:11434".to_string(),
+            scope: None,
+            credential_ref: None,
+            allow_automation: false,
+            command: Vec::new(),
+            hook_timeout_ms: None,
+            hook_max_output_bytes: None,
+        };
+        assert_eq!(HookSpec::from_endpoint(&unvalidated), None);
     }
 
     #[test]

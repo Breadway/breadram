@@ -26,6 +26,7 @@
 
 pub mod capability;
 pub mod executor;
+pub mod hook;
 pub mod http;
 pub mod mock;
 pub mod ollama;
@@ -33,6 +34,10 @@ pub mod probe;
 
 pub use capability::{AdapterCapabilities, AdapterCapability, CAPABILITY_PROBE_VERSION};
 pub use executor::{AdapterExecutor, DEFAULT_OPERATION_TIMEOUT_MS, MAX_ERROR_EXCERPT_CHARS};
+pub use hook::{
+    is_hook_url, parse_release, parse_status, parse_wake, HookAdapter, HookError, HookRelease,
+    HookRunner, HookStatus, HookVerb, HookWake, ProcessHookRunner,
+};
 pub use http::HttpTransport;
 pub use mock::MockAdapter;
 pub use ollama::{LoadedModel, OllamaAdapter, OllamaError, GENERATE_PATH, PS_PATH, VERSION_PATH};
@@ -43,7 +48,7 @@ pub use probe::{
 };
 pub use refresh_adapters as refresh;
 
-use crate::config::{ActionKind, Config, ProviderKind};
+use crate::config::{ActionKind, Config, HookSpec, ProviderKind};
 use crate::inventory::{Workload, WorkloadId};
 use crate::policy::activity::{ActivityEvidence, ActivitySource};
 use crate::telemetry::fs::Clock;
@@ -276,6 +281,31 @@ pub trait WorkloadAdapter: Send + Sync {
     fn operation(&self, _action: ActionKind, _workload: &Workload) -> Option<AdapterOperation> {
         None
     }
+
+    /// The validated hook spec, when this adapter runs a hook program.
+    ///
+    /// Only [`HookAdapter`] returns one. The default keeps every HTTP adapter
+    /// compiling unchanged and lets the executor find the hook owner without
+    /// downcasting.
+    fn hook_spec(&self) -> Option<HookSpec> {
+        None
+    }
+
+    /// Record a hook program answer outside the probe path.
+    ///
+    /// The default ignores it, which is right for every adapter that never
+    /// runs a hook.
+    fn note_hook_result(&self, _result: Result<String, HookError>, _at_ms: u64) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Run this adapter's hook program once and record what came back.
+    ///
+    /// The default does nothing, so adapters without a hook cost nothing on a
+    /// refresh pass.
+    fn refresh_hook(&self, _runner: &dyn HookRunner, _at_ms: u64) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The registered adapters.
@@ -316,23 +346,27 @@ impl AdapterRegistry {
                 ));
                 continue;
             };
-            let mut observation = vec![
-                AdapterCapability::Discovery,
-                AdapterCapability::Inventory,
-                AdapterCapability::Activity,
-            ];
-            if provider.allow_automation {
-                observation.push(AdapterCapability::UnloadModel);
-                observation.push(AdapterCapability::ModelAdministration);
-            } else {
+            // Control capabilities are granted per kind below, only when the
+            // operator set `allow_automation`. Otherwise the adapter is
+            // observation only, which is the conservative default.
+            if !provider.allow_automation {
                 notes.push(format!(
                     "provider {} is observation only: automation may not target it",
                     provider.name
                 ));
             }
-            let capabilities = AdapterCapabilities::configured(&observation);
             match &provider.kind {
                 ProviderKind::Ollama => {
+                    let mut observation = vec![
+                        AdapterCapability::Discovery,
+                        AdapterCapability::Inventory,
+                        AdapterCapability::Activity,
+                    ];
+                    if provider.allow_automation {
+                        observation.push(AdapterCapability::UnloadModel);
+                        observation.push(AdapterCapability::ModelAdministration);
+                    }
+                    let capabilities = AdapterCapabilities::configured(&observation);
                     registry.register(Box::new(
                         OllamaAdapter::new(
                             provider.name.clone(),
@@ -341,6 +375,39 @@ impl AdapterRegistry {
                         )
                         .with_capabilities(capabilities),
                     ));
+                }
+                ProviderKind::Hook => {
+                    match HookSpec::from_endpoint(provider) {
+                        Some(spec) => {
+                            // Hooks are driven by an explicit program, not by
+                            // probing, so discovery is meaningless for them. A
+                            // hook that cannot be attached is reported rather
+                            // than silently dropped.
+                            let mut hook_observation = vec![
+                                AdapterCapability::Inventory,
+                                AdapterCapability::Activity,
+                            ];
+                            if provider.allow_automation {
+                                hook_observation.push(AdapterCapability::UnloadModel);
+                                hook_observation.push(AdapterCapability::WakeModel);
+                            }
+                            let capabilities =
+                                AdapterCapabilities::configured(&hook_observation);
+                            registry.register(Box::new(
+                                HookAdapter::new(
+                                    provider.name.clone(),
+                                    provider.url.clone(),
+                                    scope.to_string(),
+                                    spec,
+                                )
+                                .with_capabilities(capabilities),
+                            ));
+                        }
+                        None => notes.push(format!(
+                            "provider {} is a hook with an invalid command, so it contributes nothing",
+                            provider.name
+                        )),
+                    }
                 }
                 other => notes.push(format!(
                     "provider {} speaks {other:?}, which this build has no adapter for yet",
@@ -456,6 +523,17 @@ impl AdapterRegistry {
             .find_map(|adapter| adapter.operation(action, workload))
     }
 
+    /// Run every hook program once and record what came back.
+    ///
+    /// Notes come back in registration order. Adapters without a hook do
+    /// nothing here.
+    pub fn refresh_hooks(&self, runner: &dyn HookRunner, at_ms: u64) -> Vec<String> {
+        self.adapters
+            .iter()
+            .flat_map(|adapter| adapter.refresh_hook(runner, at_ms))
+            .collect()
+    }
+
     /// An activity source the policy core can consume.
     ///
     /// This is the whole bridge. Policy sees [`ActivitySource`] and never learns
@@ -495,6 +573,20 @@ pub fn refresh_adapters(
         })
         .collect::<Vec<ProbeOutcome>>();
     registry.observe(&outcomes, clock.monotonic_ms())
+}
+
+/// Run every hook program once and record what came back.
+///
+/// Only adapters that run a hook do anything here; every other adapter is
+/// skipped by its own default. A read that failed is recorded as a failed
+/// reading rather than leaving the previous success in place, and the
+/// returned notes name the hook that could not be read.
+pub fn refresh_hooks(
+    registry: &AdapterRegistry,
+    runner: &dyn HookRunner,
+    at_ms: u64,
+) -> Vec<String> {
+    registry.refresh_hooks(runner, at_ms)
 }
 
 /// The bridge from the adapter registry to the policy core.
@@ -575,6 +667,9 @@ mod tests {
                     scope: Some("unit:ollama.service".to_string()),
                     credential_ref: None,
                     allow_automation: true,
+                    command: Vec::new(),
+                    hook_timeout_ms: None,
+                    hook_max_output_bytes: None,
                 },
                 crate::config::ProviderEndpoint {
                     name: "vllm".to_string(),
@@ -583,6 +678,9 @@ mod tests {
                     scope: Some("unit:vllm.service".to_string()),
                     credential_ref: None,
                     allow_automation: true,
+                    command: Vec::new(),
+                    hook_timeout_ms: None,
+                    hook_max_output_bytes: None,
                 },
                 crate::config::ProviderEndpoint {
                     name: "stray".to_string(),
@@ -591,6 +689,9 @@ mod tests {
                     scope: None,
                     credential_ref: None,
                     allow_automation: true,
+                    command: Vec::new(),
+                    hook_timeout_ms: None,
+                    hook_max_output_bytes: None,
                 },
             ],
             ..Config::default()
@@ -624,6 +725,9 @@ mod tests {
                 scope: Some("unit:ollama.service".to_string()),
                 credential_ref: None,
                 allow_automation: false,
+                command: Vec::new(),
+                hook_timeout_ms: None,
+                hook_max_output_bytes: None,
             }],
             ..Config::default()
         };

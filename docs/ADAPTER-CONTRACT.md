@@ -190,6 +190,12 @@ against.
 
 ## Adding a runtime
 
+Prefer a hook when the runtime can cooperate: write a small program speaking
+`docs/HOOKS.md` (`status`, `release`, `wake` over explicit argv), configure it
+as a `hook` provider, and no Rust change is needed. `examples/hook-example.py`
+is the minimal template. Reach for a native adapter below only when the
+runtime already speaks HTTP and probing it is cheaper than shipping a helper.
+
 1. Implement `WorkloadAdapter`, returning `Unknown` from `activity` until you can
    actually tell.
 2. Build `AdapterCapabilities` by probing with `classify`, or state them with

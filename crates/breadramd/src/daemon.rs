@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use breadram_core::adapter::{
-    AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, Sleeper,
+    AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
 };
 use breadram_core::config::{validate, Config};
 use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
@@ -259,6 +259,7 @@ struct ProviderProbes {
     transport: HttpTransport,
     sleeper: ThreadSleeper,
     circuit: CircuitConfig,
+    hooks: ProcessHookRunner,
 }
 
 /// A sleeper that really waits.
@@ -280,19 +281,25 @@ impl Sleeper for ThreadSleeper {
 /// operator configured, so nothing is discovered and no port is guessed. A read
 /// that failed is recorded as a failed reading rather than leaving the previous
 /// success in place, and the returned notes name the endpoint that could not be
-/// read.
+/// read. Hook programs run under the same rule, through the hook runner.
 fn refresh_adapters(
     registry: &AdapterRegistry,
     probes: &ProviderProbes,
     clock: &SystemClock,
 ) -> Vec<String> {
-    breadram_core::adapter::refresh_adapters(
+    let mut notes = breadram_core::adapter::refresh_adapters(
         registry,
         &probes.transport,
         &probes.sleeper,
         clock,
         probes.circuit,
-    )
+    );
+    notes.extend(breadram_core::adapter::refresh_hooks(
+        registry,
+        &probes.hooks,
+        clock.monotonic_ms(),
+    ));
+    notes
 }
 
 /// The policy state that has to survive between monitor ticks.
@@ -604,7 +611,8 @@ fn run_execution(
         &probes.transport,
         &probes.sleeper,
         clock,
-    );
+    )
+    .with_hook_runner(&probes.hooks);
     let executor = ChainedExecutor::new(vec![&control, &provider]);
     let pass = execute_with(
         &mut coordinator,
@@ -1726,6 +1734,9 @@ mod tests {
                 scope: Some(SCOPE.to_string()),
                 credential_ref: None,
                 allow_automation: true,
+                command: Vec::new(),
+                hook_timeout_ms: None,
+                hook_max_output_bytes: None,
             }],
             ..Config::default()
         };

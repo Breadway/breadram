@@ -76,10 +76,11 @@ What is not there yet, named rather than implied:
   correct; the gateway that reports real requests is RAM-45, and a deployment
   that declares complete tracking is what makes a resident but unused model
   releasable. Nothing infers it.
-- Only the Ollama adapter exists. llama.cpp (RAM-13), vLLM (RAM-14),
-  breadsearch (RAM-18), and the workload mapping for containers and services
-  (RAM-16) are open. The transport speaks loopback `http` only: `https` and
-  `unix:` endpoints are refused with a reason rather than sent in the clear.
+- Only the Ollama adapter and the generic hook adapter exist. llama.cpp
+  (RAM-13), vLLM (RAM-14), breadsearch (RAM-18), and the workload mapping for
+  containers and services (RAM-16) are open. The transport speaks loopback
+  `http` only: `https` endpoints are refused with a reason rather than sent in
+  the clear. Hook programs run under the safeguards in `docs/HOOKS.md`.
 - Background jobs (RAM-17), priorities and budgets beyond the per scope budget
   (RAM-21), swap and OOM diagnostics (RAM-23), trends (RAM-28), and the shared
   test fixtures (RAM-29) are still open.
