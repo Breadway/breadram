@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod inventory;
 pub mod ipc;
 pub mod mode;
 pub mod telemetry;

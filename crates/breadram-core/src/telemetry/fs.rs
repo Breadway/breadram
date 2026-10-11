@@ -17,6 +17,12 @@ pub trait FileSource {
 
     /// Whether `path` exists and is a readable regular file.
     fn is_file(&self, path: &Path) -> bool;
+
+    /// List the entry names directly under a directory, in any order.
+    ///
+    /// Only the immediate children are returned, and this never recurses. An
+    /// unreadable directory is an error.
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
 }
 
 /// Reads from the real filesystem.
@@ -30,6 +36,18 @@ impl FileSource for RealFs {
 
     fn is_file(&self, path: &Path) -> bool {
         path.is_file()
+    }
+
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 }
 
@@ -110,6 +128,28 @@ pub(crate) mod test_doubles {
 
         fn is_file(&self, path: &Path) -> bool {
             self.files.contains_key(path)
+        }
+
+        fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
+            let prefix = format!("{}/", path.display());
+            let mut names: Vec<String> = Vec::new();
+            for key in self.files.keys() {
+                let key = key.display().to_string();
+                if let Some(rest) = key.strip_prefix(&prefix) {
+                    let name = rest.split('/').next().unwrap_or(rest).to_string();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            if names.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no such directory in fixture",
+                ));
+            }
+            names.sort();
+            Ok(names)
         }
     }
 
