@@ -676,8 +676,14 @@ impl WorkloadAdapter for OllamaAdapter {
         // One model per action, the largest unloadable one, so each release is
         // separately confirmed and a pinned model is never touched.
         let target = self.unload_targets().into_iter().next()?;
-        let host_delta = -(target.host_model_bytes() as i64);
-        let device_delta = -(target.size_vram_bytes as i64);
+        // The host figure is the whole model on an iGPU (its device bytes are a
+        // carve-out of host RAM) and the part not in device memory otherwise. One
+        // figure drives both the delta and the note, so they cannot disagree.
+        let (freed_host_bytes, freed_device_bytes) = if self.shared_device_memory {
+            (target.size_bytes, 0)
+        } else {
+            (target.host_model_bytes(), target.size_vram_bytes)
+        };
         Some(AdapterOperation {
             kind: action,
             request: OperationRequest::post(
@@ -687,15 +693,15 @@ impl WorkloadAdapter for OllamaAdapter {
                     json_string(&target.name)
                 ),
             ),
-            expected_host_ram_delta: host_delta,
-            expected_device_ram_delta: device_delta,
+            expected_host_ram_delta: -(freed_host_bytes as i64),
+            expected_device_ram_delta: -(freed_device_bytes as i64),
             // Reloading is possible but costs a cold start, which the
             // explanation carries rather than hiding.
             reversible: true,
             note: format!(
                 "releasing {} frees about {} of host memory now; the next request that uses it pays the model's cold-start load time",
                 target.name,
-                human_bytes(target.host_model_bytes())
+                human_bytes(freed_host_bytes)
             ),
             confirmation: Confirmation::absent(
                 ProbeRequest::get(format!("{}{PS_PATH}", self.endpoint)),

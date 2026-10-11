@@ -281,6 +281,37 @@ fn a_read_that_cannot_be_trusted_is_not_acted_on() {
 }
 
 #[test]
+fn an_igpu_release_frees_host_memory_only() {
+    // On an iGPU the model's device bytes are a carve-out of host RAM, so a
+    // release frees host memory and no separate device memory. Reporting part of
+    // it as device relief would misreport where the memory came from.
+    let response = two_models();
+    let adapter = OllamaAdapter::new("ollama", "http://127.0.0.1:11434", SCOPE)
+        .with_reference_time(FIXED_NOW_MS)
+        .with_shared_device_memory(true)
+        .with_capabilities(OllamaAdapter::capabilities_from_probes(&response));
+    adapter
+        .observe_loaded(&response, 1_000)
+        .expect("the recorded body parses");
+    let operation = adapter
+        .operation(ActionKind::UnloadIdleModel, &workload())
+        .expect("a release is offered");
+    assert_eq!(
+        operation.expected_host_ram_delta, -4_294_967_296i64,
+        "the whole model is host memory on an iGPU"
+    );
+    assert_eq!(
+        operation.expected_device_ram_delta, 0,
+        "there is no separate device memory to free on an iGPU"
+    );
+    assert!(
+        operation.note.contains("4.0 GiB"),
+        "the note names the whole model, not the host-only split: {}",
+        operation.note
+    );
+}
+
+#[test]
 fn the_unload_uses_the_documented_flow_and_confirms_the_absence() {
     let adapter = observing(&two_models(), 1_000);
     let operation = adapter
