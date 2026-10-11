@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Serialize)]
 pub struct TrendSample {
     pub at_ms: u64,
     /// Opaque numeric target key, never a command line or credential-bearing URL.
@@ -33,6 +33,25 @@ pub struct TrendHistory {
 }
 
 impl TrendHistory {
+    /// Apply new limits immediately, including while collection is disabled.
+    pub fn configure(&mut self, capacity: usize, retention_ms: u64, now_ms: u64) {
+        self.capacity = capacity;
+        self.retention_ms = retention_ms;
+        self.samples
+            .retain(|sample| sample.at_ms <= now_ms && now_ms - sample.at_ms <= retention_ms);
+        while self.samples.len() > capacity {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn retained(&self, now_ms: u64) -> Vec<TrendSample> {
+        self.samples
+            .iter()
+            .filter(|sample| sample.at_ms <= now_ms && now_ms - sample.at_ms <= self.retention_ms)
+            .cloned()
+            .collect()
+    }
+
     pub fn new(capacity: usize, retention_ms: u64) -> Self {
         Self {
             capacity,
@@ -150,6 +169,18 @@ mod tests {
         history.record(sample(5, None));
         assert_eq!(history.growth(7, 1, 5), Growth::Unknown);
     }
+    #[test]
+    fn reconfiguration_expires_and_shrinks_without_a_new_sample() {
+        let mut history = TrendHistory::new(10, 100);
+        for time in 1..=5 {
+            history.record(sample(time, Some(time)));
+        }
+        history.configure(2, 100, 5);
+        assert_eq!(history.retained(5).len(), 2);
+        history.configure(2, 1, 10);
+        assert!(history.retained(10).is_empty());
+    }
+
     #[test]
     fn retention_capacity_clock_restart_and_numeric_export() {
         let mut history = TrendHistory::new(3, 5);

@@ -13,7 +13,20 @@ and duplicate times produce unknown. Clock reversal clears the timeline; aged
 samples are excluded even when collection has stopped. Estimated/shared RSS is
 never promoted to measured memory.
 
-Remaining acceptance: daemon collection of pressure/action/recovery samples,
-action-effectiveness correlation, CLI JSON and settings integration, bounded
-durable storage/restart migration, and measured collection overhead. This core
-is not yet a user-facing history command and RAM-28 remains doing.
+The daemon collects workload memory from its existing completed inventory pass,
+without another procfs scan. `breadram trends --json` exports those samples;
+`breadram diagnostics --json` includes them in the defaulted `trends` field
+(protocol 1.3). Keys use a per-daemon randomized hash, not scope names or a
+stable cross-restart identity. Samples restart empty rather than joining epochs.
+
+Limits use `[history]`: `max_records`, `max_age_days`, and `max_bytes`.
+The collector reserves 256 bytes per sample and additionally caps retained count
+at 1024 records to leave room in the 1 MiB IPC response. This is an in-memory
+budget, not a durable disk-history claim. Limits shrink and expired samples are
+removed on the next monitor pass, even with no workloads. Export also excludes
+expired records. Both exact cgroup accounting and estimated RSS retain their
+original confidence.
+
+Remaining acceptance: pressure/action/recovery samples, action-effectiveness
+correlation, settings integration, durable storage/restart migration if required,
+and measured collection overhead. RAM-28 remains doing.

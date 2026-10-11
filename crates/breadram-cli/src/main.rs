@@ -80,6 +80,8 @@ enum Command {
     Actions,
     /// Show a diagnostic bundle for a bug report.
     Diagnostics,
+    /// Export bounded numeric workload memory samples from the daemon.
+    Trends,
     /// Change the management mode.
     Mode {
         /// The mode to switch to: monitor or automatic.
@@ -207,6 +209,17 @@ async fn run(cli: &Cli, socket: &Path) -> Result<(), CliError> {
         Command::Diagnostics => {
             let diagnostics = client.diagnostics().await?;
             emit(cli.json, &diagnostics, human_diagnostics)
+        }
+        Command::Trends => {
+            let diagnostics = client.diagnostics().await?;
+            if cli.json {
+                print_json(&diagnostics.trends)
+            } else {
+                print(format!(
+                    "{} memory samples retained; use --json for numeric export. Target keys are daemon-local; growth is not a leak verdict.",
+                    diagnostics.trends.len()
+                ))
+            }
         }
         Command::Mode { persist, .. } => {
             let mode = mode.expect("the mode was parsed before the socket was opened");

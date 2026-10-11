@@ -38,6 +38,7 @@ use breadram_core::telemetry::{
     collect_cgroup_swap, collect_host, collect_swap, Clock, RealFs, SwapLayout, SystemClock,
     WorkloadSwap,
 };
+use breadram_core::trends::{TrendHistory, TrendSample};
 use breadram_core::{CapabilityReport, ManagementMode, VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -81,6 +82,8 @@ pub enum DaemonError {
 }
 
 struct SharedState {
+    trends: RwLock<TrendHistory>,
+    trend_keys: std::collections::hash_map::RandomState,
     published: RwLock<Published>,
     config: RwLock<Config>,
     config_version: AtomicU64,
@@ -205,6 +208,8 @@ pub async fn run_with_config_path(
     let journal_capacity = config.history.max_records as usize;
     let (events, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     let state = Arc::new(SharedState {
+        trends: RwLock::new(TrendHistory::new(0, 0)),
+        trend_keys: std::collections::hash_map::RandomState::new(),
         published: RwLock::new(initial),
         config: RwLock::new(config),
         config_version: AtomicU64::new(0),
@@ -496,6 +501,11 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             coordinator = Some(next_coordinator);
 
             let status = published.status.clone();
+            {
+                let config = state.config.read().await;
+                let mut trends = state.trends.write().await;
+                collect_trends(&mut trends, &published, &config, &state.trend_keys);
+            }
             *state.published.write().await = published;
             let _ = state.events.send(EventPayload {
                 kind: "status".to_string(),
@@ -1056,12 +1066,18 @@ async fn handle_request(
                 let published = state.published.read().await;
                 let journal = state.journal.read().await;
                 let execution_notes = state.execution_notes.read().await;
+                let trends = state
+                    .trends
+                    .read()
+                    .await
+                    .retained(published.status.observed_at_ms);
                 Ok(ResponseBody::Diagnostics(Box::new(diagnostics_payload(
                     state,
                     &published,
                     &config,
                     &journal,
                     &execution_notes,
+                    trends,
                 ))))
             };
             send_result(write, message.id, result).await
@@ -1202,12 +1218,43 @@ fn actions_payload(
     })
 }
 
+/// Collection reuses the inventory snapshot and never performs another procfs read.
+fn collect_trends(
+    history: &mut TrendHistory,
+    published: &Published,
+    config: &Config,
+    keys: &std::collections::hash_map::RandomState,
+) {
+    use std::hash::BuildHasher;
+    let now = published.status.observed_at_ms;
+    // Reserve a conservative wire budget per record to keep diagnostics bounded.
+    // The normal diagnostics response also needs room for capabilities and notes.
+    let capacity = (config.history.max_records as usize)
+        .min((config.history.max_bytes / 256) as usize)
+        .min(MAX_MESSAGE_BYTES / 1024);
+    history.configure(
+        capacity,
+        u64::from(config.history.max_age_days) * 86_400_000,
+        now,
+    );
+    for workload in &published.workloads {
+        history.record(TrendSample {
+            at_ms: now,
+            target_key: keys.hash_one(&workload.id.scope),
+            generation: workload.id.generation,
+            bytes: workload.accounting.bytes(),
+            measured: !workload.accounting.is_estimate(),
+        });
+    }
+}
+
 fn diagnostics_payload(
     state: &SharedState,
     published: &Published,
     config: &Config,
     journal: &ActionJournal,
     execution_notes: &[String],
+    trends: Vec<TrendSample>,
 ) -> DiagnosticsPayload {
     let mut notes = Vec::new();
     match config.mode {
@@ -1231,6 +1278,7 @@ fn diagnostics_payload(
         notes.push(workload.swap.explain(&workload.scope));
     }
     DiagnosticsPayload {
+        trends,
         mode: config.mode,
         version: VERSION.to_string(),
         protocol_major: PROTOCOL_MAJOR,
@@ -1584,6 +1632,30 @@ mod tests {
             },
             control: ControlLevel::Eligible,
         }
+    }
+
+    #[test]
+    fn trend_collection_is_bounded_numeric_and_observation_based() {
+        let mut published = unavailable(ManagementMode::Monitor, 10);
+        published.workloads = vec![workload()];
+        let keys = std::collections::hash_map::RandomState::new();
+        let mut history = TrendHistory::new(0, 0);
+        let mut config = Config::default();
+        config.history.max_records = 2;
+        for at in [10, 20, 30] {
+            published.status.observed_at_ms = at;
+            collect_trends(&mut history, &published, &config, &keys);
+        }
+        let retained = history.retained(30);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].target_key, retained[1].target_key);
+        assert_eq!(retained[1].bytes, Some(6 * GIB));
+        assert!(retained[1].measured);
+        let export = history.export_json(30).unwrap();
+        assert!(!export.contains(SCOPE));
+        config.history.max_bytes = 0;
+        collect_trends(&mut history, &published, &config, &keys);
+        assert!(history.retained(30).is_empty());
     }
 
     fn plan() -> Plan {

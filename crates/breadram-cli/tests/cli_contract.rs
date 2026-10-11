@@ -284,6 +284,7 @@ fn actions() -> ActionsPayload {
 
 fn diagnostics() -> DiagnosticsPayload {
     DiagnosticsPayload {
+        trends: Vec::new(),
         mode: ManagementMode::Monitor,
         version: "test-1.0".to_string(),
         protocol_major: PROTOCOL_MAJOR,
