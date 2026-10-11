@@ -16,6 +16,7 @@
 pub mod adapter;
 pub mod capability;
 pub mod config;
+pub mod coordinator;
 pub mod inventory;
 pub mod ipc;
 pub mod mode;
