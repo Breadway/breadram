@@ -1447,6 +1447,34 @@ fn owner_uid(path: &Path) -> std::io::Result<u32> {
 mod tests {
     use super::*;
     use breadram_core::config::{ActionKind, Automation, Budget};
+
+    /// A directory that removes itself when the test ends.
+    ///
+    /// A test that writes a daemon state file and leaves the directory behind
+    /// leaks one entry into the temporary directory per run.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "breadram-daemon-test-{}-{label}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create the test directory");
+            Self(dir)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     use breadram_core::coordinator::{
         ActionRequest, AppliedChange, Confirmation, ExecutorError, MemoryObservation, OwnedValue,
         Precondition,
@@ -1740,12 +1768,8 @@ mod tests {
 
     #[test]
     fn the_owned_values_survive_a_state_file_and_a_missing_one_is_not_an_error() {
-        let directory = std::env::temp_dir().join(format!(
-            "breadram-daemon-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let path = directory.join("journal.json");
+        let directory = TempDir::new("state-file");
+        let path = directory.path().join("journal.json");
 
         // A first run has no state file, which is not a problem to report.
         let (persisted, notes) = load_persisted(Some(&path));
@@ -1780,8 +1804,7 @@ mod tests {
         assert!(unreadable.is_empty());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("not understood"), "{notes:?}");
-
-        let _ = std::fs::remove_dir_all(&directory);
+        // The directory removes itself when this test ends.
     }
 
     #[test]

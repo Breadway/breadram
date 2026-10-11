@@ -36,14 +36,48 @@ const REFUSED: i32 = 4;
 
 static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 
-fn temp_socket(name: &str) -> PathBuf {
-    let unique = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "breadram-cli-{}-{unique}-{name}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create the test directory");
-    dir.join("breadram.sock")
+/// A socket path in a directory that removes itself when the test ends.
+///
+/// The tests drive the real CLI, so a real socket file is needed. Leaving the
+/// directory behind on every run filled the temporary directory with one entry
+/// per test per run, and a stale socket from an earlier run is not merely untidy:
+/// it can be mistaken for a live daemon.
+struct TestSocket {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl TestSocket {
+    fn new(name: &str) -> Self {
+        let unique = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "breadram-cli-{}-{unique}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the test directory");
+        Self {
+            path: dir.join("breadram.sock"),
+            dir,
+        }
+    }
+}
+
+impl std::ops::Deref for TestSocket {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn temp_socket(name: &str) -> TestSocket {
+    TestSocket::new(name)
 }
 
 fn run(args: &[&str]) -> Output {

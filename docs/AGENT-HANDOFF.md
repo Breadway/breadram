@@ -83,8 +83,11 @@ What is not there yet, named rather than implied:
 - Background jobs (RAM-17), priorities and budgets beyond the per scope budget
   (RAM-21), swap and OOM diagnostics (RAM-23), trends (RAM-28), and the shared
   test fixtures (RAM-29) are still open.
-- Tests that spawn the daemon leave their temporary directories behind in `/tmp`.
-  Cleaning that up belongs to RAM-29.
+- The shared test fixtures RAM-29 asks for (deterministic replay inputs and an
+  isolated integration harness) do not exist yet, so each suite still builds its
+  own. Tests do clean up after themselves now: every temporary directory and
+  socket is removed when the test that made it ends, and the whole suite leaves
+  nothing behind in `/tmp`.
 - Swap, compression, and OOM management are reported rather than managed: the
   layout, the effective per workload swap limit, and the kernel's OOM kill count
   are in `diagnostics`, with the constraints explained in notes. Nothing global
