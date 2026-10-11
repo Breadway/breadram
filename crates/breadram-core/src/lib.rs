@@ -25,6 +25,7 @@ pub mod mode;
 pub mod policy;
 pub mod serving;
 pub mod telemetry;
+pub mod trends;
 
 pub use capability::{Capability, CapabilityReport, CapabilityState};
 pub use ipc::{check_protocol, ProtocolError, PROTOCOL_MAJOR, PROTOCOL_MINOR};

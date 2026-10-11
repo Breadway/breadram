@@ -1,0 +1,174 @@
+//! Bounded, numeric, in-memory trend diagnostics. Growth is not a leak verdict.
+use std::collections::VecDeque;
+
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendSample {
+    pub at_ms: u64,
+    /// Opaque numeric target key, never a command line or credential-bearing URL.
+    pub target_key: u64,
+    pub generation: u64,
+    pub bytes: Option<u64>,
+    /// False for RSS estimates or other potentially shared accounting.
+    pub measured: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Growth {
+    Unknown,
+    NotSustained,
+    Sustained {
+        increase_bytes: u64,
+        interval_ms: u64,
+        measured: bool,
+    },
+}
+
+pub struct TrendHistory {
+    capacity: usize,
+    retention_ms: u64,
+    samples: VecDeque<TrendSample>,
+}
+
+impl TrendHistory {
+    pub fn new(capacity: usize, retention_ms: u64) -> Self {
+        Self {
+            capacity,
+            retention_ms,
+            samples: VecDeque::new(),
+        }
+    }
+
+    pub fn record(&mut self, sample: TrendSample) {
+        // A restart or clock reversal starts a fresh epoch; never join timelines.
+        if self
+            .samples
+            .back()
+            .is_some_and(|last| sample.at_ms < last.at_ms)
+        {
+            self.samples.clear();
+        }
+        let now = sample.at_ms;
+        self.samples
+            .retain(|old| now.saturating_sub(old.at_ms) <= self.retention_ms);
+        if self.capacity == 0 {
+            return;
+        }
+        while self.samples.len() >= self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    pub fn growth(&self, target_key: u64, generation: u64, now_ms: u64) -> Growth {
+        let relevant: Vec<_> = self
+            .samples
+            .iter()
+            .filter(|sample| {
+                sample.target_key == target_key
+                    && sample.at_ms <= now_ms
+                    && now_ms - sample.at_ms <= self.retention_ms
+            })
+            .collect();
+        // Reuse, reset, duplicate timestamps and gaps invalidate a sustained claim.
+        if relevant.len() < 3
+            || relevant
+                .iter()
+                .any(|sample| sample.generation != generation || sample.bytes.is_none())
+        {
+            return Growth::Unknown;
+        }
+        if relevant
+            .windows(2)
+            .any(|pair| pair[1].at_ms <= pair[0].at_ms)
+        {
+            return Growth::Unknown;
+        }
+        if relevant
+            .windows(2)
+            .any(|pair| pair[1].bytes < pair[0].bytes)
+        {
+            return Growth::Unknown;
+        }
+        if relevant
+            .windows(2)
+            .any(|pair| pair[1].bytes == pair[0].bytes)
+        {
+            return Growth::NotSustained;
+        }
+        let first = relevant[0];
+        let last = relevant[relevant.len() - 1];
+        Growth::Sustained {
+            increase_bytes: last.bytes.unwrap() - first.bytes.unwrap(),
+            interval_ms: last.at_ms - first.at_ms,
+            measured: relevant.iter().all(|sample| sample.measured),
+        }
+    }
+
+    /// Export only numeric fields; the caller controls where the JSON is sent.
+    pub fn export_json(&self, now_ms: u64) -> Result<String, serde_json::Error> {
+        let retained: Vec<_> = self
+            .samples
+            .iter()
+            .filter(|sample| sample.at_ms <= now_ms && now_ms - sample.at_ms <= self.retention_ms)
+            .collect();
+        serde_json::to_string(&retained)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn sample(at_ms: u64, bytes: Option<u64>) -> TrendSample {
+        TrendSample {
+            at_ms,
+            target_key: 7,
+            generation: 1,
+            bytes,
+            measured: false,
+        }
+    }
+    #[test]
+    fn growth_is_qualified_and_missing_reset_reuse_are_unknown() {
+        let mut history = TrendHistory::new(10, 100);
+        for (time, bytes) in [(1, 10), (2, 20), (3, 30)] {
+            history.record(sample(time, Some(bytes)));
+        }
+        assert_eq!(
+            history.growth(7, 1, 3),
+            Growth::Sustained {
+                increase_bytes: 20,
+                interval_ms: 2,
+                measured: false
+            }
+        );
+        assert_eq!(history.growth(7, 2, 3), Growth::Unknown);
+        history.record(sample(4, Some(1)));
+        assert_eq!(history.growth(7, 1, 4), Growth::Unknown);
+        history.record(sample(5, None));
+        assert_eq!(history.growth(7, 1, 5), Growth::Unknown);
+    }
+    #[test]
+    fn retention_capacity_clock_restart_and_numeric_export() {
+        let mut history = TrendHistory::new(3, 5);
+        for time in 1..=4 {
+            history.record(sample(time, Some(time)));
+        }
+        assert_eq!(history.samples.len(), 3);
+        assert_eq!(history.export_json(20).unwrap(), "[]");
+        history.record(sample(20, Some(20)));
+        assert_eq!(history.samples.len(), 1);
+        history.record(sample(1, Some(1)));
+        assert_eq!(history.samples.len(), 1);
+        assert_eq!(history.growth(7, 1, 1), Growth::Unknown);
+        let json = history.export_json(1).unwrap();
+        let fields = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        assert_eq!(fields[0].as_object().unwrap().len(), 5);
+        assert_eq!(TrendHistory::new(3, 5).export_json(1).unwrap(), "[]");
+        let mut disabled = TrendHistory::new(0, 5);
+        disabled.record(sample(1, Some(1)));
+        assert_eq!(disabled.export_json(1).unwrap(), "[]");
+    }
+}
