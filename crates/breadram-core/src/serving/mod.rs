@@ -32,7 +32,10 @@ pub mod gateway;
 pub mod lease;
 pub mod lifecycle;
 
-pub use gateway::{Gateway, RouteOutcome};
+pub use gateway::{
+    classify, disposition, Disposition, Gateway, RouteOutcome, ACCEPT_HEADER, CLIENT_HEADER,
+    IDEMPOTENCY_HEADER,
+};
 pub use lease::{
     Admission, ClientId, Lease, LeaseId, Leases, RequestKind, RequestMeta, WorkloadLeases,
     RETRY_MEMORY,

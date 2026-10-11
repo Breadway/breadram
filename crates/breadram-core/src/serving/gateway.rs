@@ -144,6 +144,73 @@ fn retry_hint(err: &AdmitError) -> u64 {
     }
 }
 
+/// The header the gateway reads for a client label.
+pub const CLIENT_HEADER: &str = "x-breadram-client";
+/// The header the gateway reads for an idempotency key.
+pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+/// The header that marks a streamed response.
+pub const ACCEPT_HEADER: &str = "accept";
+
+/// Classify an inbound request into the metadata the core needs.
+///
+/// Only headers are read. The request body is never inspected, so a prompt or a
+/// completion cannot be captured here, and the classified metadata has nowhere
+/// to put one.
+pub fn classify(
+    client_header: Option<&str>,
+    idempotency_header: Option<&str>,
+    accept_header: Option<&str>,
+) -> RequestMeta {
+    let client = client_header
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("anonymous");
+    let mut meta = RequestMeta::new(client);
+    if let Some(key) = idempotency_header
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        meta = meta.with_key(key);
+    }
+    if accept_header.is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream")) {
+        meta = meta.streaming();
+    }
+    meta
+}
+
+/// What the socket server should do with a routing outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Proxy the request to the backend, streaming the response when the client
+    /// asked for a stream.
+    Proxy {
+        /// Whether the response is a stream.
+        streaming: bool,
+    },
+    /// Refuse with a retry hint, which the server reports as 503 and a
+    /// `Retry-After` in seconds.
+    Retry {
+        /// How long the client should wait, in milliseconds.
+        retry_after_ms: u64,
+    },
+    /// Refuse without a retry hint.
+    Refuse,
+}
+
+/// The disposition for a routing outcome.
+pub fn disposition(meta: &RequestMeta, outcome: &RouteOutcome) -> Disposition {
+    match outcome {
+        RouteOutcome::Forward { .. } => Disposition::Proxy {
+            streaming: meta.streaming,
+        },
+        RouteOutcome::WakeThenRetry { retry_after_ms, .. }
+        | RouteOutcome::Retry { retry_after_ms, .. } => Disposition::Retry {
+            retry_after_ms: *retry_after_ms,
+        },
+        RouteOutcome::Refused { .. } => Disposition::Refuse,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +349,44 @@ mod tests {
             ),
             "a replayed key is recognized, not counted as a new request"
         );
+    }
+
+    #[test]
+    fn an_inbound_request_is_classified_from_headers_only() {
+        // A client label, an idempotency key, and a stream marker, all from
+        // headers. No body is read, so a prompt cannot be captured here.
+        let meta = classify(Some("c1"), Some("k1"), Some("text/event-stream"));
+        assert_eq!(meta.client, ClientId("c1".to_string()));
+        assert_eq!(meta.key.as_deref(), Some("k1"));
+        assert!(meta.streaming);
+
+        // Missing or blank headers leave the safe defaults.
+        let meta = classify(None, Some("   "), Some("application/json"));
+        assert_eq!(meta.client, ClientId("anonymous".to_string()));
+        assert_eq!(meta.key, None);
+        assert!(!meta.streaming);
+    }
+
+    #[test]
+    fn an_outcome_maps_to_a_disposition() {
+        let streaming = classify(None, None, Some("text/event-stream"));
+        let mut gateway = Gateway::new(vec![backend(TrackingCompleteness::Complete)]);
+        let outcome = gateway.route(&workload(), streaming.clone(), 1);
+        assert_eq!(
+            disposition(&streaming, &outcome),
+            Disposition::Proxy { streaming: true }
+        );
+
+        let plain = classify(None, None, None);
+        let mut sleeping = Gateway::new(vec![asleep(TrackingCompleteness::Complete)]);
+        let outcome = sleeping.route(&workload(), plain.clone(), 1_000_001);
+        assert!(matches!(
+            disposition(&plain, &outcome),
+            Disposition::Retry { retry_after_ms } if retry_after_ms > 0
+        ));
+
+        let mut untracked = Gateway::new(vec![backend(TrackingCompleteness::Unknown)]);
+        let outcome = untracked.route(&workload(), plain.clone(), 1);
+        assert_eq!(disposition(&plain, &outcome), Disposition::Refuse);
     }
 }
