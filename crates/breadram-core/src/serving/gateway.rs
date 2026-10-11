@@ -150,6 +150,8 @@ pub const CLIENT_HEADER: &str = "x-breadram-client";
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 /// The header that marks a streamed response.
 pub const ACCEPT_HEADER: &str = "accept";
+/// The media type a client sends to ask for a server-sent-events stream.
+pub const EVENT_STREAM: &str = "text/event-stream";
 
 /// Classify an inbound request into the metadata the core needs.
 ///
@@ -172,7 +174,7 @@ pub fn classify(
     {
         meta = meta.with_key(key);
     }
-    if accept_header.is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream")) {
+    if accept_header.is_some_and(|value| value.to_ascii_lowercase().contains(EVENT_STREAM)) {
         meta = meta.streaming();
     }
     meta

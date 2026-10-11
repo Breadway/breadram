@@ -136,6 +136,12 @@ Nothing in the core stores a body: an outcome carries only a client label, a
 request kind, whether the response is streamed, and an idempotency key, so a
 gateway built on it cannot log a prompt or a completion.
 
+An inbound request is classified from headers only (`classify`): the client label,
+the idempotency key, and whether the client asked for a stream. No body is read.
+An outcome maps to a `Disposition`: proxy the request (streaming when the client
+asked), retry with the hint (reported as 503 with `Retry-After` in seconds), or
+refuse.
+
 Still to come for the full gateway: the socket server that preserves native and
 OpenAI-compatible request and response semantics (including streaming and
 cancellation end to end), wiring the provider sleep and wake commands to

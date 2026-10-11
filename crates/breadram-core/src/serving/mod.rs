@@ -29,13 +29,15 @@
 //! completion through these types even by accident.
 
 pub mod gateway;
+pub mod http;
 pub mod lease;
 pub mod lifecycle;
 
 pub use gateway::{
     classify, disposition, Disposition, Gateway, RouteOutcome, ACCEPT_HEADER, CLIENT_HEADER,
-    IDEMPOTENCY_HEADER,
+    EVENT_STREAM, IDEMPOTENCY_HEADER,
 };
+pub use http::{parse_head, ParseError, RequestHead, MAX_HEADERS, MAX_HEADER_BYTES};
 pub use lease::{
     Admission, ClientId, Lease, LeaseId, Leases, RequestKind, RequestMeta, WorkloadLeases,
     RETRY_MEMORY,
