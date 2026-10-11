@@ -1,0 +1,17 @@
+# CPU-only bakery package metadata (RAM-32, partial).
+name = "breadram"
+version = "0.1.0"
+source = "git+https://git.breadway.dev/Breadway/breadram.git"
+revision = "workspace-main"
+license = "MIT"
+binaries = ["breadramd", "breadram"]
+service = "packaging/breadram.service"
+config = "packaging/breadram.toml.example"
+docs = ["README.md", "docs/INSTALL.md"]
+runtime_dependencies = []
+optional_dependencies = ["systemd"]
+no_gpu = true
+no_model_download = true
+no_credentials = true
+no_live_services = true
+release_automation = false
