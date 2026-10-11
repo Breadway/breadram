@@ -73,6 +73,8 @@ docs/                  project brief, architecture, issue map, handoff
 - `docs/ARCHITECTURE.md`: the decisions the implementation honours.
 - `docs/ISSUE-MAP.md`: the full card map and workflow.
 - `docs/AGENT-HANDOFF.md`: starting point for the next agent.
+- `docs/CLI.md`: the command line surface, its output contract, and exit codes.
+- `docs/ADAPTER-CONTRACT.md`: the optional workload adapter interface.
 - `CONTRIBUTING.md`: branch model and checks.
 
 ## License

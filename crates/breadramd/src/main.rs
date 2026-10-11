@@ -53,7 +53,7 @@ async fn main() -> ExitCode {
     let socket = args.socket.clone().unwrap_or_else(default_socket_path);
     tracing::info!(socket = %socket.display(), mode = %config.mode, "breadramd starting");
 
-    match daemon::run(config, socket).await {
+    match daemon::run_with_config_path(config, socket, args.config.clone()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
