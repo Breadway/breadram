@@ -38,7 +38,7 @@ pub use probe::{
     Transport, TransportError,
 };
 
-use crate::config::{ActionKind, ProviderKind};
+use crate::config::{ActionKind, Config, ProviderKind};
 use crate::inventory::{Workload, WorkloadId};
 use crate::policy::activity::{ActivityEvidence, ActivitySource};
 
@@ -246,6 +246,64 @@ impl AdapterRegistry {
         Self::default()
     }
 
+    /// Register the adapters a configuration describes.
+    ///
+    /// Only a configured endpoint is ever attached: nothing is discovered, no
+    /// port is guessed, and an endpoint that names no workload scope is not
+    /// attached at all, because activity evidence has to belong to a workload the
+    /// inventory also sees. Every endpoint that contributed nothing returns a
+    /// note saying why, so a configuration mistake is visible rather than silent.
+    ///
+    /// Control capabilities are granted only when the operator set
+    /// `allow_automation` on that endpoint. Otherwise the adapter is observation
+    /// only, which is the conservative default: it can report what it sees and
+    /// cannot be asked to write.
+    pub fn from_config(config: &Config) -> (Self, Vec<String>) {
+        let mut registry = Self::new();
+        let mut notes = Vec::new();
+        for provider in &config.providers {
+            let Some(scope) = provider.scope.as_deref() else {
+                notes.push(format!(
+                    "provider {} is configured but names no workload scope, so it contributes nothing",
+                    provider.name
+                ));
+                continue;
+            };
+            let mut observation = vec![
+                AdapterCapability::Discovery,
+                AdapterCapability::Inventory,
+                AdapterCapability::Activity,
+            ];
+            if provider.allow_automation {
+                observation.push(AdapterCapability::UnloadModel);
+                observation.push(AdapterCapability::ModelAdministration);
+            } else {
+                notes.push(format!(
+                    "provider {} is observation only: automation may not target it",
+                    provider.name
+                ));
+            }
+            let capabilities = AdapterCapabilities::configured(&observation);
+            match &provider.kind {
+                ProviderKind::Ollama => {
+                    registry.register(Box::new(
+                        OllamaAdapter::new(
+                            provider.name.clone(),
+                            provider.url.clone(),
+                            scope.to_string(),
+                        )
+                        .with_capabilities(capabilities),
+                    ));
+                }
+                other => notes.push(format!(
+                    "provider {} speaks {other:?}, which this build has no adapter for yet",
+                    provider.name
+                )),
+            }
+        }
+        (registry, notes)
+    }
+
     /// Register an adapter. Registration is always optional.
     pub fn register(&mut self, adapter: Box<dyn WorkloadAdapter>) {
         self.adapters.push(adapter);
@@ -395,6 +453,91 @@ mod tests {
             registry.activity(&workload("unit:app.service")),
             ActivityEvidence::Unknown
         );
+    }
+
+    #[test]
+    fn a_configured_provider_is_attached_only_with_a_scope() {
+        let config = Config {
+            providers: vec![
+                crate::config::ProviderEndpoint {
+                    name: "ollama".to_string(),
+                    kind: ProviderKind::Ollama,
+                    url: "http://127.0.0.1:11434".to_string(),
+                    scope: Some("unit:ollama.service".to_string()),
+                    credential_ref: None,
+                    allow_automation: true,
+                },
+                crate::config::ProviderEndpoint {
+                    name: "vllm".to_string(),
+                    kind: ProviderKind::Vllm,
+                    url: "https://gpu.example.net:8000".to_string(),
+                    scope: Some("unit:vllm.service".to_string()),
+                    credential_ref: None,
+                    allow_automation: true,
+                },
+                crate::config::ProviderEndpoint {
+                    name: "stray".to_string(),
+                    kind: ProviderKind::Ollama,
+                    url: "http://127.0.0.1:11500".to_string(),
+                    scope: None,
+                    credential_ref: None,
+                    allow_automation: true,
+                },
+            ],
+            ..Config::default()
+        };
+        let (registry, notes) = AdapterRegistry::from_config(&config);
+        assert_eq!(registry.names(), vec!["ollama"]);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().any(|note| note.contains("no workload scope")));
+        assert!(notes.iter().any(|note| note.contains("no adapter for yet")));
+
+        // With a scope, the adapter owns that workload and reports its endpoint.
+        let owners = registry.owners(&workload("unit:ollama.service"));
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind(), ProviderKind::Ollama);
+        assert_eq!(owners[0].endpoint(), "http://127.0.0.1:11434");
+        assert!(
+            owners[0]
+                .capabilities()
+                .supports(AdapterCapability::UnloadModel),
+            "allow_automation was set, so a release may be offered"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_without_allow_automation_is_observation_only() {
+        let config = Config {
+            providers: vec![crate::config::ProviderEndpoint {
+                name: "ollama".to_string(),
+                kind: ProviderKind::Ollama,
+                url: "http://127.0.0.1:11434".to_string(),
+                scope: Some("unit:ollama.service".to_string()),
+                credential_ref: None,
+                allow_automation: false,
+            }],
+            ..Config::default()
+        };
+        let (registry, notes) = AdapterRegistry::from_config(&config);
+        let owners = registry.owners(&workload("unit:ollama.service"));
+        assert_eq!(owners.len(), 1);
+        assert!(owners[0]
+            .capabilities()
+            .supports(AdapterCapability::Activity));
+        assert!(
+            !owners[0]
+                .capabilities()
+                .supports(AdapterCapability::UnloadModel),
+            "observation is allowed, control is not"
+        );
+        assert_eq!(
+            owners[0].operation(
+                ActionKind::UnloadIdleModel,
+                &workload("unit:ollama.service")
+            ),
+            None
+        );
+        assert!(notes.iter().any(|note| note.contains("observation only")));
     }
 
     #[test]

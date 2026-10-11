@@ -135,10 +135,23 @@ pub struct ProviderEndpoint {
     pub kind: ProviderKind,
     /// The endpoint URL.
     pub url: String,
+    /// The workload scope key this endpoint owns, for example
+    /// `unit:ollama.service`.
+    ///
+    /// An endpoint that names no scope is not attached to a workload, so it can
+    /// contribute nothing: activity evidence has to belong to a workload the
+    /// inventory also sees, or policy would be reasoning about two different
+    /// things. Stated rather than guessed, because a URL does not imply which
+    /// unit or container serves it.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// The name of a credential in the separate credential file.
     #[serde(default)]
     pub credential_ref: Option<String>,
     /// Whether automatic actions may target this endpoint.
+    ///
+    /// Off by default. Observation of the endpoint, and the activity evidence it
+    /// provides, do not depend on this; only a write does.
     #[serde(default)]
     pub allow_automation: bool,
 }
@@ -329,6 +342,14 @@ pub enum ConfigError {
         /// Why it is unsafe.
         reason: String,
     },
+    /// A provider names a scope key that is not a scope key.
+    #[error("provider {name} names the scope {scope}, which is not a scope key such as unit:ollama.service")]
+    InvalidProviderScope {
+        /// The provider name.
+        name: String,
+        /// The scope that was rejected.
+        scope: String,
+    },
     /// Two providers share a name.
     #[error("duplicate provider {0}")]
     DuplicateProvider(String),
@@ -455,6 +476,14 @@ fn validate_providers(providers: &[ProviderEndpoint]) -> Result<(), ConfigError>
             return Err(ConfigError::DuplicateProvider(provider.name.clone()));
         }
         seen.push(&provider.name);
+        if let Some(scope) = &provider.scope {
+            if !scope.contains(':') {
+                return Err(ConfigError::InvalidProviderScope {
+                    name: provider.name.clone(),
+                    scope: scope.clone(),
+                });
+            }
+        }
         validate_endpoint(provider)?;
     }
     Ok(())
@@ -745,6 +774,35 @@ budget_bytes = 2147483648
             Config::from_toml(text),
             Err(ConfigError::UnsafeEndpoint { .. })
         ));
+    }
+
+    #[test]
+    fn a_provider_scope_must_be_a_scope_key() {
+        let good = "[[providers]]\nname = \"ollama\"\nkind = \"ollama\"\n\
+                    url = \"http://127.0.0.1:11434\"\nscope = \"unit:ollama.service\"\n";
+        let config = Config::from_toml(good).expect("a scope key is accepted");
+        assert_eq!(
+            config.providers[0].scope.as_deref(),
+            Some("unit:ollama.service")
+        );
+
+        // A name is not a scope: it would silently never match a workload.
+        let bad = "[[providers]]\nname = \"ollama\"\nkind = \"ollama\"\n\
+                   url = \"http://127.0.0.1:11434\"\nscope = \"ollama\"\n";
+        assert!(matches!(
+            Config::from_toml(bad),
+            Err(ConfigError::InvalidProviderScope { .. })
+        ));
+
+        // And an endpoint with no scope at all is still valid: it simply
+        // contributes nothing until one is stated.
+        let unscoped = "[[providers]]\nname = \"ollama\"\nkind = \"ollama\"\n\
+                        url = \"http://127.0.0.1:11434\"\n";
+        assert!(Config::from_toml(unscoped)
+            .expect("a scope is optional")
+            .providers[0]
+            .scope
+            .is_none());
     }
 
     #[test]
