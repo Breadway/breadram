@@ -142,6 +142,11 @@ An outcome maps to a `Disposition`: proxy the request (streaming when the client
 asked), retry with the hint (reported as 503 with `Retry-After` in seconds), or
 refuse.
 
+The gateway also implements the policy's `ActivitySource`: each backend's leases
+are its activity evidence, so a workload with a live lease is never released and
+an unknown workload is unknown, never idle. That is how the policy learns a
+backend is in use without ever learning that a gateway exists.
+
 Still to come for the full gateway: the socket server that preserves native and
 OpenAI-compatible request and response semantics (including streaming and
 cancellation end to end), wiring the provider sleep and wake commands to

@@ -11,6 +11,7 @@
 //! built on it cannot log a prompt or a completion even by accident.
 
 use crate::inventory::WorkloadId;
+use crate::policy::activity::{ActivityEvidence, ActivitySource};
 
 use super::lease::{Admission, RequestMeta};
 use super::lifecycle::{AdmitError, Backend, ServingState, WakeRequest};
@@ -213,6 +214,18 @@ pub fn disposition(meta: &RequestMeta, outcome: &RouteOutcome) -> Disposition {
     }
 }
 
+/// The gateway presents each backend's leases as activity evidence.
+///
+/// This is how the policy learns a backend is in use without ever learning that
+/// a gateway, a lease, or an adapter exists: a workload with a live lease is
+/// never released, and an unknown workload is unknown, never idle.
+impl ActivitySource for Gateway {
+    fn evidence(&self, workload: &WorkloadId) -> ActivityEvidence {
+        self.backend(workload)
+            .map_or(ActivityEvidence::Unknown, Backend::evidence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +363,34 @@ mod tests {
                 }
             ),
             "a replayed key is recognized, not counted as a new request"
+        );
+    }
+
+    #[test]
+    fn a_live_lease_is_activity_evidence_for_the_policy() {
+        let mut gateway = Gateway::new(vec![backend(TrackingCompleteness::Complete)]);
+        let RouteOutcome::Forward { admission, .. } =
+            gateway.route(&workload(), RequestMeta::new("c1"), 1)
+        else {
+            panic!("a request on an awake backend is forwarded");
+        };
+        assert_eq!(gateway.evidence(&workload()), ActivityEvidence::Active);
+        gateway
+            .backend_mut(&workload())
+            .unwrap()
+            .finish(admission.lease(), 2);
+        assert!(
+            matches!(gateway.evidence(&workload()), ActivityEvidence::Idle { .. }),
+            "with nothing in flight the evidence is idle-since, not active"
+        );
+        let other = WorkloadId {
+            scope: "unit:other.service".to_string(),
+            generation: 1,
+        };
+        assert_eq!(
+            gateway.evidence(&other),
+            ActivityEvidence::Unknown,
+            "an unknown workload is unknown, never idle"
         );
     }
 
