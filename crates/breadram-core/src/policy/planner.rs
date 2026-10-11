@@ -151,7 +151,12 @@ pub fn plan(input: PlannerInput<'_>, channel: PlanChannel) -> Plan {
         // A live activity hint protects the workload even without a rule: work
         // that is actually running must not be reclaimed, and the reason is
         // explained rather than silently dropped.
-        let (effective, source) = explain_priority(config, workload, activity);
+        let (effective, source) = explain_priority(
+            config,
+            workload,
+            activity,
+            serves_protected(config, workload, workloads),
+        );
         if effective == Priority::Protected {
             explanation.push(format!(
                 "{scope}: {source}, so it is protected from action; activity is not idle"
@@ -242,8 +247,18 @@ fn ordered_candidates<'a>(
         .filter(|workload| !is_action_protected(config, workload))
         .collect();
     candidates.sort_by(|left, right| {
-        let (left_priority, _) = explain_priority(config, left, activity);
-        let (right_priority, _) = explain_priority(config, right, activity);
+        let (left_priority, _) = explain_priority(
+            config,
+            left,
+            activity,
+            serves_protected(config, left, workloads),
+        );
+        let (right_priority, _) = explain_priority(
+            config,
+            right,
+            activity,
+            serves_protected(config, right, workloads),
+        );
         priority_rank(left_priority)
             .cmp(&priority_rank(right_priority))
             .then_with(|| usage(right).cmp(&usage(left)))
@@ -272,13 +287,36 @@ pub fn explain_priority(
     config: &Config,
     workload: &Workload,
     activity: &dyn ActivitySource,
+    serves_protected: bool,
 ) -> (Priority, String) {
     priority_with_source(
         &config.rules,
         workload,
         active_hint(activity, workload),
-        false,
+        serves_protected,
     )
+}
+
+/// Whether a workload serves a protected workload, inferred from cgroup nesting.
+///
+/// A workload whose cgroup path is an ancestor of a protected workload's cgroup
+/// path is serving it, so it is protected too rather than being reclaimed out
+/// from under the thing it serves. This is read from the cgroup tree the
+/// inventory already collected, not guessed: it holds only for `cgroup:` scopes,
+/// where nesting is real.
+pub fn serves_protected(config: &Config, workload: &Workload, workloads: &[Workload]) -> bool {
+    let Some(base) = workload.id.scope.strip_prefix("cgroup:") else {
+        return false;
+    };
+    let prefix = format!("{base}/");
+    workloads.iter().any(|other| {
+        is_action_protected(config, other)
+            && other
+                .id
+                .scope
+                .strip_prefix("cgroup:")
+                .is_some_and(|path| path.starts_with(&prefix))
+    })
 }
 
 /// Whether a workload is shielded from automatic action entirely.
@@ -406,7 +444,7 @@ mod tests {
 
     use super::*;
     use crate::capability::CapabilityReport;
-    use crate::config::RuleMatch;
+    use crate::config::{Rule, RuleMatch};
     use crate::inventory::MemoryAccounting;
     use crate::policy::activity::ActivityEvidence;
     use crate::policy::history::{ActionOutcome, ActionRecord};
@@ -985,5 +1023,79 @@ mod tests {
             "a workload with live activity must not be reclaimed: {:?}",
             plans.explanation
         );
+    }
+
+    #[test]
+    fn conflicting_rules_pick_the_most_specific_and_outrank_a_hint() {
+        // Two rules match the same workload. The more specific wins, and either
+        // beats a live activity hint, which is the precedence the card asks for.
+        let w = workload("build", "exe:build", 8 * GIB);
+        let mut config = config(&[]);
+        config.rules = vec![
+            Rule {
+                name: "broad".into(),
+                match_on: RuleMatch::Executable {
+                    value: "build".into(),
+                },
+                priority: Priority::Protected,
+                budget_bytes: None,
+            },
+            Rule {
+                name: "exact".into(),
+                match_on: RuleMatch::Scope {
+                    value: "exe:build".into(),
+                },
+                priority: Priority::Background,
+                budget_bytes: None,
+            },
+        ];
+        let (priority, source) =
+            explain_priority(&config, &w, &FixedActivity::active("exe:build"), false);
+        assert_eq!(
+            priority,
+            Priority::Background,
+            "the more specific rule wins"
+        );
+        assert!(source.starts_with("explicit rule"));
+    }
+
+    #[test]
+    fn a_workload_serving_a_protected_cgroup_is_protected() {
+        // A parent cgroup whose nested workload is protected is serving it, so
+        // it is protected too rather than being reclaimed out from under it. This
+        // is read from the cgroup tree, not guessed.
+        let parent = workload("parent", "cgroup:/app", 8 * GIB);
+        let child = workload("child", "cgroup:/app/protected", GIB);
+        let mut config = config(&[ActionKind::CgroupSoftLimit]);
+        config.protection.protected = vec!["cgroup:/app/protected".to_string()];
+        let workloads = vec![parent.clone(), child.clone()];
+
+        assert!(serves_protected(&config, &parent, &workloads));
+        assert!(!serves_protected(&config, &child, &workloads));
+
+        let (priority, source) = explain_priority(
+            &config,
+            &parent,
+            &FixedActivity::default(),
+            serves_protected(&config, &parent, &workloads),
+        );
+        assert_eq!(priority, Priority::Protected);
+        assert!(
+            source.contains("dependency"),
+            "the source names it: {source}"
+        );
+
+        // And the plan never reclaims the parent.
+        let plans = run(
+            PressureState::Critical,
+            &workloads,
+            &config,
+            &empty_history(),
+            &FixedActivity::default(),
+        );
+        assert!(plans
+            .actions
+            .iter()
+            .all(|action| action.target != parent.id));
     }
 }

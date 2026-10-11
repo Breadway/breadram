@@ -1,15 +1,35 @@
-# Priority evidence (RAM-21, partial)
+# Priority evidence (RAM-21)
 
-Explicit rules retain existing specificity and file-order precedence. The new
-priority explanation helper makes explicit rules override activity hints and
-service relationship hints. A known active interaction, audio stream, inference,
-or build can promote a workload; serving a protected dependency can promote it.
-Missing hints leave the standalone normal default, never implicit idle status.
+Priority is resolved in one place, `priority_with_source`, and the precedence is
+fixed rather than implied:
 
-The debouncer promotes immediately and delays demotion until stable inactivity;
-clock reversal resets the wait. No freeze or memory write is introduced.
+1. An explicit rule, most specific first, ties to the earlier rule in the file.
+2. Serving a protected workload: a workload whose cgroup path is an ancestor of a
+   protected workload's cgroup path is protected too, so it is never reclaimed out
+   from under the thing it serves. This is read from the cgroup tree the inventory
+   already collected, not guessed, and it holds for `cgroup:` scopes where nesting
+   is real.
+3. A live activity hint: a known active interaction, audio stream, inference, or
+   build promotes a workload to protected.
+4. Otherwise the standalone normal default. A missing hint is never read as idle.
 
-Remaining: attach real optional hints and service dependency discovery, wire the
-helper into planner and status with a versioned payload, enforce bounded protection
-budgets, and test worker/dependency groups end to end. These helpers are tested
-core contracts only, not a claim that desktop hints already drive management.
+The planner and the status path both use `explain_priority`. The daemon folds
+each pass's provider activity into a per-scope `HintState` (a `HintDebouncer` per
+scope) and reasons about the debounced view through `DebouncedActivity`, so
+promotion is immediate and demotion waits for `MIN_IDLE_MS` of stable absence.
+A clock reversal resets the wait rather than manufacturing elapsed time. No
+freeze and no memory write is introduced.
+
+`WorkloadSummary` carries the effective `priority` and its `priority_source`
+(protocol minor 5, both defaulted), and `breadram workloads` prints them, so the
+decision is explained where an operator can see it rather than only in a test.
+
+Fixtures cover conflicting rules with a specificity tie-break, a live hint that
+protects a workload with no rule, a workload serving a protected cgroup, and
+missing activity data that leaves the normal default. Worker groups are collapsed
+to one workload in the inventory (`groups_a_service_and_its_workers_into_one_workload`),
+so a worker group carries one priority.
+
+Bounded protection budgets beyond the per scope budget and desktop hint plumbing
+(the compositor or bread activity that would supply a real interaction hint) are
+separate cards; this one resolves and explains the priority.

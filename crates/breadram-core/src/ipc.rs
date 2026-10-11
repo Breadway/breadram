@@ -980,11 +980,11 @@ mod tests {
 
     #[test]
     fn a_diagnostics_payload_from_the_previous_minor_version_still_decodes() {
-// The swap section was added in minor version 2, the trend samples in 3,
-// the growth report in 4, and the per workload priority and source in 5. A
-// client that speaks an older minor must still be able to read a report from
-// this build, and a report written before each addition must still decode here,
-// which is why those fields are defaulted rather than required.
+        // The swap section was added in minor version 2, the trend samples in 3,
+        // the growth report in 4, and the per workload priority and source in 5. A
+        // client that speaks an older minor must still be able to read a report from
+        // this build, and a report written before each addition must still decode here,
+        // which is why those fields are defaulted rather than required.
         assert_eq!(PROTOCOL_MINOR, 5);
         let older = r#"{
             "mode": "monitor",

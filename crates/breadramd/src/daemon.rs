@@ -30,8 +30,9 @@ use breadram_core::ipc::{
     MAX_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use breadram_core::policy::{
-    explain_priority, plan as plan_actions, ActivityEvidence, ActivitySource, DebouncedActivity,
-    Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState, StateMachine, MIN_IDLE_MS,
+    explain_priority, plan as plan_actions, serves_protected, ActivityEvidence, ActivitySource,
+    DebouncedActivity, Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState, StateMachine,
+    MIN_IDLE_MS,
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
@@ -813,7 +814,12 @@ fn observe(
         .workloads
         .iter()
         .map(|workload| {
-            let (priority, source) = explain_priority(config, workload, &activity);
+            let (priority, source) = explain_priority(
+                config,
+                workload,
+                &activity,
+                serves_protected(config, workload, &inventory.workloads),
+            );
             WorkloadPriority {
                 scope: workload.id.scope.clone(),
                 priority,

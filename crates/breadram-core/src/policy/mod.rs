@@ -23,7 +23,7 @@ pub mod state;
 pub use activity::{ActivityEvidence, ActivitySource, DebouncedActivity, UnknownActivity};
 pub use history::{ActionOutcome, ActionRecord, PolicyHistory};
 pub use planner::{
-    budget_for, explain_priority, is_action_protected, plan, Plan, PlanChannel, PlannedAction,
-    PlannerInput, MAX_ACTIONS_CRITICAL, MAX_ACTIONS_PRESSURED, MIN_IDLE_MS,
+    budget_for, explain_priority, is_action_protected, plan, serves_protected, Plan, PlanChannel,
+    PlannedAction, PlannerInput, MAX_ACTIONS_CRITICAL, MAX_ACTIONS_PRESSURED, MIN_IDLE_MS,
 };
 pub use state::{PressureState, StateMachine, RELEASE_FRACTION};
