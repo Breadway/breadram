@@ -1,0 +1,31 @@
+[Unit]
+Description=breadram memory management daemon
+Documentation=https://git.breadway.dev/Breadway/breadram
+After=default.target
+
+[Service]
+Type=simple
+# The config file must exist: install.sh copies the shipped example on first
+# install and never overwrites it afterwards, so upgrades keep the operator's
+# settings. Point this at another location with `systemctl --user edit
+# breadram` when the binaries live elsewhere (for example /usr/bin).
+ExecStart=%h/.local/bin/breadramd --config %h/.config/breadram/breadram.toml
+Restart=on-failure
+RestartSec=5
+# Hardening: breadram observes through /proc and cgroupfs and applies controls
+# through the user manager, so it needs no privilege and writes no cgroup file
+# directly. These options keep exactly that access (see docs/INSTALL.md).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+# Writable by design: the socket under $XDG_RUNTIME_DIR, owned values under
+# $XDG_STATE_HOME (or ~/.local/state), nothing else.
+ReadWritePaths=%t %S/breadram %h/.local/state/breadram
+
+[Install]
+WantedBy=default.target

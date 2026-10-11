@@ -1,0 +1,42 @@
+# breadram example configuration (RAM-31).
+#
+# Copy to ~/.config/breadram/breadram.toml and adjust (`packaging/install.sh`
+# does this on first install and never overwrites an existing file). A fresh
+# install starts in monitor mode: breadram observes, explains, and never
+# changes system state until the operator opts into automatic mode.
+version = 1
+mode = "monitor"
+
+[pressure]
+pressured_some_avg10 = 5.0
+critical_some_avg10 = 25.0
+critical_available_fraction = 0.05
+
+[timing]
+settle_ms = 3000
+cooldown_ms = 30000
+min_dwell_ms = 10000
+
+[protection]
+protected = []
+
+[automation]
+allowed_actions = []
+
+[jobs]
+enabled = false
+
+[history]
+max_records = 10000
+max_age_days = 14
+max_bytes = 16777216
+
+# A hook provider example for runtimes without a built-in adapter. Hooks only
+# run when configured here, and only observe unless allow_automation is true.
+# [[providers]]
+# name = "trainer"
+# kind = "hook"
+# url = "hook:trainer"
+# scope = "unit:trainer.service"
+# command = ["/usr/local/bin/breadram-hook-trainer"]
+# allow_automation = false

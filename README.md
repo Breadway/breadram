@@ -58,6 +58,16 @@ The daemon listens on `$XDG_RUNTIME_DIR/breadram.sock` unless `--socket` is
 given, and the socket is owner only. `breadram` exits 0 on success, 1 when the
 daemon is unavailable or returns an error, and 2 for a usage error.
 
+## Install
+
+```
+./packaging/install.sh install
+```
+
+Installs the systemd user service with the example configuration (monitor
+mode, inert until the operator opts in). See `docs/INSTALL.md` for enable,
+disable, upgrade, uninstall, hardening, and headless notes.
+
 ## Layout
 
 ```
@@ -65,6 +75,7 @@ crates/breadram-core   shared contract types, no system or bread dependencies
 crates/breadramd       the daemon binary
 crates/breadram-cli    the breadram client binary
 docs/                  project brief, architecture, issue map, handoff
+packaging/             user service, example config, installer
 ```
 
 ## Documentation
@@ -76,6 +87,7 @@ docs/                  project brief, architecture, issue map, handoff
 - `docs/CLI.md`: the command line surface, its output contract, and exit codes.
 - `docs/ADAPTER-CONTRACT.md`: the optional workload adapter interface.
 - `docs/HOOKS.md`: the cooperative hook protocol for runtimes without an adapter.
+- `docs/INSTALL.md`: installing the user service, with hardening and recovery notes.
 - `docs/SERVING-COORDINATION.md`: request leases and the drain, sleep, and wake lifecycle.
 - `CONTRIBUTING.md`: branch model and checks.
 
