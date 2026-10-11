@@ -93,6 +93,23 @@ it.
 breadram is Rust. The user is learning Go and does not want handed Go
 solutions, so no Go source is written anywhere in this repository.
 
+### AD-11: Execution is one step, gated by the mode
+
+The planner proposes and the coordinator disposes. The daemon joins them in one
+place, `breadram_core::execution`, and that is the only code that decides whether
+a proposed action may be written: the management mode is checked there, and the
+configured allowed actions are checked again because a plan can outlive the
+configuration it was made under. In any mode other than `automatic` the plan is
+still built and explained and nothing is written, so a monitor mode daemon
+describes exactly what automatic mode would do.
+
+What breadram changed is remembered across runs in a versioned state file under
+the state directory, and a restart restores a value only while it still equals
+what breadram last wrote. A value something else changed is left alone, a target
+that no longer exists is skipped, and a file this build does not understand is
+reported and ignored rather than reinterpreted. Monitor mode never writes, so it
+never restores either: it reports leftover values instead of clearing them.
+
 ## Verification
 
 Every change must pass, from a clean checkout:

@@ -47,7 +47,28 @@ assume must be gated and must report skips honestly.
 
 ## Current state
 
-RAM-1 (this card) defines the contract and the workspace skeleton. The daemon
-and CLI are bootstrap binaries: they parse arguments, print the contract, and
-exit. Telemetry (RAM-2), workload identity (RAM-3), lifecycle and IPC (RAM-4),
-and configuration (RAM-5) are next.
+The daemon and the CLI are real now. Telemetry, workload inventory, validated
+configuration, the versioned IPC surface, pressure policy, host controls, the
+action coordinator, serving coordination, the Ollama adapter, and the
+daemon's plan-execute step have landed. In `monitor` mode the daemon observes,
+explains, and records nothing. In `automatic` mode it runs the plan on each pass:
+it revalidates each action against the live inventory, applies it through systemd
+(never by rewriting a hierarchy itself), confirms the effect, measures what
+changed, journals it, and remembers the values it owns in a versioned state file
+so a restart can restore them.
+
+What is not there yet, named rather than implied:
+
+- No provider action is executed. A configured provider is attached and its
+  activity evidence reaches policy, but nothing can call it: there is no HTTP
+  transport in `breadram_core::adapter` yet, only `ScriptedTransport` for tests.
+  That plus the workload mapping is RAM-13, RAM-14, RAM-16, and RAM-45.
+- Background jobs (RAM-17), priorities and budgets beyond the per scope budget
+  (RAM-21), swap and OOM diagnostics (RAM-23), trends (RAM-28), and the shared
+  test fixtures (RAM-29) are still open.
+- Tests that spawn the daemon leave their temporary directories behind in `/tmp`.
+  Cleaning that up belongs to RAM-29.
+
+Read `docs/ADAPTER-CONTRACT.md` before touching an adapter, `docs/CLI.md` before
+touching the command surface, and `docs/SERVING-COORDINATION.md` before touching
+leases or the sleep and wake lifecycle.

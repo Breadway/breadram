@@ -76,6 +76,31 @@ impl ActionJournal {
         }
     }
 
+    /// A journal that already knows which values breadram owns.
+    ///
+    /// This is what a restart builds: the entries themselves are gone, but the
+    /// owned values are not, and a restore needs them. Ownership is only ever
+    /// claimed for a value the previous run actually wrote.
+    pub fn from_owned_values(
+        capacity: usize,
+        values: impl IntoIterator<Item = (ActionId, OwnedValue)>,
+    ) -> Self {
+        let mut journal = Self::new(capacity);
+        for (id, value) in values {
+            journal.record(JournalEntry {
+                id,
+                scope: value.key.clone(),
+                kind: None,
+                state: ActionState::Confirmed,
+                at_ms: 0,
+                reason: "recovered from the journal of a previous run".to_string(),
+                effect: None,
+                values: vec![value],
+            });
+        }
+        journal
+    }
+
     /// Append an entry, evicting the oldest when full.
     pub fn record(&mut self, entry: JournalEntry) {
         while self.entries.len() >= self.capacity {
@@ -87,6 +112,22 @@ impl ActionJournal {
     /// The entries, oldest first.
     pub fn entries(&self) -> &VecDeque<JournalEntry> {
         &self.entries
+    }
+
+    /// The entries to report as history: actions and restores, oldest first.
+    ///
+    /// A value recovered from a previous run is breadram's to restore, but it is
+    /// not something this run did, so it is held and owned without being
+    /// presented as an action that happened.
+    pub fn history(&self) -> impl DoubleEndedIterator<Item = &JournalEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind.is_some() || entry.state == ActionState::RolledBack)
+    }
+
+    /// How many entries are reported as history.
+    pub fn history_len(&self) -> usize {
+        self.history().count()
     }
 
     /// How many entries are retained.
@@ -115,10 +156,15 @@ impl ActionJournal {
 
     /// Whether this action already has a confirmed effect, which is what makes a
     /// repeated request idempotent.
+    ///
+    /// Only an entry that is actually an action counts. A value recovered from a
+    /// previous run is held and owned without being a claim that the effect is in
+    /// place: a restart restores that value, so the relief it provided is gone,
+    /// and the action must be allowed to run again when the pressure returns.
     pub fn has_confirmed(&self, id: ActionId) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.id == id && entry.state == ActionState::Confirmed)
+        self.entries.iter().any(|entry| {
+            entry.id == id && entry.kind.is_some() && entry.state == ActionState::Confirmed
+        })
     }
 
     /// Every owned value, newest first, de-duplicated by key.
@@ -201,6 +247,77 @@ mod tests {
                 .map(|key| vec![value(key, "100", "50")])
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn a_recovered_value_does_not_suppress_the_action_that_wrote_it() {
+        let id = ActionId::from_scope("unit:app.service", 1, ActionKind::CgroupSoftLimit);
+        let recovered = ActionJournal::from_owned_values(
+            4,
+            [(
+                id,
+                value("systemd:app.service:MemoryHigh", "max", "2147483648"),
+            )],
+        );
+        // The value is breadram's to restore, but the effect is not in place:
+        // a restart restores it, so the action has to be allowed to run again.
+        assert!(!recovered.has_confirmed(id));
+
+        let mut with_action = ActionJournal::from_owned_values(
+            4,
+            [(
+                id,
+                value("systemd:app.service:MemoryHigh", "max", "2147483648"),
+            )],
+        );
+        with_action.record(entry(id, None, ActionState::Confirmed));
+        assert!(
+            with_action.has_confirmed(id),
+            "an action this run confirmed does suppress a repeat"
+        );
+    }
+
+    #[test]
+    fn a_recovered_value_is_owned_without_being_reported_as_an_action() {
+        let id = ActionId::from_scope("unit:app.service", 1, ActionKind::CgroupSoftLimit);
+        let mut recovered = ActionJournal::from_owned_values(
+            4,
+            [(
+                id,
+                value("systemd:app.service:MemoryHigh", "max", "2147483648"),
+            )],
+        );
+        assert_eq!(recovered.len(), 1, "the value is held");
+        assert_eq!(
+            recovered.history_len(),
+            0,
+            "but nothing this run did is claimed as history"
+        );
+
+        // A real action, and a restore, are both history.
+        recovered.record(entry(id, None, ActionState::Confirmed));
+        assert_eq!(recovered.history_len(), 1);
+        recovered.record(entry(id, None, ActionState::RolledBack));
+        assert_eq!(recovered.history_len(), 2);
+    }
+
+    #[test]
+    fn a_recovered_journal_still_owns_what_it_wrote() {
+        let id = ActionId::from_scope("unit:app.service", 1, ActionKind::CgroupSoftLimit);
+        // A full journal is recovered with only its owned values, which is what
+        // survives a restart: what breadram changed, and what it was before.
+        let recovered = ActionJournal::from_owned_values(
+            4,
+            [(
+                id,
+                value("cgroup:unit:app.service/memory.high", "max", "2147483648"),
+            )],
+        );
+        let values = recovered.owned_values();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].0, id);
+        assert_eq!(values[0].1.original, "max");
+        assert_eq!(values[0].1.last_applied, "2147483648");
     }
 
     #[test]

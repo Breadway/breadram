@@ -29,6 +29,7 @@
 
 pub mod executor;
 pub mod journal;
+pub mod persist;
 
 pub use executor::{
     AppliedChange, Confirmation, Executor, ExecutorError, MemoryObservation, Precondition,
@@ -36,6 +37,7 @@ pub use executor::{
 pub use journal::{
     ActionJournal, JournalEntry, OwnedValue, OwnerToken, RestoreOutcome, RestoreResult,
 };
+pub use persist::{PersistedJournal, PersistedOwnedValue, JOURNAL_STATE_VERSION};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,6 +68,15 @@ impl ActionId {
     /// The raw hash, for diagnostics.
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Rebuild an id from the value a previous run recorded.
+    ///
+    /// Used when a journal is recovered from disk, so a restore can be journalled
+    /// against the action that originally wrote the value. It is the same hash a
+    /// lookup would produce: a recovered id is never invented.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 }
 

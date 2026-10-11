@@ -11,9 +11,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use breadram_core::adapter::AdapterRegistry;
 use breadram_core::config::{validate, Config};
-use breadram_core::control::discover_targets;
-use breadram_core::coordinator::ActionJournal;
+use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
+use breadram_core::coordinator::{
+    ActionJournal, Cancellation, Coordinator, Executor, OwnerToken, PersistedJournal,
+    RestoreOutcome,
+};
+use breadram_core::execution::{execute_plan, ExecutionPass};
 use breadram_core::inventory::{collect_inventory, MemoryAccounting, Workload};
 use breadram_core::ipc::{
     self, control_level_name, decode, encode, pressure_state_name, ActionJournalRecord,
@@ -24,7 +29,7 @@ use breadram_core::ipc::{
 };
 use breadram_core::policy::{
     plan as plan_actions, Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState,
-    StateMachine, UnknownActivity,
+    StateMachine,
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{collect_host, Clock, RealFs, SystemClock};
@@ -45,12 +50,10 @@ const HISTORY_RATE_WINDOW_MS: u64 = 60_000;
 /// The number of actions the planner allows inside the rate window.
 const HISTORY_MAX_ACTIONS_PER_WINDOW: usize = 10;
 
-/// The daemon observes and explains. It does not execute yet.
-///
-/// Said in one place so a report never implies that automatic action is running
+/// Said in one place, so a report never implies that automatic action is running
 /// when it is not.
-const EXECUTION_NOTE: &str =
-    "breadramd observes and explains only, so it has recorded no actions yet";
+const OBSERVATION_ONLY_NOTE: &str =
+    "breadramd is in monitor mode, which never writes: no action is executed and the journal records none";
 
 /// Why the daemon could not start or stopped unexpectedly.
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +82,15 @@ struct SharedState {
     config_path: Option<PathBuf>,
     socket: PathBuf,
     journal: RwLock<ActionJournal>,
+    /// What the monitor has to say about executing: what it restored after a
+    /// restart, what it attached, and what it refused. Written by the monitor,
+    /// read by a diagnostic request.
+    execution_notes: RwLock<Vec<String>>,
+    /// Where the owned values are remembered between runs, when there is
+    /// somewhere to put them.
+    state_path: Option<PathBuf>,
+    /// A cooperative stop flag, so a shutdown does not start another write.
+    cancel: Cancellation,
     events: broadcast::Sender<EventPayload>,
     interval_ms: u64,
     socket_uid: u32,
@@ -163,7 +175,13 @@ pub async fn run_with_config_path(
         let config = config.clone();
         tokio::task::spawn_blocking(move || {
             let mut runtime = PolicyRuntime::new(&config, 0);
-            observe(&clock, &config, &mut runtime.machine, &mut runtime.history)
+            observe(
+                &clock,
+                &config,
+                &mut runtime.machine,
+                &mut runtime.history,
+                &runtime.registry,
+            )
         })
         .await
         .unwrap_or_else(|_| unavailable(mode, clock.monotonic_ms()))
@@ -178,6 +196,9 @@ pub async fn run_with_config_path(
         config_path,
         socket: socket.clone(),
         journal: RwLock::new(ActionJournal::new(journal_capacity)),
+        execution_notes: RwLock::new(Vec::new()),
+        state_path: default_state_path(),
+        cancel: Cancellation::new(),
         events,
         interval_ms,
         socket_uid,
@@ -204,6 +225,10 @@ pub async fn run_with_config_path(
         }
     }
 
+    // Ask a write in flight to stop before the last one starts. Nothing is
+    // interrupted part way through: the flag is only read between actions.
+    state.cancel.cancel();
+
     drop(listener);
     let _ = std::fs::remove_file(&socket);
     Ok(())
@@ -212,19 +237,27 @@ pub async fn run_with_config_path(
 /// The policy state that has to survive between monitor ticks.
 ///
 /// It moves into the blocking worker and back on every tick, because hysteresis
-/// depends on the machine keeping its history and the planner needs the same
-/// record of past actions.
+/// depends on the machine keeping its history, the planner needs the same record
+/// of past actions, and an adapter's view of a provider only means something if
+/// it is the same adapter from one tick to the next.
 struct PolicyRuntime {
     machine: StateMachine,
     history: PolicyHistory,
+    registry: AdapterRegistry,
+    /// What the configured providers contributed, or why they contributed
+    /// nothing.
+    adapter_notes: Vec<String>,
     config_version: u64,
 }
 
 impl PolicyRuntime {
     fn new(config: &Config, config_version: u64) -> Self {
+        let (registry, adapter_notes) = AdapterRegistry::from_config(config);
         Self {
             machine: StateMachine::new(config),
             history: policy_history(config),
+            registry,
+            adapter_notes,
             config_version,
         }
     }
@@ -238,7 +271,65 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             &initial_config,
             state.config_version.load(Ordering::Relaxed),
         ));
-        drop(initial_config);
+        let journal_capacity = initial_config.history.max_records as usize;
+        // What happened when this daemon started, kept for the life of the
+        // process: a restore is a one time event, but it is one a report should
+        // still be able to explain hours later.
+        let (persisted, mut startup_notes) = load_persisted(state.state_path.as_deref());
+        let mut coordinator = Some(Coordinator::resume(
+            owner_token(),
+            persisted.to_journal(journal_capacity),
+        ));
+
+        // A restart restores the values breadram still owns, and only those: a
+        // value something else changed is left alone, and a target that is gone
+        // is skipped. In monitor mode nothing is written at all, so leftover
+        // values are reported instead of restored, because a monitor mode daemon
+        // must not change the host.
+        if !persisted.is_empty() {
+            if initial_config.mode == ManagementMode::Automatic {
+                let taken = coordinator.take().expect("a coordinator to resume from");
+                let instance = owner_token();
+                let recovered = tokio::task::spawn_blocking(move || {
+                    let mut coordinator = Coordinator::resume(instance, taken.journal().clone());
+                    let fs = RealFs;
+                    let targets = discover_targets(&fs);
+                    let runner = ProcessRunner;
+                    let executor = ControlExecutor::new(&fs, &runner, &targets);
+                    let results = coordinator.recover(&executor, clock.monotonic_ms());
+                    (coordinator, results)
+                })
+                .await;
+                match recovered {
+                    Ok((next, results)) => {
+                        startup_notes.push(describe_recovery(&results));
+                        state
+                            .execution_notes
+                            .write()
+                            .await
+                            .clone_from(&startup_notes);
+                        publish_and_persist(&state, &next, true).await;
+                        coordinator = Some(next);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "the startup restore failed");
+                        startup_notes.push(
+                            "a restore from a previous run could not be attempted".to_string(),
+                        );
+                        coordinator = Some(Coordinator::resume(
+                            owner_token(),
+                            persisted.to_journal(journal_capacity),
+                        ));
+                    }
+                }
+            } else {
+                startup_notes.push(format!(
+                    "{} value(s) written by a previous run are still in place and were not restored, because monitor mode never writes; switch to automatic mode once to restore them",
+                    persisted.values.len()
+                ));
+            }
+        }
+
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -254,10 +345,15 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             let Some(current_runtime) = runtime.take() else {
                 break;
             };
-            // The reads are blocking, so keep them off the async runtime. The
-            // policy state moves into the task and back, so hysteresis keeps its
-            // history across ticks.
+            let Some(current_coordinator) = coordinator.take() else {
+                break;
+            };
+            // The reads and the writes are blocking, so keep them off the async
+            // runtime. The policy state and the coordinator move into the task
+            // and back, so hysteresis keeps its history and an action is only
+            // applied once.
             let rebuild_config = config.clone();
+            let cancel = state.cancel.clone();
             let collected = tokio::task::spawn_blocking(move || {
                 let mut current_runtime = current_runtime;
                 if current_runtime.config_version != current {
@@ -270,31 +366,59 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                     &config,
                     &mut current_runtime.machine,
                     &mut current_runtime.history,
+                    &current_runtime.registry,
                 );
-                (published, current_runtime)
+                let (next, pass) = run_execution(
+                    current_coordinator,
+                    &config,
+                    published.plan.as_ref(),
+                    &published.workloads,
+                    published.status.observed_at_ms,
+                    &cancel,
+                );
+                (published, current_runtime, next, pass)
             })
             .await;
-            let published = match collected {
-                Ok((published, next_runtime)) => {
-                    runtime = Some(next_runtime);
-                    published
-                }
+            let (published, next_runtime, next_coordinator, pass) = match collected {
+                Ok(collected) => collected,
                 Err(err) => {
                     // A panicked worker must not stop the monitor. Rebuild the
                     // policy state and keep watching, saying plainly that it
                     // happened rather than silently resetting.
                     tracing::warn!(error = %err, "a monitor pass failed, rebuilding the policy state");
                     runtime = Some(PolicyRuntime::new(&rebuild_config, current));
+                    coordinator = Some(Coordinator::resume(
+                        owner_token(),
+                        ActionJournal::new(journal_capacity),
+                    ));
                     continue;
                 }
             };
+            runtime = Some(next_runtime);
             if state.config_version.load(Ordering::Relaxed) != current {
                 // A change landed while this pass was reading the host. It
                 // published an observation built from the newer settings, so
                 // this one is dropped rather than overwriting it with the mode
-                // the host had a moment ago.
+                // the host had a moment ago. The coordinator keeps the values it
+                // wrote, which are still breadram's to restore.
+                coordinator = Some(next_coordinator);
                 continue;
             }
+
+            let wrote = pass.as_ref().is_some_and(ExecutionPass::wrote);
+            let mut notes = startup_notes.clone();
+            if let Some(runtime) = runtime.as_ref() {
+                notes.extend(runtime.adapter_notes.iter().cloned());
+            }
+            match &pass {
+                Some(pass) if wrote => notes.push(pass.summary()),
+                Some(pass) => notes.extend(pass.notes.iter().cloned()),
+                None => {}
+            }
+            *state.execution_notes.write().await = notes;
+            publish_and_persist(&state, &next_coordinator, wrote).await;
+            coordinator = Some(next_coordinator);
+
             let status = published.status.clone();
             *state.published.write().await = published;
             let _ = state.events.send(EventPayload {
@@ -304,6 +428,205 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             });
         }
     });
+}
+
+/// Publish what the coordinator holds, and remember it for a restart.
+///
+/// The journal is only copied out when something was written, so a quiet host
+/// does not copy it on every tick.
+async fn publish_and_persist(state: &SharedState, coordinator: &Coordinator, wrote: bool) {
+    if wrote {
+        *state.journal.write().await = coordinator.journal().clone();
+    }
+    let journal = coordinator.journal();
+    if journal.is_empty() && !wrote {
+        return;
+    }
+    let stored = PersistedJournal::from_journal(journal);
+    let path = state.state_path.clone();
+    let text = match stored.encode() {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::warn!(error = %err, "the owned values could not be encoded");
+            return;
+        }
+    };
+    let Some(path) = path else {
+        return;
+    };
+    let shown = path.display().to_string();
+    let written = tokio::task::spawn_blocking(move || write_state_file(&path, &text)).await;
+    if let Ok(Err(err)) = written {
+        tracing::warn!(error = %err, path = %shown, "the owned values could not be written");
+    }
+}
+
+/// Describe what a startup restore did, in one line.
+fn describe_recovery(results: &[breadram_core::coordinator::RestoreResult]) -> String {
+    if results.is_empty() {
+        return "no value from a previous run needed restoring".to_string();
+    }
+    let count = |want: fn(&RestoreOutcome) -> bool| {
+        results
+            .iter()
+            .filter(|result| want(&result.outcome))
+            .count()
+    };
+    let restored = count(|outcome| *outcome == RestoreOutcome::Restored);
+    let gone = count(|outcome| *outcome == RestoreOutcome::SkippedTargetGone);
+    let unchanged = count(|outcome| *outcome == RestoreOutcome::SkippedNoChange);
+    let foreign = count(|outcome| matches!(outcome, RestoreOutcome::SkippedForeignChange { .. }));
+    let failed = count(|outcome| matches!(outcome, RestoreOutcome::Failed { .. }));
+
+    let mut line = format!("restored {restored} value(s) written by a previous run");
+    if gone > 0 {
+        line.push_str(&format!(", skipped {gone} whose target no longer exists"));
+    }
+    if unchanged > 0 {
+        line.push_str(&format!(
+            ", left {unchanged} already at their original value"
+        ));
+    }
+    if foreign > 0 {
+        line.push_str(&format!(
+            ", left {foreign} alone because something else had changed them"
+        ));
+    }
+    if failed > 0 {
+        line.push_str(&format!(", and failed to restore {failed}"));
+    }
+    line
+}
+
+/// Run the execute step for one pass, with the real control executor.
+///
+/// Only the automatic mode writes, and only the actions the configuration
+/// allows. Host controls go through systemd, which is the manager that owns the
+/// unit's cgroup, so breadram never rewrites a hierarchy itself.
+fn run_execution(
+    mut coordinator: Coordinator,
+    config: &Config,
+    plan: Option<&Plan>,
+    workloads: &[Workload],
+    now_ms: u64,
+    cancel: &Cancellation,
+) -> (Coordinator, Option<ExecutionPass>) {
+    let Some(plan) = plan else {
+        return (coordinator, None);
+    };
+    let fs = RealFs;
+    let targets = discover_targets(&fs);
+    let runner = ProcessRunner;
+    let executor = ControlExecutor::new(&fs, &runner, &targets);
+    let pass = execute_with(
+        &mut coordinator,
+        config,
+        plan,
+        workloads,
+        &executor,
+        now_ms,
+        cancel,
+    );
+    (coordinator, Some(pass))
+}
+
+/// The execute step itself, over any executor.
+///
+/// Split out so the daemon's own gating can be tested without a host control:
+/// a monitor mode pass must write nothing whatever the plan says.
+#[allow(clippy::too_many_arguments)]
+fn execute_with(
+    coordinator: &mut Coordinator,
+    config: &Config,
+    plan: &Plan,
+    workloads: &[Workload],
+    executor: &dyn Executor,
+    now_ms: u64,
+    cancel: &Cancellation,
+) -> ExecutionPass {
+    execute_plan(
+        coordinator,
+        plan,
+        config,
+        config.mode,
+        workloads,
+        executor,
+        now_ms,
+        cancel,
+    )
+}
+
+/// A label for the values this instance writes.
+fn owner_token() -> OwnerToken {
+    OwnerToken(format!("breadramd-{}", std::process::id()))
+}
+
+/// Where the owned values live between runs.
+///
+/// The socket lives in the runtime directory, which is cleared on a reboot, so
+/// it is the wrong place for something that has to survive one. If there is
+/// nowhere to write, the daemon still works: it simply cannot restore anything
+/// after a restart, and nothing is claimed to the contrary.
+fn default_state_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir).join("breadram/journal.json"));
+    }
+    let home = std::env::var_os("HOME").filter(|dir| !dir.is_empty())?;
+    Some(PathBuf::from(home).join(".local/state/breadram/journal.json"))
+}
+
+/// Read the values a previous run owned.
+///
+/// A missing file is the ordinary first run. A file this build cannot read is
+/// reported and ignored, never guessed at: restoring a value from a file written
+/// by another build is exactly the case where guessing would write the wrong
+/// thing.
+fn load_persisted(path: Option<&Path>) -> (PersistedJournal, Vec<String>) {
+    let empty = PersistedJournal {
+        version: breadram_core::coordinator::JOURNAL_STATE_VERSION,
+        values: Vec::new(),
+    };
+    let Some(path) = path else {
+        return (
+            empty,
+            vec!["no state directory is available, so the values breadram owns cannot be remembered across a restart".to_string()],
+        );
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (empty, Vec::new()),
+        Err(err) => {
+            return (
+                empty,
+                vec![format!(
+                    "the state file at {} could not be read, so nothing was restored: {err}",
+                    path.display()
+                )],
+            )
+        }
+    };
+    match PersistedJournal::decode(&text) {
+        Ok(persisted) => (persisted, Vec::new()),
+        Err(err) => (
+            empty,
+            vec![format!(
+                "the state file at {} was not understood, so nothing was restored: {err}",
+                path.display()
+            )],
+        ),
+    }
+}
+
+/// Write the owned values, creating the directory when needed.
+fn write_state_file(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Written beside the target and renamed, so a crash cannot leave a half
+    // written state file that a restart would then read.
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path)
 }
 
 /// A history bounded by the configured retention.
@@ -321,6 +644,7 @@ fn observe(
     config: &Config,
     machine: &mut StateMachine,
     history: &mut PolicyHistory,
+    registry: &AdapterRegistry,
 ) -> Published {
     let fs = RealFs;
     let inventory = collect_inventory(&fs);
@@ -340,13 +664,19 @@ fn observe(
                 workloads: &inventory.workloads,
                 config,
                 history,
-                // No adapter is registered yet, so no workload has proven
-                // activity. Unknown is never idle.
-                activity: &UnknownActivity,
+                // A configured provider is the only thing that can prove a
+                // model backend is idle. With none attached, nothing has proven
+                // activity, and unknown is never idle.
+                activity: &registry.activity_source(&inventory.workloads),
             },
-            // The plan describes what automatic mode would do. Nothing executes,
-            // so it is never labelled as a plan that would run.
-            PlanChannel::DryRun,
+            // The channel says whether the caller may execute. In automatic mode
+            // it is the plan that will be carried out; in any other mode the
+            // same reasoning is kept and the actions are dropped.
+            if config.mode == ManagementMode::Automatic {
+                PlanChannel::Automatic
+            } else {
+                PlanChannel::DryRun
+            },
         )
     });
     let status = match &snapshot {
@@ -581,7 +911,7 @@ async fn handle_request(
             let result = {
                 let published = state.published.read().await;
                 let journal = state.journal.read().await;
-                actions_payload(&published, &journal)
+                actions_payload(&published, &journal, state.config.read().await.mode)
                     .map(|payload| ResponseBody::Actions(Box::new(payload)))
             };
             send_result(write, message.id, result).await
@@ -591,8 +921,13 @@ async fn handle_request(
             let result = {
                 let published = state.published.read().await;
                 let journal = state.journal.read().await;
+                let execution_notes = state.execution_notes.read().await;
                 Ok(ResponseBody::Diagnostics(Box::new(diagnostics_payload(
-                    state, &published, &config, &journal,
+                    state,
+                    &published,
+                    &config,
+                    &journal,
+                    &execution_notes,
                 ))))
             };
             send_result(write, message.id, result).await
@@ -711,19 +1046,25 @@ fn plan_payload(published: &Published) -> Result<PlanPayload, ApiError> {
 fn actions_payload(
     published: &Published,
     journal: &ActionJournal,
+    mode: ManagementMode,
 ) -> Result<ActionsPayload, ApiError> {
     let plan = plan_payload(published)?;
+    // Actions and restores only: a value recovered from a previous run is
+    // breadram's to restore, but it is not something this run did.
     let history: Vec<ActionJournalRecord> = journal
-        .entries()
-        .iter()
+        .history()
         .rev()
         .map(ActionJournalRecord::from_entry)
         .collect();
+    // In automatic mode an empty history means nothing needed doing, not that
+    // nothing runs, so no note is added: a note here would be a false reason.
+    let history_note =
+        (mode != ManagementMode::Automatic).then(|| OBSERVATION_ONLY_NOTE.to_string());
     Ok(ActionsPayload {
         plan,
         history,
         history_capacity: journal.capacity(),
-        history_note: Some(EXECUTION_NOTE.to_string()),
+        history_note,
     })
 }
 
@@ -732,8 +1073,17 @@ fn diagnostics_payload(
     published: &Published,
     config: &Config,
     journal: &ActionJournal,
+    execution_notes: &[String],
 ) -> DiagnosticsPayload {
-    let mut notes = vec![EXECUTION_NOTE.to_string()];
+    let mut notes = Vec::new();
+    match config.mode {
+        ManagementMode::Automatic => notes.push(
+            "breadramd is in automatic mode: a plan is carried out on each pass, within the allowed actions"
+                .to_string(),
+        ),
+        other => notes.push(format!("{other} mode never writes: {OBSERVATION_ONLY_NOTE}")),
+    }
+    notes.extend(execution_notes.iter().cloned());
     if config.automation.allowed_actions.is_empty() {
         notes.push(
             "automation allows no actions, so automatic mode would never act on this host"
@@ -759,9 +1109,9 @@ fn diagnostics_payload(
         control_targets: published.control_targets,
         capabilities: merged_capabilities(published),
         journal: JournalSummary {
-            entries: journal.len(),
+            entries: journal.history_len(),
             capacity: journal.capacity(),
-            executing: false,
+            executing: config.mode == ManagementMode::Automatic,
         },
         notes,
     }
@@ -870,7 +1220,14 @@ async fn apply_config_change(
         tokio::task::spawn_blocking(move || {
             let mut machine = StateMachine::new(&config);
             let mut history = policy_history(&config);
-            observe(&clock, &config, &mut machine, &mut history)
+            let runtime = PolicyRuntime::new(&config, 0);
+            observe(
+                &clock,
+                &config,
+                &mut machine,
+                &mut history,
+                &runtime.registry,
+            )
         })
         .await
         .map_err(|err| ApiError::new(ErrorCode::Internal, err.to_string()))?
@@ -949,4 +1306,299 @@ fn set_owner_only(path: &Path) -> std::io::Result<()> {
 fn owner_uid(path: &Path) -> std::io::Result<u32> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata(path)?.uid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use breadram_core::config::{ActionKind, Automation, Budget};
+    use breadram_core::coordinator::{
+        ActionRequest, AppliedChange, Confirmation, ExecutorError, MemoryObservation, OwnedValue,
+        Precondition,
+    };
+    use breadram_core::inventory::{ControlLevel, WorkloadId};
+    use breadram_core::policy::{Plan, PlanChannel, PlannedAction, PressureState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const SCOPE: &str = "unit:build.service";
+
+    /// An executor that records what it was asked to do and writes nothing.
+    struct FakeExecutor {
+        applies: AtomicUsize,
+        memory: u64,
+    }
+
+    impl FakeExecutor {
+        fn new() -> Self {
+            Self {
+                applies: AtomicUsize::new(0),
+                memory: 6 * GIB,
+            }
+        }
+
+        fn applies(&self) -> usize {
+            self.applies.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Executor for FakeExecutor {
+        fn supports(&self, _kind: ActionKind) -> bool {
+            true
+        }
+
+        fn precondition(&self, _request: &ActionRequest) -> Precondition {
+            Precondition::Ready
+        }
+
+        fn apply(&self, _request: &ActionRequest) -> Result<AppliedChange, ExecutorError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            Ok(AppliedChange {
+                values: vec![OwnedValue {
+                    key: "cgroup:unit:build.service/memory.high".to_string(),
+                    original: "max".to_string(),
+                    last_applied: (2 * GIB).to_string(),
+                    owner: OwnerToken("test".to_string()),
+                }],
+                note: None,
+            })
+        }
+
+        fn confirm(&self, _request: &ActionRequest) -> Confirmation {
+            Confirmation::Confirmed
+        }
+
+        fn observe(&self, _target: &WorkloadId) -> MemoryObservation {
+            MemoryObservation {
+                host_ram_bytes: Some(self.memory),
+                device_ram_bytes: None,
+            }
+        }
+
+        fn read_value(&self, _key: &str) -> Result<Option<String>, ExecutorError> {
+            Ok(Some("max".to_string()))
+        }
+
+        fn write_value(&self, _key: &str, _value: &str) -> Result<(), ExecutorError> {
+            Err(ExecutorError::Unsupported(
+                "the fake writes nothing".to_string(),
+            ))
+        }
+    }
+
+    fn config(allowed: Vec<ActionKind>) -> Config {
+        Config {
+            mode: ManagementMode::Automatic,
+            automation: Automation {
+                allowed_actions: allowed,
+            },
+            budgets: vec![Budget {
+                scope: SCOPE.to_string(),
+                max_bytes: 2 * GIB,
+            }],
+            ..Config::default()
+        }
+    }
+
+    fn workload() -> Workload {
+        Workload {
+            id: WorkloadId {
+                scope: SCOPE.to_string(),
+                generation: 7,
+            },
+            name: SCOPE.to_string(),
+            pids: vec![1],
+            accounting: MemoryAccounting::Cgroup {
+                current_bytes: Some(6 * GIB),
+            },
+            control: ControlLevel::Eligible,
+        }
+    }
+
+    fn plan() -> Plan {
+        Plan {
+            state: PressureState::Pressured,
+            channel: PlanChannel::Automatic,
+            would_execute: true,
+            actions: vec![PlannedAction {
+                target: workload().id,
+                kind: ActionKind::CgroupSoftLimit,
+                reason: "the workload is over its budget".to_string(),
+                expected_host_ram_delta: -(2 * GIB as i64),
+                requires_confirmed_idle: false,
+            }],
+            explanation: Vec::new(),
+        }
+    }
+
+    fn coordinator() -> Coordinator {
+        Coordinator::new(OwnerToken("test".to_string()), 32)
+    }
+
+    #[test]
+    fn an_automatic_pass_writes_and_journals_the_measured_effect() {
+        let executor = FakeExecutor::new();
+        let mut coordinator = coordinator();
+        let settings = config(vec![ActionKind::CgroupSoftLimit]);
+
+        let pass = execute_with(
+            &mut coordinator,
+            &settings,
+            &plan(),
+            &[workload()],
+            &executor,
+            1_000,
+            &Cancellation::new(),
+        );
+
+        assert_eq!(executor.applies(), 1);
+        assert_eq!(pass.confirmed(), 1, "{}", pass.summary());
+        let entry = &coordinator.journal().entries()[0];
+        assert_eq!(entry.scope, SCOPE);
+        assert_eq!(entry.at_ms, 1_000);
+        assert_eq!(entry.reason, "the workload is over its budget");
+        assert_eq!(
+            entry.state,
+            breadram_core::coordinator::ActionState::Confirmed
+        );
+        assert_eq!(
+            entry
+                .effect
+                .as_ref()
+                .and_then(|effect| effect.observed_host_ram_delta),
+            Some(0),
+            "the effect is measured from the executor's own readings"
+        );
+        assert_eq!(
+            entry.values[0].key, "cgroup:unit:build.service/memory.high",
+            "and the value breadram now owns is recorded, so it can be restored"
+        );
+    }
+
+    #[test]
+    fn a_monitor_mode_pass_writes_nothing_whatever_the_plan_says() {
+        let executor = FakeExecutor::new();
+        let mut coordinator = coordinator();
+        let settings = Config {
+            mode: ManagementMode::Monitor,
+            ..config(vec![ActionKind::CgroupSoftLimit])
+        };
+
+        let pass = execute_with(
+            &mut coordinator,
+            &settings,
+            &plan(),
+            &[workload()],
+            &executor,
+            1_000,
+            &Cancellation::new(),
+        );
+
+        assert_eq!(executor.applies(), 0, "monitor mode must not write");
+        assert!(coordinator.journal().is_empty());
+        assert!(!pass.wrote());
+        assert!(pass.notes[0].contains("never writes"), "{:?}", pass.notes);
+    }
+
+    #[test]
+    fn a_pass_refuses_what_the_configuration_does_not_allow() {
+        let executor = FakeExecutor::new();
+        let mut coordinator = coordinator();
+        let settings = config(Vec::new());
+
+        let pass = execute_with(
+            &mut coordinator,
+            &settings,
+            &plan(),
+            &[workload()],
+            &executor,
+            1_000,
+            &Cancellation::new(),
+        );
+
+        assert_eq!(executor.applies(), 0);
+        assert!(coordinator.journal().is_empty());
+        assert!(
+            pass.notes
+                .iter()
+                .any(|note| note.contains("automation does not allow it")),
+            "{:?}",
+            pass.notes
+        );
+    }
+
+    #[test]
+    fn a_second_pass_does_not_apply_the_same_action_twice() {
+        let executor = FakeExecutor::new();
+        let mut coordinator = coordinator();
+        let settings = config(vec![ActionKind::CgroupSoftLimit]);
+
+        for _ in 0..3 {
+            execute_with(
+                &mut coordinator,
+                &settings,
+                &plan(),
+                &[workload()],
+                &executor,
+                1_000,
+                &Cancellation::new(),
+            );
+        }
+
+        assert_eq!(executor.applies(), 1, "a confirmed action is not repeated");
+        assert_eq!(coordinator.journal().len(), 3);
+    }
+
+    #[test]
+    fn the_owned_values_survive_a_state_file_and_a_missing_one_is_not_an_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "breadram-daemon-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = directory.join("journal.json");
+
+        // A first run has no state file, which is not a problem to report.
+        let (persisted, notes) = load_persisted(Some(&path));
+        assert!(persisted.is_empty());
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // After a write, the values come back with their originals.
+        let executor = FakeExecutor::new();
+        let mut coordinator = coordinator();
+        let settings = config(vec![ActionKind::CgroupSoftLimit]);
+        execute_with(
+            &mut coordinator,
+            &settings,
+            &plan(),
+            &[workload()],
+            &executor,
+            1_000,
+            &Cancellation::new(),
+        );
+        let stored = PersistedJournal::from_journal(coordinator.journal());
+        write_state_file(&path, &stored.encode().expect("encodes")).expect("writes");
+        let (reloaded, notes) = load_persisted(Some(&path));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(reloaded, stored);
+        let resumed = reloaded.to_journal(32);
+        assert_eq!(resumed.owned_values().len(), 1);
+        assert_eq!(resumed.owned_values()[0].1.original, "max");
+
+        // A file this build cannot read is reported and ignored.
+        std::fs::write(&path, "{ not json").expect("writes");
+        let (unreadable, notes) = load_persisted(Some(&path));
+        assert!(unreadable.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("not understood"), "{notes:?}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_daemon_with_no_state_directory_says_so() {
+        let (persisted, notes) = load_persisted(None);
+        assert!(persisted.is_empty());
+        assert!(notes[0].contains("no state directory"), "{notes:?}");
+    }
 }
