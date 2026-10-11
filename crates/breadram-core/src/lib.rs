@@ -22,6 +22,7 @@ pub mod inventory;
 pub mod ipc;
 pub mod mode;
 pub mod policy;
+pub mod serving;
 pub mod telemetry;
 
 pub use capability::{Capability, CapabilityReport, CapabilityState};

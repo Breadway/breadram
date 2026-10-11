@@ -75,6 +75,7 @@ docs/                  project brief, architecture, issue map, handoff
 - `docs/AGENT-HANDOFF.md`: starting point for the next agent.
 - `docs/CLI.md`: the command line surface, its output contract, and exit codes.
 - `docs/ADAPTER-CONTRACT.md`: the optional workload adapter interface.
+- `docs/SERVING-COORDINATION.md`: request leases and the drain, sleep, and wake lifecycle.
 - `CONTRIBUTING.md`: branch model and checks.
 
 ## License
