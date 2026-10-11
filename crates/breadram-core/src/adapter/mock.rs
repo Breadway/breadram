@@ -10,10 +10,7 @@ use crate::policy::activity::ActivityEvidence;
 
 use super::capability::{AdapterCapabilities, AdapterCapability};
 use super::probe::ProbeRequest;
-use super::{
-    AdapterOperation, Confirmation, ManagedResource, OperationMethod, OperationRequest,
-    WorkloadAdapter,
-};
+use super::{AdapterOperation, Confirmation, ManagedResource, OperationRequest, WorkloadAdapter};
 
 /// A configurable adapter used by tests and as the extension example.
 #[derive(Debug, Clone)]
@@ -176,8 +173,8 @@ impl WorkloadAdapter for MockAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::WorkloadId;
-    use crate::inventory::{ControlLevel, MemoryAccounting};
+    use crate::adapter::OperationMethod;
+    use crate::inventory::{ControlLevel, MemoryAccounting, WorkloadId};
 
     fn workload(scope: &str) -> Workload {
         Workload {

@@ -407,10 +407,12 @@ impl<'a> ProbeClient<'a> {
     }
 
     fn backoff(&self, attempt: u32) {
+        let exponent = attempt.saturating_sub(1);
         let delay = self
             .config
             .backoff_ms
-            .saturating_shl(attempt.saturating_sub(1))
+            .checked_shl(exponent)
+            .unwrap_or(u64::MAX)
             .min(self.config.max_backoff_ms);
         self.sleeper.sleep_ms(delay);
     }
