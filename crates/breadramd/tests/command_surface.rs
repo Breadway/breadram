@@ -8,13 +8,12 @@
 //! and only written to disk when it is asked for.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+mod support;
+use support::{wait_until_ready, Daemon};
 
 use breadram_core::config::Config;
 use breadram_core::ipc::Client;
 use breadram_core::ManagementMode;
-use tokio::net::UnixStream;
 
 fn temp_socket(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -30,52 +29,6 @@ fn temp_config(tag: &str, text: &str) -> PathBuf {
     ));
     std::fs::write(&path, text).expect("write the test configuration");
     path
-}
-
-/// A daemon child that is always killed and whose socket is always removed.
-///
-/// The daemon's output goes nowhere on purpose. A child that inherited the test
-/// harness's pipes would keep them open after a failed assertion, and the harness
-/// would then wait on a pipe nobody closes.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-}
-
-impl Daemon {
-    fn start(socket: &Path, config: Option<&Path>) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_breadramd"));
-        command
-            .arg("--socket")
-            .arg(socket)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(path) = config {
-            command.arg("--config").arg(path);
-        }
-        Self {
-            child: command.spawn().expect("spawn breadramd"),
-            socket: socket.to_path_buf(),
-        }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
-async fn wait_until_ready(socket: &Path) {
-    for _ in 0..400 {
-        if UnixStream::connect(socket).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("daemon did not become ready at {}", socket.display());
 }
 
 async fn connect(socket: &Path) -> Client {
