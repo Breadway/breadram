@@ -1,7 +1,16 @@
 //! Bounded, numeric, in-memory trend diagnostics. Growth is not a leak verdict.
 use std::collections::VecDeque;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// A workload's memory figure: the only kind `growth` judges.
+pub const KIND_WORKLOAD: u8 = 0;
+/// Host available memory, sampled once per pass.
+pub const KIND_HOST: u8 = 1;
+/// The pressure state as a level, sampled once per pass.
+pub const KIND_PRESSURE: u8 = 2;
+/// A measured action effect, recorded from a journal entry.
+pub const KIND_RECOVERY: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, Serialize)]
 pub struct TrendSample {
@@ -12,9 +21,15 @@ pub struct TrendSample {
     pub bytes: Option<u64>,
     /// False for RSS estimates or other potentially shared accounting.
     pub measured: bool,
+    /// What this sample describes: a workload, the host, a pressure level, or a
+    /// measured action effect. Numeric, so the schema still carries no text.
+    pub kind: u8,
+    /// A signed measured host memory change in bytes for a recovery sample.
+    /// Negative is relief. `None` for every other kind.
+    pub delta: Option<i64>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Growth {
     Unknown,
@@ -24,6 +39,23 @@ pub enum Growth {
         interval_ms: u64,
         measured: bool,
     },
+}
+
+/// A reachable, operator-facing growth judgement for one workload.
+///
+/// It carries the net measured relief recorded for the same target inside the
+/// window, so a rising figure is never read without the relief that also
+/// happened. Growth alone is not a leak verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct GrowthReport {
+    /// The opaque target key, matching the exported samples.
+    pub target_key: u64,
+    /// The generation the judgement was made against.
+    pub generation: u64,
+    /// The sustained-growth judgement.
+    pub growth: Growth,
+    /// Net measured relief recorded for this target inside the window.
+    pub recorded_relief_bytes: i64,
 }
 
 pub struct TrendHistory {
@@ -86,7 +118,8 @@ impl TrendHistory {
             .samples
             .iter()
             .filter(|sample| {
-                sample.target_key == target_key
+                sample.kind == KIND_WORKLOAD
+                    && sample.target_key == target_key
                     && sample.at_ms <= now_ms
                     && now_ms - sample.at_ms <= self.retention_ms
             })
@@ -135,6 +168,48 @@ impl TrendHistory {
             .collect();
         serde_json::to_string(&retained)
     }
+
+    /// One growth judgement per retained workload, with its recorded relief.
+    ///
+    /// This is the operator-facing view: it makes the sustained-growth
+    /// judgement reachable outside the unit tests, and pairs each figure with
+    /// the measured relief for the same target so growth is told apart from
+    /// relief rather than read as a leak on its own.
+    pub fn report(&self, now_ms: u64) -> Vec<GrowthReport> {
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let mut reports = Vec::new();
+        for sample in &self.samples {
+            if sample.kind != KIND_WORKLOAD
+                || sample.at_ms > now_ms
+                || now_ms - sample.at_ms > self.retention_ms
+                || seen.contains(&(sample.target_key, sample.generation))
+            {
+                continue;
+            }
+            seen.push((sample.target_key, sample.generation));
+            reports.push(GrowthReport {
+                target_key: sample.target_key,
+                generation: sample.generation,
+                growth: self.growth(sample.target_key, sample.generation, now_ms),
+                recorded_relief_bytes: self.relief_for(sample.target_key, now_ms),
+            });
+        }
+        reports
+    }
+
+    /// Net measured relief recorded for a target inside the retained window.
+    pub fn relief_for(&self, target_key: u64, now_ms: u64) -> i64 {
+        self.samples
+            .iter()
+            .filter(|sample| {
+                sample.kind == KIND_RECOVERY
+                    && sample.target_key == target_key
+                    && sample.at_ms <= now_ms
+                    && now_ms - sample.at_ms <= self.retention_ms
+            })
+            .filter_map(|sample| sample.delta)
+            .fold(0i64, i64::saturating_add)
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +222,55 @@ mod tests {
             generation: 1,
             bytes,
             measured: false,
+            kind: KIND_WORKLOAD,
+            delta: None,
         }
+    }
+
+    fn recovery(at_ms: u64, target_key: u64, delta: i64) -> TrendSample {
+        TrendSample {
+            at_ms,
+            target_key,
+            generation: 1,
+            bytes: None,
+            measured: true,
+            kind: KIND_RECOVERY,
+            delta: Some(delta),
+        }
+    }
+
+    #[test]
+    fn report_pairs_growth_with_recorded_relief_and_ignores_non_workload_samples() {
+        let mut history = TrendHistory::new(20, 1000);
+        history.record(sample(1, Some(10)));
+        history.record(sample(2, Some(20)));
+        history.record(sample(3, Some(30)));
+        history.record(recovery(4, 7, 4096));
+        history.record(TrendSample {
+            at_ms: 4,
+            target_key: 900,
+            generation: 0,
+            bytes: Some(1),
+            measured: true,
+            kind: KIND_HOST,
+            delta: None,
+        });
+        let report = history.report(4);
+        assert_eq!(
+            report.len(),
+            1,
+            "host and recovery samples are not growth targets: {report:?}"
+        );
+        assert_eq!(report[0].target_key, 7);
+        assert_eq!(
+            report[0].growth,
+            Growth::Sustained {
+                increase_bytes: 20,
+                interval_ms: 2,
+                measured: false
+            }
+        );
+        assert_eq!(report[0].recorded_relief_bytes, 4096);
     }
     #[test]
     fn growth_is_qualified_and_missing_reset_reuse_are_unknown() {
@@ -196,7 +319,7 @@ mod tests {
         assert_eq!(history.growth(7, 1, 1), Growth::Unknown);
         let json = history.export_json(1).unwrap();
         let fields = serde_json::from_str::<serde_json::Value>(&json).unwrap();
-        assert_eq!(fields[0].as_object().unwrap().len(), 5);
+        assert_eq!(fields[0].as_object().unwrap().len(), 7);
         assert_eq!(TrendHistory::new(3, 5).export_json(1).unwrap(), "[]");
         let mut disabled = TrendHistory::new(0, 5);
         disabled.record(sample(1, Some(1)));

@@ -38,7 +38,9 @@ use breadram_core::telemetry::{
     collect_cgroup_swap, collect_host, collect_swap, Clock, RealFs, SwapLayout, SystemClock,
     WorkloadSwap,
 };
-use breadram_core::trends::{TrendHistory, TrendSample};
+use breadram_core::trends::{
+    TrendHistory, TrendSample, KIND_HOST, KIND_PRESSURE, KIND_RECOVERY, KIND_WORKLOAD,
+};
 use breadram_core::{CapabilityReport, ManagementMode, VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -504,7 +506,13 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             {
                 let config = state.config.read().await;
                 let mut trends = state.trends.write().await;
-                collect_trends(&mut trends, &published, &config, &state.trend_keys);
+                collect_trends(
+                    &mut trends,
+                    &published,
+                    pass.as_ref(),
+                    &config,
+                    &state.trend_keys,
+                );
             }
             *state.published.write().await = published;
             let _ = state.events.send(EventPayload {
@@ -1066,11 +1074,11 @@ async fn handle_request(
                 let published = state.published.read().await;
                 let journal = state.journal.read().await;
                 let execution_notes = state.execution_notes.read().await;
-                let trends = state
-                    .trends
-                    .read()
-                    .await
-                    .retained(published.status.observed_at_ms);
+                let (trends, growth) = {
+                    let history = state.trends.read().await;
+                    let now = published.status.observed_at_ms;
+                    (history.retained(now), history.report(now))
+                };
                 Ok(ResponseBody::Diagnostics(Box::new(diagnostics_payload(
                     state,
                     &published,
@@ -1078,6 +1086,7 @@ async fn handle_request(
                     &journal,
                     &execution_notes,
                     trends,
+                    growth,
                 ))))
             };
             send_result(write, message.id, result).await
@@ -1222,6 +1231,7 @@ fn actions_payload(
 fn collect_trends(
     history: &mut TrendHistory,
     published: &Published,
+    pass: Option<&ExecutionPass>,
     config: &Config,
     keys: &std::collections::hash_map::RandomState,
 ) {
@@ -1237,6 +1247,26 @@ fn collect_trends(
         u64::from(config.history.max_age_days) * 86_400_000,
         now,
     );
+    // Host available memory and the pressure level, once per pass, so the series
+    // the card asks for exist alongside workload memory.
+    history.record(TrendSample {
+        at_ms: now,
+        target_key: keys.hash_one("host"),
+        generation: 0,
+        bytes: published.status.available_bytes,
+        measured: true,
+        kind: KIND_HOST,
+        delta: None,
+    });
+    history.record(TrendSample {
+        at_ms: now,
+        target_key: keys.hash_one("pressure"),
+        generation: 0,
+        bytes: Some(pressure_level(published.pressure)),
+        measured: true,
+        kind: KIND_PRESSURE,
+        delta: None,
+    });
     for workload in &published.workloads {
         history.record(TrendSample {
             at_ms: now,
@@ -1244,7 +1274,42 @@ fn collect_trends(
             generation: workload.id.generation,
             bytes: workload.accounting.bytes(),
             measured: !workload.accounting.is_estimate(),
+            kind: KIND_WORKLOAD,
+            delta: None,
         });
+    }
+    // A measured action effect becomes a recovery sample on the same opaque key
+    // as its target, so the following workload samples can be read as relief
+    // rather than mistaken for growth.
+    if let Some(pass) = pass {
+        for result in &pass.results {
+            let Some(delta) = result
+                .effect
+                .as_ref()
+                .and_then(|effect| effect.observed_host_ram_delta)
+            else {
+                continue;
+            };
+            history.record(TrendSample {
+                at_ms: now,
+                target_key: keys.hash_one(&result.scope),
+                generation: 0,
+                bytes: None,
+                measured: true,
+                kind: KIND_RECOVERY,
+                delta: Some(delta),
+            });
+        }
+    }
+}
+
+/// The pressure state as an ordered level, for a numeric-only series.
+fn pressure_level(state: PressureState) -> u64 {
+    match state {
+        PressureState::Healthy => 0,
+        PressureState::Recovering => 1,
+        PressureState::Pressured => 2,
+        PressureState::Critical => 3,
     }
 }
 
@@ -1255,6 +1320,7 @@ fn diagnostics_payload(
     journal: &ActionJournal,
     execution_notes: &[String],
     trends: Vec<TrendSample>,
+    growth: Vec<breadram_core::trends::GrowthReport>,
 ) -> DiagnosticsPayload {
     let mut notes = Vec::new();
     match config.mode {
@@ -1279,6 +1345,7 @@ fn diagnostics_payload(
     }
     DiagnosticsPayload {
         trends,
+        growth,
         mode: config.mode,
         version: VERSION.to_string(),
         protocol_major: PROTOCOL_MAJOR,
@@ -1638,24 +1705,74 @@ mod tests {
     fn trend_collection_is_bounded_numeric_and_observation_based() {
         let mut published = unavailable(ManagementMode::Monitor, 10);
         published.workloads = vec![workload()];
+        published.status.available_bytes = Some(3 * GIB);
+        published.pressure = PressureState::Pressured;
         let keys = std::collections::hash_map::RandomState::new();
         let mut history = TrendHistory::new(0, 0);
         let mut config = Config::default();
-        config.history.max_records = 2;
+        config.history.max_records = 64;
         for at in [10, 20, 30] {
             published.status.observed_at_ms = at;
-            collect_trends(&mut history, &published, &config, &keys);
+            collect_trends(&mut history, &published, None, &config, &keys);
         }
         let retained = history.retained(30);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].target_key, retained[1].target_key);
-        assert_eq!(retained[1].bytes, Some(6 * GIB));
-        assert!(retained[1].measured);
+        // Each pass records a host sample, a pressure sample, and a workload
+        // sample, so the series the card asks for exist alongside workload bytes.
+        assert_eq!(retained.len(), 9);
+        assert_eq!(retained.iter().filter(|s| s.kind == KIND_HOST).count(), 3);
+        assert!(retained
+            .iter()
+            .filter(|s| s.kind == KIND_PRESSURE)
+            .all(|s| s.bytes == Some(pressure_level(PressureState::Pressured))));
+        let workload_samples: Vec<_> = retained
+            .iter()
+            .filter(|s| s.kind == KIND_WORKLOAD)
+            .collect();
+        assert_eq!(workload_samples.len(), 3);
+        assert_eq!(workload_samples[2].bytes, Some(6 * GIB));
+        assert!(workload_samples[2].measured);
+        // The growth judgement is reachable, and paired with recorded relief.
+        let report = history.report(30);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].recorded_relief_bytes, 0);
         let export = history.export_json(30).unwrap();
         assert!(!export.contains(SCOPE));
+        // The wire budget still bounds retention: a zero byte budget keeps nothing.
         config.history.max_bytes = 0;
-        collect_trends(&mut history, &published, &config, &keys);
+        collect_trends(&mut history, &published, None, &config, &keys);
         assert!(history.retained(30).is_empty());
+    }
+
+    #[test]
+    fn trends_expire_and_a_reused_target_does_not_join_an_old_generation() {
+        let keys = std::collections::hash_map::RandomState::new();
+        let mut config = Config::default();
+        config.history.max_records = 64;
+        // Zero age means anything not sampled exactly now has expired, which is
+        // how a restart-that-never-joined-a-timeline shows up.
+        config.history.max_age_days = 0;
+        let mut history = TrendHistory::new(0, 0);
+        let mut published = unavailable(ManagementMode::Monitor, 10);
+        published.workloads = vec![workload()];
+        published.status.observed_at_ms = 10;
+        collect_trends(&mut history, &published, None, &config, &keys);
+        assert!(history
+            .retained(10)
+            .iter()
+            .any(|sample| sample.kind == KIND_WORKLOAD && sample.generation == 7));
+
+        // A reused target appears with a new generation, and the old series has
+        // expired rather than being joined.
+        published.workloads[0].id.generation = 99;
+        published.status.observed_at_ms = 20;
+        collect_trends(&mut history, &published, None, &config, &keys);
+        let workloads: Vec<_> = history
+            .retained(20)
+            .into_iter()
+            .filter(|sample| sample.kind == KIND_WORKLOAD)
+            .collect();
+        assert!(!workloads.is_empty());
+        assert!(workloads.iter().all(|sample| sample.generation == 99));
     }
 
     fn plan() -> Plan {
