@@ -18,13 +18,16 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ActionKind, Budget, Rule};
+use crate::coordinator::{ActionEffect, ActionState, JournalEntry};
+use crate::policy::{Plan, PlanChannel, PlannedAction, PressureState};
 use crate::{CapabilityReport, ManagementMode};
 
 /// Major protocol version. Breaking changes bump this.
 pub const PROTOCOL_MAJOR: u16 = 1;
 
 /// Minor protocol version. Backward compatible additions bump this.
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 /// The largest single message, in bytes. Oversized messages are rejected.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -110,6 +113,36 @@ pub enum RequestBody {
     Capabilities,
     /// Start streaming status events.
     Subscribe,
+    /// The discovered workloads.
+    Workloads,
+    /// Explain what the policy would do right now, without doing it.
+    Explain,
+    /// The settings in effect: mode, permitted actions, protection, rules.
+    Rules,
+    /// The current plan and the bounded action history.
+    Actions,
+    /// The full diagnostic bundle.
+    Diagnostics,
+    /// Change the management mode.
+    SetMode {
+        /// The mode to switch to.
+        mode: ManagementMode,
+        /// Write the change back to the configuration file.
+        #[serde(default)]
+        persist: bool,
+    },
+    /// Add or remove protected workloads.
+    SetProtection {
+        /// Scope keys to protect.
+        #[serde(default)]
+        add: Vec<String>,
+        /// Scope keys to stop protecting.
+        #[serde(default)]
+        remove: Vec<String>,
+        /// Write the change back to the configuration file.
+        #[serde(default)]
+        persist: bool,
+    },
 }
 
 /// A client message with its request id.
@@ -219,8 +252,364 @@ pub enum ResponseBody {
     },
     /// A streamed event.
     Event(EventPayload),
+    /// The discovered workloads.
+    Workloads(Box<WorkloadsPayload>),
+    /// An explanation of the current plan.
+    Plan(Box<PlanPayload>),
+    /// The settings in effect.
+    Rules(Box<RulesPayload>),
+    /// The current plan and the bounded action history.
+    Actions(Box<ActionsPayload>),
+    /// The diagnostic bundle.
+    Diagnostics(Box<DiagnosticsPayload>),
+    /// The result of a configuration change.
+    Applied(Box<AppliedPayload>),
     /// An error.
     Error(ApiError),
+}
+
+/// One workload, as the daemon sees it.
+///
+/// The memory figures are reported separately by source. A cgroup figure is
+/// exact accounting; a summed RSS is an over-estimate because a shared page is
+/// counted in every process that maps it. `estimated` says which one this is, so
+/// a caller never mistakes an estimate for a measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadSummary {
+    /// The stable grouping key, for example `unit:ollama.service`.
+    pub scope: String,
+    /// The generation taken from process start times.
+    pub generation: u64,
+    /// A human readable name.
+    pub name: String,
+    /// How many processes are grouped here.
+    pub processes: usize,
+    /// Exact cgroup memory, when the kernel accounts it.
+    pub cgroup_bytes: Option<u64>,
+    /// Summed resident set size, when that is all there is.
+    pub rss_bytes: Option<u64>,
+    /// Whether the figure is an estimate rather than exact accounting.
+    pub estimated: bool,
+    /// `eligible` when policy may control it, otherwise `observe_only`.
+    pub control: String,
+}
+
+/// The workload inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadsPayload {
+    /// Monotonic observation time in milliseconds.
+    pub observed_at_ms: u64,
+    /// The workloads, sorted by scope.
+    pub workloads: Vec<WorkloadSummary>,
+    /// What could be read on this host.
+    pub capabilities: CapabilityReport,
+}
+
+/// One proposed action, with the reason it was proposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedActionPayload {
+    /// The scope key of the target.
+    pub target: String,
+    /// The generation the plan was made against.
+    pub generation: u64,
+    /// What would be done.
+    pub kind: ActionKind,
+    /// Why, for the explanation.
+    pub reason: String,
+    /// The expected host memory change in bytes. Negative is relief.
+    pub expected_host_ram_delta: i64,
+    /// Whether proven idleness is required before it may run.
+    pub requires_confirmed_idle: bool,
+}
+
+/// A plan, annotated for the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanPayload {
+    /// The pressure state the plan was made in.
+    pub state: String,
+    /// Which channel asked for the plan.
+    pub channel: String,
+    /// Whether the caller is permitted to execute it.
+    pub would_execute: bool,
+    /// The proposed actions, most relief first.
+    pub actions: Vec<PlannedActionPayload>,
+    /// The reasoning, including every declined action and why.
+    pub explanation: Vec<String>,
+    /// Monotonic time the plan was made, in milliseconds.
+    pub observed_at_ms: u64,
+}
+
+/// The settings in effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RulesPayload {
+    /// The management mode.
+    pub mode: ManagementMode,
+    /// The configuration file the daemon loaded, when it loaded one.
+    pub config_path: Option<String>,
+    /// Which actions automation may take. Empty means automation does nothing.
+    pub allowed_actions: Vec<ActionKind>,
+    /// Scope keys that must not be touched automatically.
+    pub protected: Vec<String>,
+    /// Bounded per workload budgets.
+    pub budgets: Vec<Budget>,
+    /// Per workload rules, in evaluation order.
+    pub rules: Vec<Rule>,
+}
+
+/// A daemon-owned setting that an action changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedValueRecord {
+    /// A stable setting key.
+    pub key: String,
+    /// The value before breadram touched it.
+    pub original: String,
+    /// The value breadram last wrote.
+    pub last_applied: String,
+}
+
+/// One recorded action: what ran, why, and what it changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionJournalRecord {
+    /// The idempotency id.
+    pub id: u64,
+    /// The stable scope key of the target. Never a command line.
+    pub scope: String,
+    /// The action, or `None` for an entry that is not an action, such as a
+    /// restore. A rollback never claims to be the action it undid.
+    pub kind: Option<ActionKind>,
+    /// How it ended.
+    pub state: String,
+    /// When it ended, in monotonic milliseconds.
+    pub at_ms: u64,
+    /// Why it ran, in words.
+    pub reason: String,
+    /// The host memory change the plan expected.
+    pub requested_host_ram_delta: Option<i64>,
+    /// The host memory change that was measured, when it could be.
+    pub observed_host_ram_delta: Option<i64>,
+    /// The device memory change the plan expected.
+    pub requested_device_ram_delta: Option<i64>,
+    /// The device memory change that was measured, when it could be.
+    pub observed_device_ram_delta: Option<i64>,
+    /// The daemon-owned values it changed.
+    pub owned_values: Vec<OwnedValueRecord>,
+}
+
+/// The current plan and the bounded history of actions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionsPayload {
+    /// The plan the daemon would follow right now.
+    pub plan: PlanPayload,
+    /// Recorded actions, newest first.
+    pub history: Vec<ActionJournalRecord>,
+    /// How many entries the journal retains at most.
+    pub history_capacity: usize,
+    /// Why the history is empty, when the daemon is not executing anything.
+    pub history_note: Option<String>,
+}
+
+/// The host memory figures, each from its own source.
+///
+/// A figure that could not be read is `None` with a note, so an unknown value is
+/// never displayed as zero. VRAM is separate from system RAM: it is reported only
+/// when a provider or adapter can actually measure it, and it is never inferred
+/// from host memory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryBreakdown {
+    /// Total system RAM in bytes.
+    pub ram_total_bytes: Option<u64>,
+    /// Available system RAM in bytes, when the kernel reports it.
+    pub ram_available_bytes: Option<u64>,
+    /// Total swap in bytes. Zero means no swap is configured.
+    pub swap_total_bytes: Option<u64>,
+    /// Used swap in bytes, absent when no swap is configured.
+    pub swap_used_bytes: Option<u64>,
+    /// Shared memory (`Shmem`) in bytes.
+    pub shared_bytes: Option<u64>,
+    /// Device memory in bytes, when something can measure it.
+    pub vram_bytes: Option<u64>,
+    /// Pages swapped in since boot, when the kernel reports them.
+    pub swap_pages_in: Option<u64>,
+    /// Pages swapped out since boot, when the kernel reports them.
+    pub swap_pages_out: Option<u64>,
+    /// Why a figure is missing, one note per missing figure.
+    pub notes: Vec<String>,
+}
+
+/// The pressure reading the policy is acting on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PressureSummary {
+    /// The pressure state.
+    pub state: String,
+    /// The 10 second `some` average, when PSI is available.
+    pub some_avg10: Option<f64>,
+    /// The 10 second `full` average, when the kernel reports it.
+    pub full_avg10: Option<f64>,
+    /// Available memory as a fraction of total.
+    pub available_fraction: Option<f64>,
+}
+
+/// What the action journal holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalSummary {
+    /// How many entries are retained.
+    pub entries: usize,
+    /// The configured capacity.
+    pub capacity: usize,
+    /// Whether a plan-execute loop is running in the daemon.
+    pub executing: bool,
+}
+
+/// Everything a bug report needs, in one response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticsPayload {
+    /// The management mode.
+    pub mode: ManagementMode,
+    /// The daemon version.
+    pub version: String,
+    /// The protocol major version.
+    pub protocol_major: u16,
+    /// The protocol minor version.
+    pub protocol_minor: u16,
+    /// The socket the daemon is listening on.
+    pub socket: String,
+    /// How long the daemon has been running, in milliseconds.
+    pub uptime_ms: u64,
+    /// Monotonic observation time in milliseconds.
+    pub observed_at_ms: u64,
+    /// The configuration file the daemon loaded, when it loaded one.
+    pub config_path: Option<String>,
+    /// Host memory, split by source.
+    pub memory: MemoryBreakdown,
+    /// The pressure reading.
+    pub pressure: PressureSummary,
+    /// Whether background job admission is enabled.
+    pub jobs_enabled: bool,
+    /// How many workloads were discovered.
+    pub workloads: usize,
+    /// How many systemd user units could be controlled.
+    pub control_targets: usize,
+    /// What could be read and controlled on this host.
+    pub capabilities: CapabilityReport,
+    /// What the action journal holds.
+    pub journal: JournalSummary,
+    /// Anything a human should know when reading this report.
+    pub notes: Vec<String>,
+}
+
+/// The result of a configuration change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedPayload {
+    /// A one line description of what changed.
+    pub summary: String,
+    /// Whether the change was written back to the configuration file.
+    pub persisted: bool,
+    /// The settings in effect after the change.
+    pub rules: RulesPayload,
+}
+
+/// The wire name of a pressure state.
+pub fn pressure_state_name(state: PressureState) -> &'static str {
+    match state {
+        PressureState::Healthy => "healthy",
+        PressureState::Recovering => "recovering",
+        PressureState::Pressured => "pressured",
+        PressureState::Critical => "critical",
+    }
+}
+
+/// The wire name of a plan channel.
+pub fn plan_channel_name(channel: PlanChannel) -> &'static str {
+    match channel {
+        PlanChannel::Monitor => "monitor",
+        PlanChannel::DryRun => "dry_run",
+        PlanChannel::Automatic => "automatic",
+    }
+}
+
+/// The wire name of an action state.
+pub fn action_state_name(state: ActionState) -> &'static str {
+    match state {
+        ActionState::Confirmed => "confirmed",
+        ActionState::Unconfirmed => "unconfirmed",
+        ActionState::SkippedDuplicate => "skipped_duplicate",
+        ActionState::Unsupported => "unsupported",
+        ActionState::Superseded => "superseded",
+        ActionState::Busy => "busy",
+        ActionState::Denied => "denied",
+        ActionState::TimedOut => "timed_out",
+        ActionState::Cancelled => "cancelled",
+        ActionState::Failed => "failed",
+        ActionState::RolledBack => "rolled_back",
+    }
+}
+
+/// The wire name of a control level.
+pub fn control_level_name(level: crate::inventory::ControlLevel) -> &'static str {
+    match level {
+        crate::inventory::ControlLevel::Eligible => "eligible",
+        crate::inventory::ControlLevel::ObserveOnly => "observe_only",
+    }
+}
+
+impl PlannedActionPayload {
+    /// Present one planned action for the wire.
+    pub fn from_planned(action: &PlannedAction) -> Self {
+        Self {
+            target: action.target.scope.clone(),
+            generation: action.target.generation,
+            kind: action.kind,
+            reason: action.reason.clone(),
+            expected_host_ram_delta: action.expected_host_ram_delta,
+            requires_confirmed_idle: action.requires_confirmed_idle,
+        }
+    }
+}
+
+impl PlanPayload {
+    /// Present a plan for the wire.
+    pub fn from_plan(plan: &Plan, observed_at_ms: u64) -> Self {
+        Self {
+            state: pressure_state_name(plan.state).to_string(),
+            channel: plan_channel_name(plan.channel).to_string(),
+            would_execute: plan.would_execute,
+            actions: plan
+                .actions
+                .iter()
+                .map(PlannedActionPayload::from_planned)
+                .collect(),
+            explanation: plan.explanation.clone(),
+            observed_at_ms,
+        }
+    }
+}
+
+impl ActionJournalRecord {
+    /// Present one journal entry for the wire.
+    pub fn from_entry(entry: &JournalEntry) -> Self {
+        let effect: Option<&ActionEffect> = entry.effect.as_ref();
+        Self {
+            id: entry.id.as_u64(),
+            scope: entry.scope.clone(),
+            kind: entry.kind,
+            state: action_state_name(entry.state).to_string(),
+            at_ms: entry.at_ms,
+            reason: entry.reason.clone(),
+            requested_host_ram_delta: effect.map(|e| e.requested_host_ram_delta),
+            observed_host_ram_delta: effect.and_then(|e| e.observed_host_ram_delta),
+            requested_device_ram_delta: effect.map(|e| e.requested_device_ram_delta),
+            observed_device_ram_delta: effect.and_then(|e| e.observed_device_ram_delta),
+            owned_values: entry
+                .values
+                .iter()
+                .map(|value| OwnedValueRecord {
+                    key: value.key.clone(),
+                    original: value.original.clone(),
+                    last_applied: value.last_applied.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// A server message with the id of the request it answers.
@@ -263,11 +652,12 @@ pub fn default_socket_path() -> PathBuf {
 /// An async client for the daemon protocol.
 pub mod client {
     use super::{
-        check_protocol, decode, encode, ApiError, ClientMessage, EventPayload, Hello, IpcError,
-        RequestBody, ResponseBody, ServerMessage, StatusPayload, MAX_MESSAGE_BYTES, PROTOCOL_MAJOR,
-        PROTOCOL_MINOR,
+        check_protocol, decode, encode, ActionsPayload, ApiError, AppliedPayload, ClientMessage,
+        DiagnosticsPayload, EventPayload, Hello, IpcError, PlanPayload, RequestBody, ResponseBody,
+        RulesPayload, ServerMessage, StatusPayload, WorkloadsPayload, MAX_MESSAGE_BYTES,
+        PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
-    use crate::CapabilityReport;
+    use crate::{CapabilityReport, ManagementMode};
     use std::path::Path;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -361,6 +751,85 @@ pub mod client {
         pub async fn capabilities(&mut self) -> Result<CapabilityReport, ClientError> {
             match self.call(RequestBody::Capabilities).await? {
                 ResponseBody::Capabilities(report) => Ok(report),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Request the discovered workloads.
+        pub async fn workloads(&mut self) -> Result<WorkloadsPayload, ClientError> {
+            match self.call(RequestBody::Workloads).await? {
+                ResponseBody::Workloads(payload) => Ok(*payload),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Ask for an explanation of the current plan.
+        pub async fn explain(&mut self) -> Result<PlanPayload, ClientError> {
+            match self.call(RequestBody::Explain).await? {
+                ResponseBody::Plan(plan) => Ok(*plan),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Request the settings in effect.
+        pub async fn rules(&mut self) -> Result<RulesPayload, ClientError> {
+            match self.call(RequestBody::Rules).await? {
+                ResponseBody::Rules(rules) => Ok(*rules),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Request the plan and the bounded action history.
+        pub async fn actions(&mut self) -> Result<ActionsPayload, ClientError> {
+            match self.call(RequestBody::Actions).await? {
+                ResponseBody::Actions(actions) => Ok(*actions),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Request the diagnostic bundle.
+        pub async fn diagnostics(&mut self) -> Result<DiagnosticsPayload, ClientError> {
+            match self.call(RequestBody::Diagnostics).await? {
+                ResponseBody::Diagnostics(diagnostics) => Ok(*diagnostics),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Change the management mode, optionally writing it to the file.
+        pub async fn set_mode(
+            &mut self,
+            mode: ManagementMode,
+            persist: bool,
+        ) -> Result<AppliedPayload, ClientError> {
+            match self.call(RequestBody::SetMode { mode, persist }).await? {
+                ResponseBody::Applied(applied) => Ok(*applied),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Protect or unprotect workloads, optionally writing it to the file.
+        pub async fn set_protection(
+            &mut self,
+            add: Vec<String>,
+            remove: Vec<String>,
+            persist: bool,
+        ) -> Result<AppliedPayload, ClientError> {
+            match self
+                .call(RequestBody::SetProtection {
+                    add,
+                    remove,
+                    persist,
+                })
+                .await?
+            {
+                ResponseBody::Applied(applied) => Ok(*applied),
                 ResponseBody::Error(err) => Err(ClientError::Api(err)),
                 other => Err(ClientError::Unexpected(format!("{other:?}"))),
             }
@@ -496,5 +965,74 @@ mod tests {
             decode::<ClientMessage>("not json"),
             Err(IpcError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn every_command_round_trips_as_a_request() {
+        let bodies = vec![
+            RequestBody::Status,
+            RequestBody::Capabilities,
+            RequestBody::Subscribe,
+            RequestBody::Workloads,
+            RequestBody::Explain,
+            RequestBody::Rules,
+            RequestBody::Actions,
+            RequestBody::Diagnostics,
+            RequestBody::SetMode {
+                mode: ManagementMode::Automatic,
+                persist: true,
+            },
+            RequestBody::SetProtection {
+                add: vec!["unit:sshd.service".to_string()],
+                remove: Vec::new(),
+                persist: false,
+            },
+        ];
+        for body in bodies {
+            let message = ClientMessage { id: 1, body };
+            let line = encode(&message).unwrap();
+            let decoded: ClientMessage = decode(&line).unwrap();
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn a_write_request_without_persist_defaults_to_false() {
+        let decoded: ClientMessage = decode(r#"{"id":1,"type":"set_mode","mode":"automatic"}"#)
+            .expect("a request without the optional field");
+        assert_eq!(
+            decoded.body,
+            RequestBody::SetMode {
+                mode: ManagementMode::Automatic,
+                persist: false,
+            }
+        );
+    }
+
+    #[test]
+    fn action_states_have_stable_wire_names() {
+        use crate::coordinator::ActionState;
+        let names = [
+            (ActionState::Confirmed, "confirmed"),
+            (ActionState::Unconfirmed, "unconfirmed"),
+            (ActionState::SkippedDuplicate, "skipped_duplicate"),
+            (ActionState::Unsupported, "unsupported"),
+            (ActionState::Superseded, "superseded"),
+            (ActionState::Busy, "busy"),
+            (ActionState::Denied, "denied"),
+            (ActionState::TimedOut, "timed_out"),
+            (ActionState::Cancelled, "cancelled"),
+            (ActionState::Failed, "failed"),
+            (ActionState::RolledBack, "rolled_back"),
+        ];
+        for (state, name) in names {
+            assert_eq!(action_state_name(state), name);
+        }
+    }
+
+    #[test]
+    fn an_action_kind_serializes_as_its_configuration_name() {
+        let json = serde_json::to_string(&ActionKind::CgroupSoftLimit).unwrap();
+        assert_eq!(json, "\"cgroup_soft_limit\"");
     }
 }
