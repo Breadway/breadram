@@ -28,9 +28,11 @@
 //! monotonic timestamps, so a gateway built on top cannot log a prompt or a
 //! completion through these types even by accident.
 
+pub mod gateway;
 pub mod lease;
 pub mod lifecycle;
 
+pub use gateway::{Gateway, RouteOutcome};
 pub use lease::{
     Admission, ClientId, Lease, LeaseId, Leases, RequestKind, RequestMeta, WorkloadLeases,
     RETRY_MEMORY,

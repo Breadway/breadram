@@ -108,12 +108,36 @@ state from what the provider reports:
 | Serving | `awake` |
 | Nothing | `unverified`, so health is checked before serving |
 
-## Not implemented yet
+## Gateway core
 
-The lifecycle and the leases are complete and tested. The optional local
-inference gateway that would feed them from real traffic is a separate piece of
-work: it must preserve native and OpenAI-compatible request and response
-semantics, including streaming, and it must admit every request through a lease
-before dispatch. Until it exists, the only `ActivitySource` an adapter provides
-is the provider's own answer, and a backend whose idleness cannot be proven is
-reported unsupported rather than guessed at.
+The request-path core is `breadram-core/src/serving/gateway.rs`. It performs no
+I/O: given a request's metadata and the backends, [`Gateway::route`] decides
+whether to forward the request (holding a lease for its whole duration), whether
+to trigger a wake and tell the client to retry, or whether to refuse. The caller
+owns the socket, the provider commands, and the clock.
+
+Routing:
+
+| Backend state | Outcome |
+|---|---|
+| `awake` | `Forward` with the admission: `Started`, `Joined`, or `Replayed` |
+| `sleeping` | `WakeThenRetry`: the wake is begun on the request path, and the client is told when to retry |
+| `waking`, `draining`, `unverified` | `Retry` with the policy's retry hint, nothing dispatched |
+| `unsupported`, `failed`, unknown workload | `Refused` with an actionable reason |
+
+A stream holds its lease until it finishes; a client disconnect releases every
+lease of that client; a retry that carries the same idempotency key joins the
+running request rather than counting twice, and a retry after it finished is
+recognized as `Replayed`. A backend whose idleness cannot be proven (`Unknown`
+tracking, no operator override) is `Unsupported`, so routing refuses rather than
+serving through a path that could be slept from under it.
+
+Nothing in the core stores a body: an outcome carries only a client label, a
+request kind, whether the response is streamed, and an idempotency key, so a
+gateway built on it cannot log a prompt or a completion.
+
+Still to come for the full gateway: the socket server that preserves native and
+OpenAI-compatible request and response semantics (including streaming and
+cancellation end to end), wiring the provider sleep and wake commands to
+`SleepDecision`, `DrainOutcome`, and `WakeHealth`, and the operator configuration
+that points a client at the gateway.
