@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/breadram-core",
+    "crates/breadramd",
+    "crates/breadram-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Breadway"]
+repository = "https://git.breadway.dev/Breadway/breadram"
+
+[workspace.dependencies]
+breadram-core = { path = "crates/breadram-core" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
