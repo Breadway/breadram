@@ -1,17 +1,12 @@
-//! breadramd: the breadram memory management daemon.
-//!
-//! This is the RAM-1 bootstrap entry point. It establishes argument parsing,
-//! logging, and a startup contract summary so that later cards have a real
-//! binary to grow into. The daemon event loop, single instance protection, the
-//! versioned local socket, telemetry, and policy land in RAM-2 through RAM-10.
-//!
-//! It is honest about that instead of pretending to run: it prints what it is
-//! and the version of the IPC contract it speaks, then exits.
+//! breadramd binary entry point.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use breadram_core::{ManagementMode, PRODUCT_NAME, PROTOCOL_MAJOR, PROTOCOL_MINOR, VERSION};
+use breadram_core::config::{Config, Profile};
+use breadram_core::ipc::default_socket_path;
+use breadram_core::ManagementMode;
+use breadramd::daemon;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -22,24 +17,30 @@ use clap::Parser;
 )]
 struct Args {
     /// Configuration file path.
-    ///
-    /// Validation and profiles land in RAM-5. The flag is accepted now so that
-    /// service files and operator scripts can pass it unchanged later.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Management mode: "monitor" observes and explains, "automatic" may act.
-    #[arg(long, value_name = "MODE", default_value = "monitor")]
-    mode: String,
+    /// Starting profile: monitor, desktop, or headless-server.
+    #[arg(long, value_name = "PROFILE")]
+    profile: Option<String>,
+
+    /// Override the management mode: monitor or automatic.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
+
+    /// Unix socket path. Defaults to $XDG_RUNTIME_DIR/breadram.sock.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let mode = match args.mode.parse::<ManagementMode>() {
-        Ok(mode) => mode,
-        Err(err) => {
-            eprintln!("error: {err}");
+    let config = match resolve_config(&args) {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("error: {message}");
             return ExitCode::from(2);
         }
     };
@@ -49,23 +50,35 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    if let Some(path) = args.config.as_deref() {
-        if path.exists() {
-            tracing::info!(
-                config = %path.display(),
-                "configuration file found, parsing lands in RAM-5"
-            );
-        } else {
-            tracing::warn!(
-                config = %path.display(),
-                "configuration file does not exist, using built in defaults"
-            );
+    let socket = args.socket.clone().unwrap_or_else(default_socket_path);
+    tracing::info!(socket = %socket.display(), mode = %config.mode, "breadramd starting");
+
+    match daemon::run(config, socket).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
         }
     }
+}
 
-    println!("{PRODUCT_NAME}d {VERSION} (IPC {PROTOCOL_MAJOR}.{PROTOCOL_MINOR})");
-    println!("mode: {mode}");
-    println!("state: bootstrap build, lifecycle and IPC land in RAM-4");
-
-    ExitCode::SUCCESS
+fn resolve_config(args: &Args) -> Result<Config, String> {
+    let mut config = match args.profile.as_deref() {
+        Some(name) => name
+            .parse::<Profile>()
+            .map_err(|err| err.to_string())?
+            .resolve(),
+        None => Profile::Monitor.resolve(),
+    };
+    if let Some(path) = &args.config {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        config = Config::from_toml(&text).map_err(|err| err.to_string())?;
+    }
+    if let Some(mode) = &args.mode {
+        config.mode = mode
+            .parse::<ManagementMode>()
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(config)
 }
