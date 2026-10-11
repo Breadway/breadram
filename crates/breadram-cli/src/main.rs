@@ -21,6 +21,7 @@ use breadram_core::ipc::{
     default_socket_path, ActionsPayload, AppliedPayload, Client, ClientError, DiagnosticsPayload,
     EventPayload, PlanPayload, RulesPayload, StatusPayload, WorkloadsPayload,
 };
+use breadram_core::telemetry::{SwapKind, SwapLayout, WorkloadSwap};
 use breadram_core::{CapabilityReport, ManagementMode};
 use clap::{Parser, Subcommand};
 
@@ -504,6 +505,94 @@ fn human_actions(payload: &ActionsPayload) -> String {
     lines.join("\n")
 }
 
+/// The swap, compression, and OOM layout, as reported and never changed.
+fn human_swap(swap: &SwapLayout) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "swap areas: {} (total {}, used {})",
+            swap.areas.len(),
+            human_bytes(swap.total_bytes),
+            human_bytes(swap.used_bytes)
+        ),
+        format!(
+            "compression: {}",
+            if swap.compressed() {
+                "compressed swap in use"
+            } else {
+                "none detected"
+            }
+        ),
+        format!(
+            "OOM:        {} and {} OOM kill(s) since boot",
+            if swap.oom.systemd_oomd_installed {
+                "a systemd OOM manager is installed"
+            } else {
+                "no separate OOM manager detected"
+            },
+            human_optional_u64(swap.oom.kernel_oom_kills)
+        ),
+    ];
+    for area in &swap.areas {
+        lines.push(format!(
+            "  {} ({}, {}, used {}{})",
+            area.path,
+            match area.kind {
+                SwapKind::Partition => "partition",
+                SwapKind::File => "file",
+                SwapKind::Unknown => "unknown kind",
+            },
+            human_bytes(area.size_bytes),
+            human_bytes(area.used_bytes),
+            match area.priority {
+                Some(priority) => format!(", priority {priority}"),
+                None => String::new(),
+            }
+        ));
+    }
+    for device in &swap.zram {
+        lines.push(format!(
+            "  {} (compressed device, size {}, in use {})",
+            device.name,
+            human_optional_bytes(device.disksize_bytes),
+            human_optional_bytes(device.mem_used_bytes)
+        ));
+    }
+    if let Some(zswap) = &swap.zswap {
+        // A share that could not be read is reported as unknown rather than as a
+        // percentage of zero.
+        let pool = match zswap.max_pool_percent {
+            Some(percent) => format!("{percent}% of RAM"),
+            None => "unknown".to_string(),
+        };
+        lines.push(format!(
+            "  zswap ({}), pool up to {pool}, compressor {}",
+            if zswap.enabled { "enabled" } else { "disabled" },
+            zswap
+                .compressor
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    lines
+}
+
+/// The effective swap limit of each workload breadram can control.
+fn human_workload_swap(workloads: &[WorkloadSwap]) -> Vec<String> {
+    if workloads.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["workload swap:".to_string()];
+    for workload in workloads {
+        lines.push(format!(
+            "  {} (in use {}, {})",
+            workload.scope,
+            human_optional_bytes(workload.swap.current_bytes),
+            workload.swap.limit_phrase()
+        ));
+    }
+    lines
+}
+
 fn human_diagnostics(diagnostics: &DiagnosticsPayload) -> String {
     let memory = &diagnostics.memory;
     let mut lines = vec![
@@ -565,6 +654,8 @@ fn human_diagnostics(diagnostics: &DiagnosticsPayload) -> String {
             diagnostics.journal.executing
         ),
     ];
+    lines.extend(human_swap(&diagnostics.swap));
+    lines.extend(human_workload_swap(&diagnostics.workload_swap));
     lines.extend(human_capabilities(&diagnostics.capabilities));
     if !memory.notes.is_empty() {
         lines.push("memory notes:".to_string());

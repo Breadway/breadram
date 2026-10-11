@@ -21,13 +21,17 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ActionKind, Budget, Rule};
 use crate::coordinator::{ActionEffect, ActionState, JournalEntry};
 use crate::policy::{Plan, PlanChannel, PlannedAction, PressureState};
+use crate::telemetry::{SwapLayout, WorkloadSwap};
 use crate::{CapabilityReport, ManagementMode};
 
 /// Major protocol version. Breaking changes bump this.
 pub const PROTOCOL_MAJOR: u16 = 1;
 
 /// Minor protocol version. Backward compatible additions bump this.
-pub const PROTOCOL_MINOR: u16 = 1;
+///
+/// 2 adds the swap and OOM diagnostic section and the per workload swap limits
+/// to the diagnostics report. Nothing was removed or renumbered.
+pub const PROTOCOL_MINOR: u16 = 2;
 
 /// The largest single message, in bytes. Oversized messages are rejected.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -493,6 +497,15 @@ pub struct DiagnosticsPayload {
     pub capabilities: CapabilityReport,
     /// What the action journal holds.
     pub journal: JournalSummary,
+    /// The swap, compression, and OOM management this host already has.
+    ///
+    /// Descriptive only: breadram reports this layout and never changes it.
+    /// Defaulted on read, so a client of either minor version can decode it.
+    #[serde(default)]
+    pub swap: SwapLayout,
+    /// The effective swap limit of each workload breadram can control.
+    #[serde(default)]
+    pub workload_swap: Vec<WorkloadSwap>,
     /// Anything a human should know when reading this report.
     pub notes: Vec<String>,
 }
@@ -948,6 +961,45 @@ mod tests {
         let line = encode(&message).unwrap();
         let decoded: ServerMessage = decode(&line).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn a_diagnostics_payload_from_the_previous_minor_version_still_decodes() {
+        // The swap section was added in minor version 2. A client that speaks the
+        // older minor must still be able to read a report from this build, and a
+        // report written before the addition must still decode here, which is why
+        // the fields are defaulted rather than required.
+        assert_eq!(PROTOCOL_MINOR, 2);
+        let older = r#"{
+            "mode": "monitor",
+            "version": "0.1.0",
+            "protocol_major": 1,
+            "protocol_minor": 1,
+            "socket": "/run/user/1000/breadram.sock",
+            "uptime_ms": 10,
+            "observed_at_ms": 20,
+            "config_path": null,
+            "memory": {
+                "ram_total_bytes": null, "ram_available_bytes": null,
+                "swap_total_bytes": null, "swap_used_bytes": null,
+                "shared_bytes": null, "vram_bytes": null,
+                "swap_pages_in": null, "swap_pages_out": null, "notes": []
+            },
+            "pressure": {
+                "state": "healthy", "some_avg10": null,
+                "full_avg10": null, "available_fraction": null
+            },
+            "jobs_enabled": false,
+            "workloads": 0,
+            "control_targets": 0,
+            "capabilities": { "capabilities": [] },
+            "journal": { "entries": 0, "capacity": 10, "executing": false },
+            "notes": []
+        }"#;
+        let decoded: DiagnosticsPayload = serde_json::from_str(older).expect("the older shape");
+        assert!(!decoded.swap.swap_table_readable);
+        assert!(decoded.workload_swap.is_empty());
+        assert!(decoded.swap.areas.is_empty());
     }
 
     #[test]

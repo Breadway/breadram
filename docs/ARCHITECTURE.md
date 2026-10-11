@@ -52,6 +52,15 @@ arbitrary workloads, drop global caches, or rewrite global VM settings.
 Anything that can terminate a process is an explicit, documented, opt in
 policy with tested consequences.
 
+The swap and OOM layout is therefore reported rather than managed, in
+`breadram_core::telemetry::swap` and in `diagnostics`: which swap areas exist and
+what each is backed by, whether swap compresses, the effective swap limit of each
+workload breadram can control, whether a systemd OOM manager is installed, and
+how many OOM kills the kernel has recorded. Nothing in that module writes. A
+missing reading is reported as unknown and never as zero, so an unreadable swap
+table does not read as a host with no swap. The rules and the degraded cases are
+in `docs/SWAP-AND-OOM.md`.
+
 ### AD-5: Reversible, ownership aware changes
 
 Every applied change records the original value and its owner. Restores happen

@@ -34,7 +34,10 @@ use breadram_core::policy::{
     StateMachine,
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
-use breadram_core::telemetry::{collect_host, Clock, RealFs, SystemClock};
+use breadram_core::telemetry::{
+    collect_cgroup_swap, collect_host, collect_swap, Clock, RealFs, SwapLayout, SystemClock,
+    WorkloadSwap,
+};
 use breadram_core::{CapabilityReport, ManagementMode, VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -120,6 +123,10 @@ struct Published {
     /// rather than swallowed, because an adapter that cannot see its provider
     /// cannot offer a release either.
     probe_notes: Vec<String>,
+    /// The swap, compression, and OOM management on this host, as read.
+    swap: SwapLayout,
+    /// The effective swap limit of each workload breadram can control.
+    workload_swap: Vec<WorkloadSwap>,
 }
 
 /// What a handler should do next.
@@ -746,7 +753,22 @@ fn observe(
     // doing now rather than about the last answer that happened to succeed.
     let probe_notes = refresh_adapters(registry, probes, clock);
     let inventory = collect_inventory(&fs);
-    let control_targets = discover_targets(&fs).len();
+    // The swap layout is read once per pass and reported, never changed: the
+    // swappiness, swap files, fstab, and kernel parameters are the
+    // administrator's, and breadram installs no second OOM manager.
+    let swap = collect_swap(&fs);
+    let targets = discover_targets(&fs);
+    let control_targets = targets.len();
+    // A swap limit is only meaningful against the cgroup a workload is actually
+    // charged to, so it is read from the targets breadram can control.
+    let workload_swap: Vec<WorkloadSwap> = targets
+        .iter()
+        .map(|target| WorkloadSwap {
+            scope: target.scope.clone(),
+            cgroup: target.control_group.clone(),
+            swap: collect_cgroup_swap(&fs, &target.control_group),
+        })
+        .collect();
     let snapshot = collect_host(&fs, clock).ok();
     let pressure = match &snapshot {
         Some(snapshot) => machine.observe(snapshot),
@@ -806,6 +828,8 @@ fn observe(
         pressure,
         plan,
         probe_notes,
+        swap,
+        workload_swap,
     }
 }
 
@@ -828,6 +852,8 @@ fn unavailable(mode: ManagementMode, observed_at_ms: u64) -> Published {
         pressure: PressureState::Healthy,
         plan: None,
         probe_notes: Vec::new(),
+        swap: SwapLayout::default(),
+        workload_swap: Vec::new(),
     }
 }
 
@@ -1190,6 +1216,12 @@ fn diagnostics_payload(
                 .to_string(),
         );
     }
+    // The swap and OOM constraints are part of the same explanation: what relief
+    // costs here, and which manager already owns OOM.
+    notes.extend(published.swap.notes());
+    for workload in &published.workload_swap {
+        notes.push(workload.swap.explain(&workload.scope));
+    }
     DiagnosticsPayload {
         mode: config.mode,
         version: VERSION.to_string(),
@@ -1213,6 +1245,8 @@ fn diagnostics_payload(
             capacity: journal.capacity(),
             executing: config.mode == ManagementMode::Automatic,
         },
+        swap: published.swap.clone(),
+        workload_swap: published.workload_swap.clone(),
         notes,
     }
 }
@@ -1686,6 +1720,22 @@ mod tests {
         let (empty, _) = AdapterRegistry::from_config(&Config::default());
         assert!(empty.is_empty());
         assert!(refresh_adapters(&empty, &probes, &clock).is_empty());
+    }
+
+    #[test]
+    fn the_daemon_reports_the_swap_layout_of_this_host_and_never_changes_it() {
+        // The collection path the daemon uses, on this host rather than a
+        // fixture: it must not panic, it must always explain itself, and the
+        // promise that the layout is left alone must be in the report.
+        let swap = collect_swap(&RealFs);
+        let notes = swap.notes();
+        assert!(!notes.is_empty());
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("never changes global swappiness")),
+            "{notes:?}"
+        );
     }
 
     #[test]

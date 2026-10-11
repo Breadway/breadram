@@ -22,6 +22,10 @@ use breadram_core::ipc::{
     PlannedActionPayload, PressureSummary, RequestBody, ResponseBody, RulesPayload, ServerMessage,
     StatusPayload, WorkloadSummary, WorkloadsPayload, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+use breadram_core::telemetry::{
+    CgroupSwap, OomManagement, SwapArea, SwapKind, SwapLayout, SwapLimit, WorkloadSwap, ZramDevice,
+    ZswapState,
+};
 use breadram_core::{CapabilityReport, ManagementMode};
 
 /// The exit codes the CLI promises.
@@ -284,6 +288,46 @@ fn diagnostics() -> DiagnosticsPayload {
             capacity: 5_000,
             executing: false,
         },
+        swap: SwapLayout {
+            areas: vec![SwapArea {
+                path: "/dev/zram0".to_string(),
+                kind: SwapKind::Partition,
+                size_bytes: 4 * 1024 * 1024 * 1024,
+                used_bytes: 1024 * 1024 * 1024,
+                priority: Some(100),
+            }],
+            total_bytes: 4 * 1024 * 1024 * 1024,
+            used_bytes: 1024 * 1024 * 1024,
+            zswap: Some(ZswapState {
+                enabled: false,
+                max_pool_percent: Some(20),
+                compressor: Some("lz4".to_string()),
+                zpool: None,
+            }),
+            zram: vec![ZramDevice {
+                name: "zram0".to_string(),
+                disksize_bytes: Some(4 * 1024 * 1024 * 1024),
+                mem_used_bytes: Some(512 * 1024 * 1024),
+                algorithm: Some("lz4".to_string()),
+            }],
+            oom: OomManagement {
+                systemd_oomd_installed: true,
+                kernel_oom_kills: Some(2),
+            },
+            swap_in_pages: Some(12),
+            swap_out_pages: None,
+            swap_table_readable: true,
+        },
+        workload_swap: vec![WorkloadSwap {
+            scope: "unit:app.service".to_string(),
+            cgroup: "/user.slice/app.service".to_string(),
+            swap: CgroupSwap {
+                current_bytes: Some(1024),
+                limit: SwapLimit::Unlimited,
+                high_limit: SwapLimit::Unknown,
+                oom_kills: None,
+            },
+        }],
         notes: Vec::new(),
     }
 }
@@ -460,6 +504,37 @@ fn diagnostics_keep_unknown_figures_unknown() {
         "an unknown figure must carry its reason: {text}"
     );
     assert!(text.contains("executing: false"), "{text}");
+
+    // The swap layout is reported, including the part that makes reclaim cost
+    // CPU instead of I/O, and the OOM manager breadram coexists with.
+    assert!(
+        text.contains("swap areas: 1 (total 4.0 GiB, used 1.0 GiB)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("compression: compressed swap in use"),
+        "{text}"
+    );
+    assert!(
+        text.contains("/dev/zram0 (partition, 4.0 GiB, used 1.0 GiB, priority 100)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("zram0 (compressed device, size 4.0 GiB, in use 512.0 MiB)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("zswap (disabled), pool up to 20% of RAM, compressor lz4"),
+        "{text}"
+    );
+    assert!(
+        text.contains("a systemd OOM manager is installed and 2 OOM kill(s) since boot"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unit:app.service (in use 1.0 KiB, may swap without a limit"),
+        "the effective limit and the workload it applies to are both shown: {text}"
+    );
 }
 
 #[test]

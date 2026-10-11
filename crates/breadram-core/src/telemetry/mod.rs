@@ -18,6 +18,7 @@ pub mod fs;
 pub mod meminfo;
 pub mod psi;
 pub mod snapshot;
+pub mod swap;
 pub mod vmstat;
 
 pub use cgroup::{collect_cgroup, CgroupMemory, CgroupSnapshot};
@@ -28,5 +29,9 @@ pub use snapshot::{
     collect_host, is_gap, MemorySnapshot, TelemetryError, CAP_CGROUP_V2, CAP_MEMINFO, CAP_PSI,
     CAP_SWAP_ACTIVITY, CGROUP_V2_ROOT, MAX_OBSERVATION_GAP_MS, PROC_MEMINFO, PROC_PRESSURE_MEMORY,
     PROC_VMSTAT,
+};
+pub use swap::{
+    collect_cgroup_swap, collect_swap, parse_swaps, CgroupSwap, OomManagement, SwapArea, SwapKind,
+    SwapLayout, SwapLimit, WorkloadSwap, ZramDevice, ZswapState,
 };
 pub use vmstat::{counter_delta, parse_vmstat, VmStat};
