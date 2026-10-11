@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapter;
 pub mod capability;
 pub mod config;
 pub mod inventory;
