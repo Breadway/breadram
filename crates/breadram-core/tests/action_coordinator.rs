@@ -38,6 +38,7 @@ fn workload(scope: &str, generation: u64, name: &str) -> Workload {
             current_bytes: Some(4 * GIB),
         },
         control: ControlLevel::Eligible,
+        limit_bytes: None,
     }
 }
 

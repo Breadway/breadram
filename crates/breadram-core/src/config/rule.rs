@@ -245,6 +245,7 @@ mod tests {
                 current_bytes: Some(0),
             },
             control: ControlLevel::Eligible,
+            limit_bytes: None,
         }
     }
 

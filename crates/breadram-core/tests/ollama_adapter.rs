@@ -34,6 +34,7 @@ fn workload() -> Workload {
             current_bytes: Some(4 * 1024 * 1024 * 1024),
         },
         control: ControlLevel::Eligible,
+        limit_bytes: None,
     }
 }
 
@@ -529,6 +530,7 @@ fn the_adapter_reports_its_provider_and_version() {
             processes: 1,
         },
         control: ControlLevel::ObserveOnly,
+        limit_bytes: None,
     }));
 
     let observed = adapter

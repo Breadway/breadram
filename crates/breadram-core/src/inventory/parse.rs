@@ -175,6 +175,26 @@ pub fn systemd_unit(path: &str) -> Option<String> {
     }
 }
 
+/// Host-visible container boundary, including nested worker cgroups.
+/// Only canonical known runtime shapes are recognized; metadata is not executed.
+pub fn container_root(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.split('/').any(|part| part == ".." || part == ".") {
+        return None;
+    }
+    let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    for (index, part) in parts.iter().enumerate() {
+        let id = part
+            .strip_prefix("docker-")
+            .or_else(|| part.strip_prefix("libpod-"))
+            .and_then(|value| value.strip_suffix(".scope"))
+            .or_else(|| (index > 0 && parts[index - 1] == "docker").then_some(*part));
+        if id.is_some_and(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+            return Some(format!("/{}", parts[..=index].join("/")));
+        }
+    }
+    None
+}
+
 /// The executable identity from `/proc/<pid>/cmdline`.
 ///
 /// The file is NUL separated. The first field is `argv[0]`, which is reduced to

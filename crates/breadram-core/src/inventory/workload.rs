@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::parse::{
-    parse_cgroup_path, parse_cmdline, parse_proc_stat, parse_proc_status, systemd_unit,
+    container_root, parse_cgroup_path, parse_cmdline, parse_proc_stat, parse_proc_status,
+    systemd_unit,
 };
 use crate::telemetry::fs::FileSource;
 use crate::{CapabilityReport, CapabilityState};
@@ -93,6 +94,11 @@ pub struct Workload {
     pub accounting: MemoryAccounting,
     /// What may be done with it.
     pub control: ControlLevel,
+    /// The cgroup's effective memory limit (`memory.max`), when one is set.
+    ///
+    /// This is the group's own cap, distinct from host `MemAvailable`. It is
+    /// `None` when the group has no cap (`max`) or the file is unreadable.
+    pub limit_bytes: Option<u64>,
 }
 
 /// The result of one inventory pass.
@@ -165,6 +171,10 @@ pub fn collect_inventory(fs: &dyn FileSource) -> Inventory {
             .read_to_string(&dir.join("cgroup"))
             .ok()
             .and_then(|text| parse_cgroup_path(&text));
+        // Account a container once at its host-visible boundary, not once for
+        // the parent and again for each nested worker's inclusive memory.current.
+        let container = cgroup.as_deref().and_then(container_root);
+        let cgroup = container.clone().or(cgroup);
         let unit = cgroup.as_deref().and_then(systemd_unit);
         let exe = fs
             .read_to_string(&dir.join("cmdline"))
@@ -176,7 +186,13 @@ pub fn collect_inventory(fs: &dyn FileSource) -> Inventory {
             .map_or_else(Default::default, |text| parse_proc_status(&text));
 
         let group_cgroup = cgroup.clone();
-        let (scope, name, identity_known) = if let Some(unit) = unit {
+        let (scope, name, identity_known) = if let Some(path) = container {
+            (
+                format!("cgroup:{path}"),
+                path.rsplit('/').next().unwrap_or(&path).to_string(),
+                true,
+            )
+        } else if let Some(unit) = unit {
             (format!("unit:{unit}"), unit, true)
         } else if let Some(path) = cgroup.as_deref() {
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
@@ -230,6 +246,13 @@ pub fn collect_inventory(fs: &dyn FileSource) -> Inventory {
             let mut pids = group.pids;
             pids.sort_unstable();
             pids.dedup();
+            // The group's own cap, read from the same cgroup it is charged to,
+            // so a container's effective limit is reported rather than inferred
+            // from the host.
+            let limit_bytes = group
+                .cgroup
+                .as_deref()
+                .and_then(|path| read_cgroup_limit(fs, path));
             Workload {
                 id: WorkloadId {
                     scope: group.scope,
@@ -239,6 +262,7 @@ pub fn collect_inventory(fs: &dyn FileSource) -> Inventory {
                 pids,
                 accounting,
                 control,
+                limit_bytes,
             }
         })
         .collect();
@@ -256,6 +280,17 @@ fn read_cgroup_current(fs: &dyn FileSource, cgroup_path: &str) -> Option<u64> {
     let path = Path::new(CGROUP_V2_ROOT)
         .join(relative)
         .join("memory.current");
+    fs.read_to_string(&path).ok()?.trim().parse().ok()
+}
+
+/// The group's effective memory cap, `memory.max`, when one is set.
+///
+/// `max` means no cap and yields `None`, so "no limit" and "unreadable" never
+/// look the same as a byte figure. This is the cgroup's own ceiling, which is
+/// what a container is actually bounded by, not the host's `MemAvailable`.
+fn read_cgroup_limit(fs: &dyn FileSource, cgroup_path: &str) -> Option<u64> {
+    let relative = cgroup_path.trim_start_matches('/');
+    let path = Path::new(CGROUP_V2_ROOT).join(relative).join("memory.max");
     fs.read_to_string(&path).ok()?.trim().parse().ok()
 }
 
@@ -298,6 +333,88 @@ mod tests {
             "generation is the earliest start"
         );
         assert_eq!(workload.control, ControlLevel::Eligible);
+    }
+
+    #[test]
+    fn nested_container_workers_share_one_host_charge_and_generation() {
+        for runtime in ["docker", "libpod"] {
+            let root = format!("/user.slice/{runtime}-{}.scope", "a".repeat(64));
+            let fs = MemoryFs::new()
+                .with("/proc/100/stat", &stat_line(100, "server", 1, 5000))
+                .with("/proc/100/cgroup", &format!("0::{root}\n"))
+                .with("/proc/101/stat", &stat_line(101, "worker", 100, 5001))
+                .with("/proc/101/cgroup", &format!("0::{root}/workers\n"))
+                .with(&format!("/sys/fs/cgroup{root}/memory.current"), "4096")
+                .with(&format!("/sys/fs/cgroup{root}/memory.max"), "1073741824")
+                .with(
+                    &format!("/sys/fs/cgroup{root}/workers/memory.current"),
+                    "2048",
+                );
+            let inventory = collect_inventory(&fs);
+            assert_eq!(inventory.workloads.len(), 1);
+            assert_eq!(inventory.workloads[0].pids, vec![100, 101]);
+            assert_eq!(inventory.workloads[0].accounting.bytes(), Some(4096));
+            assert_eq!(inventory.workloads[0].id.scope, format!("cgroup:{root}"));
+            // The group's own cap is read from the boundary, distinct from the
+            // host, and the nested worker's own (absent) cap does not shadow it.
+            assert_eq!(inventory.workloads[0].limit_bytes, Some(1_073_741_824));
+        }
+    }
+
+    #[test]
+    fn an_unlimited_group_reports_no_limit_rather_than_zero() {
+        let fs = MemoryFs::new()
+            .with("/proc/100/stat", &stat_line(100, "server", 1, 5000))
+            .with("/proc/100/cgroup", &unit_cgroup("app.service"))
+            .with(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/app.service/memory.current",
+                "4096",
+            )
+            .with(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/app.service/memory.max",
+                "max\n",
+            );
+        let inventory = collect_inventory(&fs);
+        assert_eq!(inventory.workloads[0].limit_bytes, None);
+    }
+
+    #[test]
+    fn an_unreadable_cgroup_falls_back_to_estimated_rss_and_reports_no_limit() {
+        // Limited permissions: the cgroup accounting files cannot be read. The
+        // public inventory path must still produce a workload, with an honest
+        // estimate and no fabricated limit, rather than failing or reporting zero.
+        let fs = MemoryFs::new()
+            .with("/proc/100/stat", &stat_line(100, "server", 1, 5000))
+            .with("/proc/100/cgroup", &unit_cgroup("app.service"))
+            .with("/proc/100/status", "VmRSS:\t 2048 kB\n");
+        let inventory = collect_inventory(&fs);
+        let workload = &inventory.workloads[0];
+        assert!(
+            workload.accounting.is_estimate(),
+            "unreadable accounting is an estimate, not a measured zero"
+        );
+        assert_eq!(workload.accounting.bytes(), Some(2 * 1024 * 1024));
+        assert_eq!(workload.limit_bytes, None);
+    }
+
+    #[test]
+    fn a_replaced_container_gets_a_new_generation() {
+        let root = format!("/user.slice/docker-{}.scope", "b".repeat(64));
+        let before = MemoryFs::new()
+            .with("/proc/100/stat", &stat_line(100, "server", 1, 5000))
+            .with("/proc/100/cgroup", &format!("0::{root}\n"))
+            .with(&format!("/sys/fs/cgroup{root}/memory.current"), "4096");
+        let after = MemoryFs::new()
+            .with("/proc/200/stat", &stat_line(200, "server", 1, 9000))
+            .with("/proc/200/cgroup", &format!("0::{root}\n"))
+            .with(&format!("/sys/fs/cgroup{root}/memory.current"), "4096");
+        let first = collect_inventory(&before);
+        let second = collect_inventory(&after);
+        assert_eq!(first.workloads[0].id.scope, second.workloads[0].id.scope);
+        assert_ne!(
+            first.workloads[0].id.generation, second.workloads[0].id.generation,
+            "a reused container path is a new generation, not the workload that used to be there"
+        );
     }
 
     #[test]

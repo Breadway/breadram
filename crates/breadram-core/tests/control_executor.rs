@@ -226,6 +226,7 @@ fn workload() -> Workload {
             current_bytes: Some(6 * GIB),
         },
         control: ControlLevel::Eligible,
+        limit_bytes: None,
     }
 }
 

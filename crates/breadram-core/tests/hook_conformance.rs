@@ -88,6 +88,7 @@ fn workload(scope: &str) -> Workload {
             current_bytes: Some(1024),
         },
         control: ControlLevel::Eligible,
+        limit_bytes: None,
     }
 }
 

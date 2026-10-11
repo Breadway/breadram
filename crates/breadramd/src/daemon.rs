@@ -1238,6 +1238,7 @@ fn workload_summary(workload: &Workload, priorities: &[WorkloadPriority]) -> Wor
         control: control_level_name(workload.control).to_string(),
         priority,
         priority_source,
+        limit_bytes: workload.limit_bytes,
     }
 }
 
@@ -1763,6 +1764,7 @@ mod tests {
                 current_bytes: Some(6 * GIB),
             },
             control: ControlLevel::Eligible,
+            limit_bytes: None,
         }
     }
 

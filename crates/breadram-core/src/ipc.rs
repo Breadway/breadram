@@ -32,8 +32,9 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// 2 adds the swap and OOM diagnostic section and the per workload swap limits
 /// to the diagnostics report. 3 adds the bounded trend samples. 4 adds the
 /// growth report paired with recorded relief. 5 adds the per workload priority
-/// and its source. Nothing was removed or renumbered.
-pub const PROTOCOL_MINOR: u16 = 5;
+/// and its source. 6 adds the per workload effective memory limit. Nothing was
+/// removed or renumbered.
+pub const PROTOCOL_MINOR: u16 = 6;
 
 /// The largest single message, in bytes. Oversized messages are rejected.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -304,6 +305,10 @@ pub struct WorkloadSummary {
     /// Why that priority applies, in words, so it is not a bare number.
     #[serde(default)]
     pub priority_source: String,
+    /// The group's effective memory cap (`memory.max`), when one is set. This is
+    /// distinct from host available memory.
+    #[serde(default)]
+    pub limit_bytes: Option<u64>,
 }
 
 /// The workload inventory.
@@ -980,12 +985,13 @@ mod tests {
 
     #[test]
     fn a_diagnostics_payload_from_the_previous_minor_version_still_decodes() {
-        // The swap section was added in minor version 2, the trend samples in 3,
-        // the growth report in 4, and the per workload priority and source in 5. A
-        // client that speaks an older minor must still be able to read a report from
-        // this build, and a report written before each addition must still decode here,
-        // which is why those fields are defaulted rather than required.
-        assert_eq!(PROTOCOL_MINOR, 5);
+        // The swap section was added in minor version 2, the trend samples in 3, the
+        // growth report in 4, the per workload priority and source in 5, and the
+        // per workload effective memory limit in 6. A client that speaks an older
+        // minor must still be able to read a report from this build, and a report
+        // written before each addition must still decode here, which is why those
+        // fields are defaulted rather than required.
+        assert_eq!(PROTOCOL_MINOR, 6);
         let older = r#"{
             "mode": "monitor",
             "version": "0.1.0",

@@ -517,6 +517,7 @@ mod tests {
                 current_bytes: Some(bytes),
             },
             control: ControlLevel::Eligible,
+            limit_bytes: None,
         }
     }
 

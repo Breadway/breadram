@@ -216,6 +216,7 @@ fn workload(scope: &str, name: &str, cgroup: Option<u64>, rss: Option<u64>) -> W
         },
         priority: Priority::Normal,
         priority_source: "standalone default; missing activity is not idle".to_string(),
+        limit_bytes: None,
     }
 }
 

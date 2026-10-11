@@ -374,13 +374,18 @@ fn human_workloads(payload: &WorkloadsPayload) -> String {
             }
             (None, None) => "unknown".to_string(),
         };
+        let limit = match workload.limit_bytes {
+            Some(bytes) => format!(", limit {}", human_bytes(bytes)),
+            None => String::new(),
+        };
         lines.push(format!(
-            "  {:<28} {} proc, {:<12} {:<10} {:<16} {} (priority: {})",
+            "  {:<28} {} proc, {:<12} {:<10} {:<16}{} {} (priority: {})",
             workload.scope,
             workload.processes,
             workload.control,
             workload.priority,
             memory,
+            limit,
             workload.name,
             workload.priority_source
         ));

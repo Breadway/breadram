@@ -67,6 +67,7 @@ fn cgroup_workload(name: &str, scope: &str, bytes: u64) -> Workload {
             current_bytes: Some(bytes),
         },
         control: ControlLevel::Eligible,
+        limit_bytes: None,
     }
 }
 
