@@ -30,7 +30,6 @@ use breadram_core::adapter::{
     refresh_adapters, AdapterCapabilities, AdapterCapability, CircuitConfig, HttpTransport,
     NoSleep, OllamaAdapter,
 };
-use breadram_core::capability::CapabilityReport;
 use breadram_core::config::{ActionKind, Automation, Config};
 use breadram_core::coordinator::{
     ActionState, AppliedChange, Cancellation, ChainedExecutor, Confirmation, Coordinator, Executor,
@@ -43,11 +42,13 @@ use breadram_core::policy::{
 };
 use breadram_core::serving::TrackingCompleteness;
 use breadram_core::telemetry::fs::Clock;
-use breadram_core::telemetry::{MemInfo, MemorySnapshot, PsiLine, PsiReading, VmStat};
 use breadram_core::ManagementMode;
 
+mod support;
+
+use support::snapshot;
+
 const GIB: u64 = 1024 * 1024 * 1024;
-const TOTAL: u64 = 64 * GIB;
 const SCOPE: &str = "unit:ollama.service";
 /// 2026-10-11T00:00:00Z, so the model's reported expiry below is read against a
 /// fixed instant rather than the clock the test happens to run on.
@@ -311,34 +312,6 @@ fn pressured(config: &Config) -> PressureState {
         state = machine.observe(&snapshot(at_ms, avg10, available_fraction));
     }
     state
-}
-
-fn snapshot(now_ms: u64, avg10: f64, available_fraction: f64) -> MemorySnapshot {
-    MemorySnapshot {
-        observed_at_ms: now_ms,
-        meminfo: MemInfo {
-            total: TOTAL,
-            free: 0,
-            available: Some((TOTAL as f64 * available_fraction) as u64),
-            buffers: 0,
-            cached: 0,
-            swap_total: 0,
-            swap_free: 0,
-            anon: None,
-            shmem: None,
-        },
-        psi: Some(PsiReading {
-            some: PsiLine {
-                avg10,
-                avg60: avg10,
-                avg300: avg10,
-                total_us: 0,
-            },
-            full: None,
-        }),
-        vmstat: VmStat::default(),
-        capabilities: CapabilityReport::new(),
-    }
 }
 
 /// A host control that fails loudly if it is ever asked to do anything.

@@ -5,69 +5,23 @@
 //! protected workload and a background one, an action that proves ineffective,
 //! and a recovery back to health. Nothing is stubbed except the inputs.
 
-use breadram_core::capability::CapabilityReport;
 use breadram_core::config::{
     ActionKind, Automation, Budget, Config, Priority, Protection, Rule, RuleMatch, Timing,
 };
-use breadram_core::inventory::{ControlLevel, MemoryAccounting, Workload, WorkloadId};
+use breadram_core::inventory::{Workload, WorkloadId};
 use breadram_core::policy::{
     plan, ActionOutcome, ActionRecord, ActivityEvidence, ActivitySource, Plan, PlanChannel,
     PlannerInput, PolicyHistory, PressureState, StateMachine,
 };
-use breadram_core::telemetry::{MemInfo, MemorySnapshot, PsiLine, PsiReading, VmStat};
+mod support;
 
-const GIB: u64 = 1024 * 1024 * 1024;
-const TOTAL: u64 = 64 * GIB;
+use support::{cgroup_workload, snapshot, GIB};
 
 struct NoActivity;
 
 impl ActivitySource for NoActivity {
     fn evidence(&self, _workload: &WorkloadId) -> ActivityEvidence {
         ActivityEvidence::Unknown
-    }
-}
-
-fn snapshot(now_ms: u64, avg10: f64, available_fraction: f64) -> MemorySnapshot {
-    MemorySnapshot {
-        observed_at_ms: now_ms,
-        meminfo: MemInfo {
-            total: TOTAL,
-            free: 0,
-            available: Some((TOTAL as f64 * available_fraction) as u64),
-            buffers: 0,
-            cached: 0,
-            swap_total: 0,
-            swap_free: 0,
-            anon: None,
-            shmem: None,
-        },
-        psi: Some(PsiReading {
-            some: PsiLine {
-                avg10,
-                avg60: avg10,
-                avg300: avg10,
-                total_us: 0,
-            },
-            full: None,
-        }),
-        vmstat: VmStat::default(),
-        capabilities: CapabilityReport::new(),
-    }
-}
-
-fn cgroup_workload(name: &str, scope: &str, bytes: u64) -> Workload {
-    Workload {
-        id: WorkloadId {
-            scope: scope.to_string(),
-            generation: 1,
-        },
-        name: name.to_string(),
-        pids: vec![100],
-        accounting: MemoryAccounting::Cgroup {
-            current_bytes: Some(bytes),
-        },
-        control: ControlLevel::Eligible,
-        limit_bytes: None,
     }
 }
 
