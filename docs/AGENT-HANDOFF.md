@@ -85,7 +85,12 @@ What is not there yet, named rather than implied:
   test fixtures (RAM-29) are still open.
 - Tests that spawn the daemon leave their temporary directories behind in `/tmp`.
   Cleaning that up belongs to RAM-29.
+- Swap, compression, and OOM management are reported rather than managed: the
+  layout, the effective per workload swap limit, and the kernel's OOM kill count
+  are in `diagnostics`, with the constraints explained in notes. Nothing global
+  is ever changed, and no second OOM killer is installed.
 
 Read `docs/ADAPTER-CONTRACT.md` before touching an adapter, `docs/CLI.md` before
-touching the command surface, and `docs/SERVING-COORDINATION.md` before touching
-leases or the sleep and wake lifecycle.
+touching the command surface, `docs/SERVING-COORDINATION.md` before touching
+leases or the sleep and wake lifecycle, and `docs/SWAP-AND-OOM.md` before
+touching swap, compression, or OOM diagnostics.

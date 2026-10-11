@@ -14,6 +14,11 @@ pub struct VmStat {
     pub pswpin: Option<u64>,
     /// Pages swapped out since boot.
     pub pswpout: Option<u64>,
+    /// OOM kills the kernel has performed since boot.
+    ///
+    /// breadram reports this rather than acting on it: existing OOM management,
+    /// including the kernel's own killer, stays in charge.
+    pub oom_kill: Option<u64>,
 }
 
 /// Parse the swap related fields of `/proc/vmstat`.
@@ -26,6 +31,7 @@ pub fn parse_vmstat(contents: &str) -> VmStat {
     VmStat {
         pswpin: fields.get("pswpin").copied(),
         pswpout: fields.get("pswpout").copied(),
+        oom_kill: fields.get("oom_kill").copied(),
     }
 }
 
@@ -58,10 +64,11 @@ mod tests {
 
     #[test]
     fn parses_swap_counters() {
-        let contents = "nr_free_pages 12345\npswpin 102445\npswpout 465559\n";
+        let contents = "nr_free_pages 12345\npswpin 102445\npswpout 465559\noom_kill 3\n";
         let stat = parse_vmstat(contents);
         assert_eq!(stat.pswpin, Some(102_445));
         assert_eq!(stat.pswpout, Some(465_559));
+        assert_eq!(stat.oom_kill, Some(3));
     }
 
     #[test]
@@ -69,6 +76,10 @@ mod tests {
         let stat = parse_vmstat("nr_free_pages 10\n");
         assert_eq!(stat.pswpin, None);
         assert_eq!(stat.pswpout, None);
+        assert_eq!(
+            stat.oom_kill, None,
+            "an OOM kill counter that is not there is not zero kills"
+        );
     }
 
     #[test]
