@@ -1,0 +1,20 @@
+[package]
+name = "breadramd"
+description = "breadram memory management daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "breadramd"
+path = "src/main.rs"
+
+[dependencies]
+breadram-core.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
