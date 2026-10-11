@@ -74,15 +74,26 @@ impl RuleMatch {
 }
 
 /// A workload's scheduling priority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
     /// First to yield under pressure.
     Background,
     /// The default.
+    #[default]
     Normal,
     /// Last to yield, and shielded from automatic action.
     Protected,
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Priority::Background => "background",
+            Priority::Normal => "normal",
+            Priority::Protected => "protected",
+        })
+    }
 }
 
 /// A named rule.
@@ -174,6 +185,46 @@ impl HintDebouncer {
             }
         }
         self.active
+    }
+
+    /// Whether the hint is currently held active.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+/// Per-scope debounced activity hints for the whole host.
+///
+/// Promotion is immediate, so work that starts is never reclaimed; demotion
+/// waits for stable absence, so one missing reading cannot demote a workload and
+/// then re-promote it, which would oscillate reclaim and reload.
+#[derive(Default)]
+pub struct HintState {
+    per_scope: std::collections::BTreeMap<String, HintDebouncer>,
+}
+
+impl HintState {
+    /// Fold one observation into the hint for a scope and report whether it is
+    /// active now.
+    pub fn update(
+        &mut self,
+        scope: &str,
+        observed_active: bool,
+        now_ms: u64,
+        dwell_ms: u64,
+    ) -> bool {
+        self.per_scope.entry(scope.to_string()).or_default().update(
+            observed_active,
+            now_ms,
+            dwell_ms,
+        )
+    }
+
+    /// Whether the scope is currently held active.
+    pub fn is_active(&self, scope: &str) -> bool {
+        self.per_scope
+            .get(scope)
+            .is_some_and(HintDebouncer::is_active)
     }
 }
 
@@ -310,5 +361,18 @@ mod tests {
         )];
         assert!(select_rule(&rules, &workload("app.service", "unit:app.service")).is_some());
         assert!(select_rule(&rules, &workload("app.service", "unit:other.service")).is_none());
+    }
+
+    #[test]
+    fn a_hint_promotes_at_once_and_demotes_only_after_stable_absence() {
+        let mut hints = HintState::default();
+        assert!(hints.update("exe:build", true, 100, 50));
+        assert!(hints.is_active("exe:build"));
+        // One quiet reading does not demote, so a missing sample cannot oscillate.
+        assert!(hints.update("exe:build", false, 110, 50));
+        assert!(hints.is_active("exe:build"));
+        // Stable absence demotes.
+        assert!(!hints.update("exe:build", false, 160, 50));
+        assert!(!hints.is_active("exe:build"));
     }
 }

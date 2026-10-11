@@ -375,8 +375,14 @@ fn human_workloads(payload: &WorkloadsPayload) -> String {
             (None, None) => "unknown".to_string(),
         };
         lines.push(format!(
-            "  {:<28} {} proc, {:<16} {:<12} {}",
-            workload.scope, workload.processes, workload.control, memory, workload.name
+            "  {:<28} {} proc, {:<12} {:<10} {:<16} {} (priority: {})",
+            workload.scope,
+            workload.processes,
+            workload.control,
+            workload.priority,
+            memory,
+            workload.name,
+            workload.priority_source
         ));
     }
     lines.extend(human_capabilities(&payload.capabilities));

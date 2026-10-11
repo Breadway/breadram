@@ -14,7 +14,7 @@ use std::time::Duration;
 use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
 };
-use breadram_core::config::{validate, Config};
+use breadram_core::config::{validate, Config, HintState, Priority};
 use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
 use breadram_core::coordinator::{
     ActionJournal, Cancellation, ChainedExecutor, Coordinator, Executor, OwnerToken,
@@ -30,8 +30,8 @@ use breadram_core::ipc::{
     MAX_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use breadram_core::policy::{
-    plan as plan_actions, Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState,
-    StateMachine,
+    explain_priority, plan as plan_actions, ActivityEvidence, ActivitySource, DebouncedActivity,
+    Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState, StateMachine, MIN_IDLE_MS,
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
@@ -132,6 +132,16 @@ struct Published {
     swap: SwapLayout,
     /// The effective swap limit of each workload breadram can control.
     workload_swap: Vec<WorkloadSwap>,
+    /// The effective priority of each workload and why it applies.
+    priorities: Vec<WorkloadPriority>,
+}
+
+/// The effective priority of a workload and the reason it applies, for the wire.
+#[derive(Debug, Clone)]
+struct WorkloadPriority {
+    scope: String,
+    priority: Priority,
+    source: String,
 }
 
 /// What a handler should do next.
@@ -200,6 +210,7 @@ pub async fn run_with_config_path(
                 &mut runtime.machine,
                 &mut runtime.history,
                 &runtime.registry,
+                &mut runtime.hints,
                 &ProviderProbes::default(),
             )
         })
@@ -319,6 +330,9 @@ struct PolicyRuntime {
     machine: StateMachine,
     history: PolicyHistory,
     registry: AdapterRegistry,
+    /// Per-scope debounced activity hints. Promotion is immediate and demotion
+    /// waits for stable absence, so a focus change cannot oscillate reclaim.
+    hints: HintState,
     /// What the configured providers contributed, or why they contributed
     /// nothing.
     adapter_notes: Vec<String>,
@@ -332,6 +346,7 @@ impl PolicyRuntime {
             machine: StateMachine::new(config),
             history: policy_history(config),
             registry,
+            hints: HintState::default(),
             adapter_notes,
             config_version,
         }
@@ -443,6 +458,7 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                     &mut current_runtime.machine,
                     &mut current_runtime.history,
                     &current_runtime.registry,
+                    &mut current_runtime.hints,
                     &probes,
                 );
                 let (next, pass) = run_execution(
@@ -772,6 +788,7 @@ fn observe(
     machine: &mut StateMachine,
     history: &mut PolicyHistory,
     registry: &AdapterRegistry,
+    hints: &mut HintState,
     probes: &ProviderProbes,
 ) -> Published {
     let fs = RealFs;
@@ -779,6 +796,31 @@ fn observe(
     // doing now rather than about the last answer that happened to succeed.
     let probe_notes = refresh_adapters(registry, probes, clock);
     let inventory = collect_inventory(&fs);
+    // Fold this pass's activity readings into the debounced hints, then build the
+    // one activity view the plan and the status both reason about. Promotion is
+    // immediate; demotion waits for MIN_IDLE_MS of stable absence.
+    let raw_activity = registry.activity_source(&inventory.workloads);
+    let now_ms = clock.monotonic_ms();
+    for workload in &inventory.workloads {
+        let active = matches!(
+            raw_activity.evidence(&workload.id),
+            ActivityEvidence::Active
+        );
+        hints.update(&workload.id.scope, active, now_ms, MIN_IDLE_MS);
+    }
+    let activity = DebouncedActivity::new(&raw_activity, hints);
+    let priorities: Vec<WorkloadPriority> = inventory
+        .workloads
+        .iter()
+        .map(|workload| {
+            let (priority, source) = explain_priority(config, workload, &activity);
+            WorkloadPriority {
+                scope: workload.id.scope.clone(),
+                priority,
+                source,
+            }
+        })
+        .collect();
     // The swap layout is read once per pass and reported, never changed: the
     // swappiness, swap files, fstab, and kernel parameters are the
     // administrator's, and breadram installs no second OOM manager.
@@ -812,8 +854,9 @@ fn observe(
                 history,
                 // A configured provider is the only thing that can prove a
                 // model backend is idle. With none attached, nothing has proven
-                // activity, and unknown is never idle.
-                activity: &registry.activity_source(&inventory.workloads),
+                // activity, and unknown is never idle. The view is debounced so a
+                // brief gap cannot demote and re-promote a workload.
+                activity: &activity,
             },
             // The channel says whether the caller may execute. In automatic mode
             // it is the plan that will be carried out; in any other mode the
@@ -856,6 +899,7 @@ fn observe(
         probe_notes,
         swap,
         workload_swap,
+        priorities,
     }
 }
 
@@ -880,6 +924,7 @@ fn unavailable(mode: ManagementMode, observed_at_ms: u64) -> Published {
         probe_notes: Vec::new(),
         swap: SwapLayout::default(),
         workload_swap: Vec::new(),
+        priorities: Vec::new(),
     }
 }
 
@@ -1156,16 +1201,26 @@ async fn send_result(
 fn workloads_payload(published: &Published) -> WorkloadsPayload {
     WorkloadsPayload {
         observed_at_ms: published.status.observed_at_ms,
-        workloads: published.workloads.iter().map(workload_summary).collect(),
+        workloads: published
+            .workloads
+            .iter()
+            .map(|workload| workload_summary(workload, &published.priorities))
+            .collect(),
         capabilities: published.inventory_capabilities.clone(),
     }
 }
 
-fn workload_summary(workload: &Workload) -> WorkloadSummary {
+fn workload_summary(workload: &Workload, priorities: &[WorkloadPriority]) -> WorkloadSummary {
     let (cgroup_bytes, rss_bytes) = match &workload.accounting {
         MemoryAccounting::Cgroup { current_bytes } => (*current_bytes, None),
         MemoryAccounting::RssEstimate { rss_bytes, .. } => (None, Some(*rss_bytes)),
     };
+    let (priority, priority_source) = priorities
+        .iter()
+        .find(|entry| entry.scope == workload.id.scope)
+        .map_or((Priority::Normal, String::new()), |entry| {
+            (entry.priority, entry.source.clone())
+        });
     WorkloadSummary {
         scope: workload.id.scope.clone(),
         generation: workload.id.generation,
@@ -1175,6 +1230,8 @@ fn workload_summary(workload: &Workload) -> WorkloadSummary {
         rss_bytes,
         estimated: workload.accounting.is_estimate(),
         control: control_level_name(workload.control).to_string(),
+        priority,
+        priority_source,
     }
 }
 
@@ -1478,12 +1535,14 @@ async fn apply_config_change(
             let mut machine = StateMachine::new(&config);
             let mut history = policy_history(&config);
             let runtime = PolicyRuntime::new(&config, 0);
+            let mut hints = HintState::default();
             observe(
                 &clock,
                 &config,
                 &mut machine,
                 &mut history,
                 &runtime.registry,
+                &mut hints,
                 &ProviderProbes::default(),
             )
         })

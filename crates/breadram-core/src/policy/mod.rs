@@ -20,10 +20,10 @@ pub mod history;
 pub mod planner;
 pub mod state;
 
-pub use activity::{ActivityEvidence, ActivitySource, UnknownActivity};
+pub use activity::{ActivityEvidence, ActivitySource, DebouncedActivity, UnknownActivity};
 pub use history::{ActionOutcome, ActionRecord, PolicyHistory};
 pub use planner::{
-    budget_for, is_action_protected, plan, Plan, PlanChannel, PlannedAction, PlannerInput,
-    MAX_ACTIONS_CRITICAL, MAX_ACTIONS_PRESSURED, MIN_IDLE_MS,
+    budget_for, explain_priority, is_action_protected, plan, Plan, PlanChannel, PlannedAction,
+    PlannerInput, MAX_ACTIONS_CRITICAL, MAX_ACTIONS_PRESSURED, MIN_IDLE_MS,
 };
 pub use state::{PressureState, StateMachine, RELEASE_FRACTION};
