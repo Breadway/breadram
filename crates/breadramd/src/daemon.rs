@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use breadram_core::adapter::AdapterRegistry;
+use breadram_core::adapter::{
+    AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, Sleeper,
+};
 use breadram_core::config::{validate, Config};
 use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
 use breadram_core::coordinator::{
-    ActionJournal, Cancellation, Coordinator, Executor, OwnerToken, PersistedJournal,
-    RestoreOutcome,
+    ActionJournal, Cancellation, ChainedExecutor, Coordinator, Executor, OwnerToken,
+    PersistedJournal, RestoreOutcome,
 };
 use breadram_core::execution::{execute_plan, ExecutionPass};
 use breadram_core::inventory::{collect_inventory, MemoryAccounting, Workload};
@@ -113,6 +115,11 @@ struct Published {
     control_targets: usize,
     pressure: PressureState,
     plan: Option<Plan>,
+    /// What this pass learned from the configured providers: an endpoint that
+    /// could not be read, or an answer that could not be understood. Reported
+    /// rather than swallowed, because an adapter that cannot see its provider
+    /// cannot offer a release either.
+    probe_notes: Vec<String>,
 }
 
 /// What a handler should do next.
@@ -181,6 +188,7 @@ pub async fn run_with_config_path(
                 &mut runtime.machine,
                 &mut runtime.history,
                 &runtime.registry,
+                &ProviderProbes::default(),
             )
         })
         .await
@@ -232,6 +240,52 @@ pub async fn run_with_config_path(
     drop(listener);
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+/// The bounded path to the configured providers.
+///
+/// It is deliberately small and copyable: the probe client owns the retries, the
+/// backoff, the timeout, and the response cap, so the daemon only has to say how
+/// to reach the wire and how to wait.
+#[derive(Clone, Copy, Default)]
+struct ProviderProbes {
+    transport: HttpTransport,
+    sleeper: ThreadSleeper,
+    circuit: CircuitConfig,
+}
+
+/// A sleeper that really waits.
+///
+/// Only the daemon's blocking monitor worker uses this. Core ships a no-op
+/// sleeper, so tests and library users never block on a retry.
+#[derive(Debug, Default, Clone, Copy)]
+struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// Read every configured provider once, and record what came back.
+///
+/// The probes come from the adapters, which only ever ask about endpoints an
+/// operator configured, so nothing is discovered and no port is guessed. A read
+/// that failed is recorded as a failed reading rather than leaving the previous
+/// success in place, and the returned notes name the endpoint that could not be
+/// read.
+fn refresh_adapters(
+    registry: &AdapterRegistry,
+    probes: &ProviderProbes,
+    clock: &SystemClock,
+) -> Vec<String> {
+    breadram_core::adapter::refresh_adapters(
+        registry,
+        &probes.transport,
+        &probes.sleeper,
+        clock,
+        probes.circuit,
+    )
 }
 
 /// The policy state that has to survive between monitor ticks.
@@ -361,20 +415,27 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                     // threshold takes effect at once instead of after a dwell.
                     current_runtime = PolicyRuntime::new(&config, current);
                 }
+                let probes = ProviderProbes::default();
                 let published = observe(
                     &clock,
                     &config,
                     &mut current_runtime.machine,
                     &mut current_runtime.history,
                     &current_runtime.registry,
+                    &probes,
                 );
                 let (next, pass) = run_execution(
                     current_coordinator,
-                    &config,
-                    published.plan.as_ref(),
-                    &published.workloads,
-                    published.status.observed_at_ms,
-                    &cancel,
+                    ExecutionStep {
+                        config: &config,
+                        plan: published.plan.as_ref(),
+                        workloads: &published.workloads,
+                        now_ms: published.status.observed_at_ms,
+                        cancel: &cancel,
+                        registry: &current_runtime.registry,
+                        probes: &probes,
+                        clock: &clock,
+                    },
                 );
                 (published, current_runtime, next, pass)
             })
@@ -407,6 +468,7 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
 
             let wrote = pass.as_ref().is_some_and(ExecutionPass::wrote);
             let mut notes = startup_notes.clone();
+            notes.extend(published.probe_notes.iter().cloned());
             if let Some(runtime) = runtime.as_ref() {
                 notes.extend(runtime.adapter_notes.iter().cloned());
             }
@@ -505,19 +567,38 @@ fn describe_recovery(results: &[breadram_core::coordinator::RestoreResult]) -> S
 /// unit's cgroup, so breadram never rewrites a hierarchy itself.
 fn run_execution(
     mut coordinator: Coordinator,
-    config: &Config,
-    plan: Option<&Plan>,
-    workloads: &[Workload],
-    now_ms: u64,
-    cancel: &Cancellation,
+    step: ExecutionStep<'_>,
 ) -> (Coordinator, Option<ExecutionPass>) {
+    let ExecutionStep {
+        config,
+        plan,
+        workloads,
+        now_ms,
+        cancel,
+        registry,
+        probes,
+        clock,
+    } = step;
     let Some(plan) = plan else {
         return (coordinator, None);
     };
     let fs = RealFs;
     let targets = discover_targets(&fs);
     let runner = ProcessRunner;
-    let executor = ControlExecutor::new(&fs, &runner, &targets);
+    let control = ControlExecutor::new(&fs, &runner, &targets);
+    // Host controls and provider actions are disjoint, so each executor claims
+    // the actions it can carry out and the chain keeps them in one pass. The
+    // transport is the same value on both sides: a probe can only read, and only
+    // an operation can write.
+    let provider = AdapterExecutor::new(
+        registry,
+        workloads,
+        &probes.transport,
+        &probes.transport,
+        &probes.sleeper,
+        clock,
+    );
+    let executor = ChainedExecutor::new(vec![&control, &provider]);
     let pass = execute_with(
         &mut coordinator,
         config,
@@ -528,6 +609,19 @@ fn run_execution(
         cancel,
     );
     (coordinator, Some(pass))
+}
+
+/// Everything one execution pass needs beyond the coordinator itself.
+struct ExecutionStep<'a> {
+    config: &'a Config,
+    plan: Option<&'a Plan>,
+    workloads: &'a [Workload],
+    now_ms: u64,
+    cancel: &'a Cancellation,
+    /// The configured providers, so a provider action can be carried out.
+    registry: &'a AdapterRegistry,
+    probes: &'a ProviderProbes,
+    clock: &'a SystemClock,
 }
 
 /// The execute step itself, over any executor.
@@ -645,8 +739,12 @@ fn observe(
     machine: &mut StateMachine,
     history: &mut PolicyHistory,
     registry: &AdapterRegistry,
+    probes: &ProviderProbes,
 ) -> Published {
     let fs = RealFs;
+    // The providers are read first, so the policy reasons about what a backend is
+    // doing now rather than about the last answer that happened to succeed.
+    let probe_notes = refresh_adapters(registry, probes, clock);
     let inventory = collect_inventory(&fs);
     let control_targets = discover_targets(&fs).len();
     let snapshot = collect_host(&fs, clock).ok();
@@ -707,6 +805,7 @@ fn observe(
         control_targets,
         pressure,
         plan,
+        probe_notes,
     }
 }
 
@@ -728,6 +827,7 @@ fn unavailable(mode: ManagementMode, observed_at_ms: u64) -> Published {
         control_targets: 0,
         pressure: PressureState::Healthy,
         plan: None,
+        probe_notes: Vec::new(),
     }
 }
 
@@ -1227,6 +1327,7 @@ async fn apply_config_change(
                 &mut machine,
                 &mut history,
                 &runtime.registry,
+                &ProviderProbes::default(),
             )
         })
         .await
@@ -1547,6 +1648,44 @@ mod tests {
 
         assert_eq!(executor.applies(), 1, "a confirmed action is not repeated");
         assert_eq!(coordinator.journal().len(), 3);
+    }
+
+    #[test]
+    fn a_configured_provider_is_read_by_the_daemon_and_its_failure_is_reported() {
+        use breadram_core::config::{ProviderEndpoint, ProviderKind};
+
+        // A provider on a port nothing is listening on, so the daemon's own read
+        // path is exercised rather than a fake.
+        let settings = Config {
+            providers: vec![ProviderEndpoint {
+                name: "ollama".to_string(),
+                kind: ProviderKind::Ollama,
+                url: "http://127.0.0.1:9".to_string(),
+                scope: Some(SCOPE.to_string()),
+                credential_ref: None,
+                allow_automation: true,
+            }],
+            ..Config::default()
+        };
+        let clock = SystemClock::new();
+        let (registry, attached) = AdapterRegistry::from_config(&settings);
+        assert_eq!(registry.names(), vec!["ollama"]);
+        assert!(attached.is_empty(), "{attached:?}");
+
+        let probes = ProviderProbes::default();
+        let notes = refresh_adapters(&registry, &probes, &clock);
+        assert_eq!(notes.len(), 2, "both reads are reported: {notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains("could not be reached")),
+            "{notes:?}"
+        );
+
+        // With no provider configured, nothing is asked and nothing is claimed.
+        let (empty, _) = AdapterRegistry::from_config(&Config::default());
+        assert!(empty.is_empty());
+        assert!(refresh_adapters(&empty, &probes, &clock).is_empty());
     }
 
     #[test]

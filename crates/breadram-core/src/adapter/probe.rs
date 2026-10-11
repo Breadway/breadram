@@ -17,6 +17,7 @@
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 
+use super::OperationRequest;
 use crate::capability::CapabilityState;
 use crate::telemetry::fs::Clock;
 
@@ -175,6 +176,23 @@ pub enum TransportError {
 pub trait Transport: Send + Sync {
     /// Send one request, giving up after `timeout_ms`.
     fn send(&self, request: &ProbeRequest, timeout_ms: u64) -> Result<Response, TransportError>;
+}
+
+/// Carries an operation request, which is the only thing that can write.
+///
+/// It is separate from [`Transport`] so a read-only path can never be handed a
+/// write request: a probe is a `GET` by construction, and the only way to reach
+/// an operation is to hold this trait.
+///
+/// The same rules apply as for [`Transport`]: a credential must never appear in
+/// an error message, and the request must be bounded.
+pub trait OperationTransport: Send + Sync {
+    /// Send one operation, giving up after `timeout_ms`.
+    fn send_operation(
+        &self,
+        request: &OperationRequest,
+        timeout_ms: u64,
+    ) -> Result<Response, TransportError>;
 }
 
 /// Waits between retries.
@@ -479,6 +497,8 @@ pub struct ScriptedTransport {
     script: Mutex<Vec<Result<Response, TransportError>>>,
     calls: Mutex<Vec<ProbeRequest>>,
     timeouts: Mutex<Vec<u64>>,
+    operation_script: Mutex<Vec<Result<Response, TransportError>>>,
+    operations: Mutex<Vec<OperationRequest>>,
 }
 
 impl ScriptedTransport {
@@ -491,6 +511,25 @@ impl ScriptedTransport {
     pub fn push(self, outcome: Result<Response, TransportError>) -> Self {
         lock(&self.script).push(outcome);
         self
+    }
+
+    /// Append one outcome to the operation script.
+    ///
+    /// Operations are scripted separately from probes, so a test can say exactly
+    /// what a write was answered with without disturbing the read sequence.
+    pub fn push_operation(self, outcome: Result<Response, TransportError>) -> Self {
+        lock(&self.operation_script).push(outcome);
+        self
+    }
+
+    /// The operations that were actually sent, oldest first.
+    pub fn operations(&self) -> Vec<OperationRequest> {
+        lock(&self.operations).clone()
+    }
+
+    /// How many operations were sent.
+    pub fn operation_count(&self) -> usize {
+        lock(&self.operations).len()
     }
 
     /// The requests that were actually sent, oldest first.
@@ -516,6 +555,24 @@ impl Transport for ScriptedTransport {
         let mut script = lock(&self.script);
         if script.is_empty() {
             return Err(TransportError::Failure("script exhausted".to_string()));
+        }
+        script.remove(0)
+    }
+}
+
+impl OperationTransport for ScriptedTransport {
+    fn send_operation(
+        &self,
+        request: &OperationRequest,
+        timeout_ms: u64,
+    ) -> Result<Response, TransportError> {
+        lock(&self.operations).push(request.clone());
+        lock(&self.timeouts).push(timeout_ms);
+        let mut script = lock(&self.operation_script);
+        if script.is_empty() {
+            return Err(TransportError::Failure(
+                "the operation script is exhausted".to_string(),
+            ));
         }
         script.remove(0)
     }

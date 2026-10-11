@@ -57,12 +57,29 @@ it revalidates each action against the live inventory, applies it through system
 changed, journals it, and remembers the values it owns in a versioned state file
 so a restart can restore them.
 
+A provider action can now be carried out as well as planned. `adapter::HttpTransport`
+is the real bounded loopback transport, `adapter::AdapterExecutor` implements the
+coordinator's `Executor` boundary for the provider-backed actions, and
+`ChainedExecutor` runs host controls and provider actions in one pass. The daemon
+reads every configured endpoint once per tick before policy runs, so a decision
+is never made on a stale provider reading. This was verified over a real socket
+against an in-process fake provider: an idle release is planned, performed,
+confirmed, and journalled with a measured effect, a busy backend is never written
+to, an unreachable provider is reported, and an unconfirmable release is
+journalled as unconfirmed rather than as success.
+
 What is not there yet, named rather than implied:
 
-- No provider action is executed. A configured provider is attached and its
-  activity evidence reaches policy, but nothing can call it: there is no HTTP
-  transport in `breadram_core::adapter` yet, only `ScriptedTransport` for tests.
-  That plus the workload mapping is RAM-13, RAM-14, RAM-16, and RAM-45.
+- The release path is planned-never-executed until request tracking is declared.
+  With `TrackingCompleteness::Unknown`, a resident model reports `Active`, so
+  nothing is planned against it. That is the conservative direction and it is
+  correct; the gateway that reports real requests is RAM-45, and a deployment
+  that declares complete tracking is what makes a resident but unused model
+  releasable. Nothing infers it.
+- Only the Ollama adapter exists. llama.cpp (RAM-13), vLLM (RAM-14),
+  breadsearch (RAM-18), and the workload mapping for containers and services
+  (RAM-16) are open. The transport speaks loopback `http` only: `https` and
+  `unix:` endpoints are refused with a reason rather than sent in the clear.
 - Background jobs (RAM-17), priorities and budgets beyond the per scope budget
   (RAM-21), swap and OOM diagnostics (RAM-23), trends (RAM-28), and the shared
   test fixtures (RAM-29) are still open.
