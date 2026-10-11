@@ -32,6 +32,7 @@ pub mod llamacpp;
 pub mod mock;
 pub mod ollama;
 pub mod probe;
+pub mod vllm;
 
 pub use capability::{AdapterCapabilities, AdapterCapability, CAPABILITY_PROBE_VERSION};
 pub use executor::{AdapterExecutor, DEFAULT_OPERATION_TIMEOUT_MS, MAX_ERROR_EXCERPT_CHARS};
@@ -520,6 +521,14 @@ impl AdapterRegistry {
                         ));
                     }
                 }
+                ProviderKind::Vllm => {
+                    registry.register(Box::new(vllm::VllmAdapter::new(
+                        provider.name.clone(),
+                        provider.url.clone(),
+                        scope.to_string(),
+                    )));
+                    notes.push(format!("provider {}: vLLM controls unavailable pending coordinated restore and real inference verification", provider.name));
+                }
                 other => notes.push(format!(
                     "provider {} speaks {other:?}, which this build has no adapter for yet",
                     provider.name
@@ -812,10 +821,15 @@ mod tests {
             ..Config::default()
         };
         let (registry, notes) = AdapterRegistry::from_config(&config);
-        assert_eq!(registry.names(), vec!["ollama"]);
+        assert_eq!(registry.names(), vec!["ollama", "vllm"]);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes.iter().any(|note| note.contains("no workload scope")));
-        assert!(notes.iter().any(|note| note.contains("no adapter for yet")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("vLLM controls unavailable")));
+        assert!(!registry.owners(&workload("unit:vllm.service"))[0]
+            .capabilities()
+            .supports(AdapterCapability::SleepModel));
 
         // With a scope, the adapter owns that workload and reports its endpoint.
         let owners = registry.owners(&workload("unit:ollama.service"));
