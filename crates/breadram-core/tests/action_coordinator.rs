@@ -202,6 +202,7 @@ fn a_confirmed_action_records_the_requested_and_observed_effect() {
     let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB)
         .script_apply(Ok(AppliedChange {
             values: vec![owned(KEY, "4294967296", "2147483648")],
+            note: None,
         }));
     let mut coordinator = coordinator();
     let results = run(
@@ -442,6 +443,7 @@ fn recovery_after_a_restart_restores_values_breadram_still_owns() {
     let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB)
         .script_apply(Ok(AppliedChange {
             values: vec![owned(KEY, "4294967296", "2147483648")],
+            note: None,
         }));
     let mut first_run = coordinator();
     run(&mut first_run, &executor, &[request("unit:app.service", 1)]);
@@ -467,6 +469,7 @@ fn recovery_does_not_overwrite_a_newer_external_change() {
     let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB)
         .script_apply(Ok(AppliedChange {
             values: vec![owned(KEY, "4294967296", "2147483648")],
+            note: None,
         }));
     let mut coordinator = coordinator();
     run(
@@ -498,6 +501,7 @@ fn recovery_skips_a_target_that_is_gone() {
     let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB)
         .script_apply(Ok(AppliedChange {
             values: vec![owned(KEY, "4294967296", "2147483648")],
+            note: None,
         }));
     let mut coordinator = coordinator();
     run(

@@ -95,6 +95,12 @@ pub struct ActionRequest {
     pub requested_at_ms: u64,
     /// The latest time the action may start. Zero means no deadline.
     pub deadline_ms: u64,
+    /// The value the action intends to reach, when the action has one.
+    ///
+    /// For a bounded soft limit this is the budget in bytes to limit the
+    /// workload to. An executor that needs a value refuses the action when this
+    /// is absent rather than guessing one.
+    pub limit_bytes: Option<u64>,
 }
 
 impl ActionRequest {
@@ -113,7 +119,14 @@ impl ActionRequest {
             expected_device_ram_delta: 0,
             requested_at_ms: at_ms,
             deadline_ms: 0,
+            limit_bytes: None,
         }
+    }
+
+    /// Set the value the action intends to reach.
+    pub fn with_limit_bytes(mut self, limit_bytes: u64) -> Self {
+        self.limit_bytes = Some(limit_bytes);
+        self
     }
 
     /// Set the deadline.
@@ -411,23 +424,30 @@ impl Coordinator {
             Ok(change) => {
                 let confirmation = executor.confirm(request);
                 let after = executor.observe(&request.target);
+                let note = change.note.clone();
                 let values = self.own(change.values);
                 match confirmation {
                     Confirmation::Confirmed => finish!(
                         ActionState::Confirmed,
-                        "applied and confirmed".to_string(),
+                        with_note("applied and confirmed", &note),
                         Some(effect_of(before, after)),
                         values
                     ),
                     Confirmation::NotYet { reason } => finish!(
                         ActionState::Unconfirmed,
-                        format!("applied but the effect is not visible yet: {reason}"),
+                        with_note(
+                            &format!("applied but the effect is not visible yet: {reason}"),
+                            &note
+                        ),
                         Some(effect_of(before, after)),
                         values
                     ),
                     Confirmation::Refused { reason } => finish!(
                         ActionState::Failed,
-                        format!("the target refused to confirm the effect: {reason}"),
+                        with_note(
+                            &format!("the target refused to confirm the effect: {reason}"),
+                            &note
+                        ),
                         Some(effect_of(before, after)),
                         values
                     ),
@@ -521,6 +541,14 @@ impl Coordinator {
             });
         }
         results
+    }
+}
+
+/// Append an executor note to a detail string, when there is one.
+fn with_note(base: &str, note: &Option<String>) -> String {
+    match note {
+        Some(note) => format!("{base} ({note})"),
+        None => base.to_string(),
     }
 }
 

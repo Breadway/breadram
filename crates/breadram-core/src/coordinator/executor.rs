@@ -76,6 +76,9 @@ pub enum ExecutorError {
 pub struct AppliedChange {
     /// Daemon-owned values that were written, each carrying its original.
     pub values: Vec<OwnedValue>,
+    /// Anything the caller should know about what happened, such as a value
+    /// that was clamped to stay within a bound. Reported, never hidden.
+    pub note: Option<String>,
 }
 
 /// The result of a confirmation check.
