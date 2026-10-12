@@ -167,6 +167,15 @@ impl GatewayServer {
         self.inner.started.elapsed().as_millis() as u64
     }
 
+    /// The scopes that currently hold a lease.
+    ///
+    /// This is the bridge to the policy planner, which only sees activity
+    /// evidence and never learns that a gateway exists. A scope in this list has
+    /// a request in flight and must not be unloaded.
+    pub async fn active_scopes(&self) -> Vec<String> {
+        self.inner.gateway.lock().await.active_scopes()
+    }
+
     /// What the gateway knows about a workload: active while a lease is in
     /// flight, idle once the last one ends, unknown when untracked.
     pub async fn evidence(&self, workload_scope: &str) -> ActivityEvidence {

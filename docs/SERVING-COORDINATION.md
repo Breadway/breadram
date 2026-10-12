@@ -144,8 +144,11 @@ refuse.
 
 The gateway also implements the policy's `ActivitySource`: each backend's leases
 are its activity evidence, so a workload with a live lease is never released and
-an unknown workload is unknown, never idle. That is how the policy learns a
-backend is in use without ever learning that a gateway exists.
+an unknown workload is unknown, never idle. The daemon publishes the scopes
+that currently hold a lease into the monitor pass, where a lease counts as
+active on its own, ahead of whatever the provider last answered. That is how a
+request in flight stops an unload without the planner ever learning that a
+gateway exists.
 
 The wake side is performed; the sleep side is still provider work. The gateway
 wakes and serves, and the drain/sleep lifecycle the adapters drive through

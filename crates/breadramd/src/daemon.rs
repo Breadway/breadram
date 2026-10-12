@@ -147,6 +147,10 @@ struct SharedState {
     job_running: Mutex<HashMap<String, JobCancel>>,
     /// Recently finished jobs, newest last, bounded.
     job_finished: Mutex<VecDeque<FinishedJob>>,
+    /// Scopes the gateway currently holds a lease for. Written by the gateway
+    /// task, read by the monitor, so a request in flight is active evidence
+    /// the planner can see and will not unload from under.
+    gateway_active: RwLock<Vec<String>>,
 }
 
 /// What to execute for one admitted job.
@@ -315,7 +319,10 @@ pub async fn run_with_config_path(
                 &mut runtime.history,
                 &runtime.registry,
                 &mut runtime.hints,
-                &ProviderProbes::default(),
+                Observation {
+                    probes: &ProviderProbes::default(),
+                    gateway_active: &[],
+                },
             )
         })
         .await
@@ -339,6 +346,7 @@ pub async fn run_with_config_path(
         job_specs: Mutex::new(HashMap::new()),
         job_running: Mutex::new(HashMap::new()),
         job_finished: Mutex::new(VecDeque::new()),
+        gateway_active: RwLock::new(Vec::new()),
         execution_notes: RwLock::new(Vec::new()),
         state_path: default_state_path(),
         cancel: Cancellation::new(),
@@ -574,11 +582,23 @@ async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
             }),
         })
         .collect();
-    let server = GatewayServer::new(GatewayConfig { routes }, now_ms);
+    let server = Arc::new(GatewayServer::new(GatewayConfig { routes }, now_ms));
     // Before the listener opens, so a backend that is already asleep is woken
     // by the first request instead of being served into a miss. Reconcile
     // drops leases, which is why it happens here and never again.
     server.reconcile_startup().await;
+    // Publish the scopes that hold a lease, so the planner sees a request in
+    // flight as active and will not unload the backend from under it.
+    let publishing = Arc::clone(&server);
+    let shared = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            ticker.tick().await;
+            let active = publishing.active_scopes().await;
+            *shared.gateway_active.write().await = active;
+        }
+    });
     tokio::spawn(async move {
         server.serve(listener).await;
     });
@@ -676,6 +696,9 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             // applied once.
             let rebuild_config = config.clone();
             let cancel = state.cancel.clone();
+            // A snapshot of the gateway's leases, so a request in flight counts
+            // as active for this pass.
+            let gateway_active = state.gateway_active.read().await.clone();
             let collected = tokio::task::spawn_blocking(move || {
                 let mut current_runtime = current_runtime;
                 if current_runtime.config_version != current {
@@ -691,7 +714,10 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                     &mut current_runtime.history,
                     &current_runtime.registry,
                     &mut current_runtime.hints,
-                    &probes,
+                    Observation {
+                        probes: &probes,
+                        gateway_active: &gateway_active,
+                    },
                 );
                 let (next, pass) = run_execution(
                     current_coordinator,
@@ -1024,6 +1050,13 @@ fn policy_history(config: &Config) -> PolicyHistory {
 }
 
 /// Collect one complete observation and run the policy over it.
+/// One observation's inputs that are not the policy state itself.
+struct Observation<'a> {
+    probes: &'a ProviderProbes,
+    /// Scopes the gateway holds a lease for, so a request in flight is active.
+    gateway_active: &'a [String],
+}
+
 fn observe(
     clock: &SystemClock,
     config: &Config,
@@ -1031,12 +1064,12 @@ fn observe(
     history: &mut PolicyHistory,
     registry: &AdapterRegistry,
     hints: &mut HintState,
-    probes: &ProviderProbes,
+    observation: Observation<'_>,
 ) -> Published {
     let fs = RealFs;
     // The providers are read first, so the policy reasons about what a backend is
     // doing now rather than about the last answer that happened to succeed.
-    let probe_notes = refresh_adapters(registry, probes, clock);
+    let probe_notes = refresh_adapters(registry, observation.probes, clock);
     let inventory = collect_inventory(&fs);
     // Fold this pass's activity readings into the debounced hints, then build the
     // one activity view the plan and the status both reason about. Promotion is
@@ -1044,10 +1077,16 @@ fn observe(
     let raw_activity = registry.activity_source(&inventory.workloads);
     let now_ms = clock.monotonic_ms();
     for workload in &inventory.workloads {
-        let active = matches!(
-            raw_activity.evidence(&workload.id),
-            ActivityEvidence::Active
-        );
+        // A gateway lease is active evidence on its own: a request in flight
+        // must not be unloaded, even when the provider has not answered yet.
+        let active = observation
+            .gateway_active
+            .iter()
+            .any(|scope| scope == &workload.id.scope)
+            || matches!(
+                raw_activity.evidence(&workload.id),
+                ActivityEvidence::Active
+            );
         hints.update(&workload.id.scope, active, now_ms, MIN_IDLE_MS);
     }
     let activity = DebouncedActivity::new(&raw_activity, hints);
@@ -2666,7 +2705,10 @@ async fn apply_config_change(
                 &mut history,
                 &runtime.registry,
                 &mut hints,
-                &ProviderProbes::default(),
+                Observation {
+                    probes: &ProviderProbes::default(),
+                    gateway_active: &[],
+                },
             )
         })
         .await

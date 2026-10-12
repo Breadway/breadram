@@ -79,6 +79,16 @@ impl Gateway {
             .find(|backend| backend.workload() == workload)
     }
 
+    /// The scopes that currently hold a lease, so a planner that never sees the
+    /// gateway still knows a request is in flight.
+    pub fn active_scopes(&self) -> Vec<String> {
+        self.backends
+            .iter()
+            .filter(|backend| backend.evidence() == ActivityEvidence::Active)
+            .map(|backend| backend.workload().scope.clone())
+            .collect()
+    }
+
     /// The backend serving a workload, for the caller to record results on.
     pub fn backend_mut(&mut self, workload: &WorkloadId) -> Option<&mut Backend> {
         self.backends
@@ -269,6 +279,31 @@ mod tests {
         ));
         backend.sleep_confirmed(1_000_000).unwrap();
         backend
+    }
+
+    #[test]
+    fn a_lease_in_flight_is_reported_as_an_active_scope() {
+        // The planner never sees the gateway. It only sees the scopes that hold
+        // a lease, so a request in flight must appear here and disappear once
+        // it completes, or the planner could unload a backend mid-request.
+        let mut gateway = Gateway::new(vec![Backend::new(
+            workload(),
+            TrackingCompleteness::Complete,
+            ServingPolicy::default(),
+            0,
+        )]);
+        assert!(gateway.active_scopes().is_empty());
+        let RouteOutcome::Forward { admission, .. } =
+            gateway.route(&workload(), RequestMeta::new("c1"), 1)
+        else {
+            panic!("an awake backend forwards");
+        };
+        assert_eq!(gateway.active_scopes(), vec![SCOPE.to_string()]);
+        gateway
+            .backend_mut(&workload())
+            .unwrap()
+            .finish(admission.lease(), 2);
+        assert!(gateway.active_scopes().is_empty());
     }
 
     #[test]
