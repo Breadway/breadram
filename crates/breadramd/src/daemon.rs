@@ -575,6 +575,10 @@ async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
         })
         .collect();
     let server = GatewayServer::new(GatewayConfig { routes }, now_ms);
+    // Before the listener opens, so a backend that is already asleep is woken
+    // by the first request instead of being served into a miss. Reconcile
+    // drops leases, which is why it happens here and never again.
+    server.reconcile_startup().await;
     tokio::spawn(async move {
         server.serve(listener).await;
     });

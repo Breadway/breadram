@@ -55,7 +55,9 @@ use super::http::{
     parse_head, parse_response_head, ParseError, RequestHead, ResponseHead, MAX_HEADER_BYTES,
 };
 use super::lease::{Admission, ClientId, LeaseId, RequestKind};
-use super::lifecycle::{Backend, ServingPolicy, TrackingCompleteness, WakeHealth, WakeRequest};
+use super::lifecycle::{
+    Backend, ProviderState, ServingPolicy, TrackingCompleteness, WakeHealth, WakeRequest,
+};
 
 /// The largest head accepted, in bytes.
 pub const MAX_HEAD_BYTES: usize = MAX_HEADER_BYTES;
@@ -173,6 +175,35 @@ impl GatewayServer {
             .lock()
             .await
             .evidence(&workload(workload_scope))
+    }
+
+    /// Learn each backend's real state before the first request arrives.
+    ///
+    /// A backend starts awake, which is the safe assumption when nothing is
+    /// known: an awake backend only wastes memory, while a sleeping one that is
+    /// treated as awake wastes a request. But a provider that is already asleep
+    /// at startup would then never be woken, because routing only wakes a
+    /// backend it believes is asleep. This asks once, before the listener
+    /// opens, and reconciles. It is safe only then: reconcile drops every
+    /// lease, so it must not run once requests are in flight.
+    ///
+    /// A route with no wake spec has nothing to observe, and stays awake. A
+    /// provider that does not answer is unverified, which a later request can
+    /// still wake, rather than assumed to be serving.
+    pub async fn reconcile_startup(&self) {
+        for route in &self.inner.routes {
+            let Some(spec) = &route.wake else {
+                continue;
+            };
+            let observed = observe_provider(&route.backend_addr, spec).await;
+            let now = self.now_ms();
+            self.inner
+                .gateway
+                .lock()
+                .await
+                .backend_mut(&workload(&route.workload_scope))
+                .map(|backend| backend.reconcile(observed, now));
+        }
     }
 
     /// Serve connections until the listener closes. One task per connection.
@@ -459,6 +490,40 @@ async fn poll_loaded(addr: &str, spec: &WakeSpec) -> WakeHealth {
             }
             ModelStatus::Other => continue,
         }
+    }
+}
+
+/// Ask a backend whether its wake model is serving, once.
+///
+/// The same structured listing the wake verifies against: the exact model id
+/// carrying `loaded` means serving, any other reported status means asleep,
+/// and a provider that cannot be read means unknown. A substring match across
+/// entries is never enough.
+async fn observe_provider(addr: &str, spec: &WakeSpec) -> ProviderState {
+    let mut backend = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return ProviderState::Unknown,
+    };
+    let head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        spec.health_path, addr
+    );
+    if backend.write_all(head.as_bytes()).await.is_err() {
+        return ProviderState::Unknown;
+    }
+    let Ok((response, buffered)) = read_response_head(&mut backend).await else {
+        return ProviderState::Unknown;
+    };
+    if !(200..300).contains(&response.status) {
+        return ProviderState::Unknown;
+    }
+    let Ok(body) = read_body_exact(&mut backend, &response, buffered).await else {
+        return ProviderState::Unknown;
+    };
+    match model_status(&body, &spec.model_id) {
+        ModelStatus::Loaded => ProviderState::Serving,
+        ModelStatus::Other => ProviderState::Sleeping,
+        ModelStatus::Unparseable => ProviderState::Unknown,
     }
 }
 
@@ -1612,6 +1677,51 @@ mod wake_tests {
             .next()
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_finds_a_backend_that_is_already_asleep() {
+        // The daemon seeds every backend awake. A provider that is already
+        // unloaded must be learned before the listener opens, or the first
+        // request is forwarded into a miss instead of waking it.
+        let state = flip_state();
+        let addr = start_router(Arc::clone(&state)).await;
+        let config = ServerConfig {
+            routes: vec![Route {
+                path_prefix: "/v1".to_string(),
+                workload_scope: SCOPE.to_string(),
+                backend_addr: addr.clone(),
+                tracking: TrackingCompleteness::Complete,
+                wake: Some(wake_spec()),
+            }],
+        };
+        let server = Arc::new(GatewayServer::new(config, 0));
+        server.reconcile_startup().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let gateway = listener.local_addr().expect("an address").to_string();
+        let serving = Arc::clone(&server);
+        tokio::spawn(async move {
+            serving.serve(listener).await;
+        });
+
+        let first = get(&gateway, "/v1/models").await;
+        assert!(
+            status_of(&first).contains("503"),
+            "an already-asleep backend must wake, not serve: {}",
+            status_of(&first)
+        );
+        // The load runs after the reply, so give it a moment to land.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.loads.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            state.loads.load(Ordering::Relaxed) >= 1,
+            "the reconcile must begin the provider wake"
+        );
     }
 
     #[tokio::test]

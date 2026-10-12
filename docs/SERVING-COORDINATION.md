@@ -152,6 +152,31 @@ wakes and serves, and the drain/sleep lifecycle the adapters drive through
 `SleepDecision` and `DrainOutcome` remains theirs: the gateway only ever
 answers arrivals, it never decides to sleep a backend.
 
+A backend starts awake, which is the safe assumption when nothing is known,
+but a provider that is already asleep at startup would then never be woken.
+Before the listener opens, and only then, the server asks each route that has
+a wake spec for its listing and reconciles: `loaded` means serving, any other
+reported status means asleep, and a provider that cannot be read is
+unverified, which a later request can still wake. Reconcile drops every lease,
+so it never runs once requests are in flight.
+
+## Verified against a real server
+
+llama-server 0.5.0-dev (build 11146) in router mode on loopback, Qwen3 8B
+Q4_K_M from the local Ollama store, context capped at 4096 with one slot so
+the load stays near 6GB of shared device memory rather than the 30GB a default
+context costs:
+
+- The model starts `unloaded`. breadramd with `wake_model = "qwen3-8b"`
+  reconciles that before listening, so the first request to the gateway
+  answers 503 with `Retry-After` and the reason "the wake was begun on the
+  request path", instead of being forwarded into a miss.
+- The gateway then calls `POST /models/load` itself. The next request answers
+  200 and the listing reports the same model id as `loaded`.
+- `POST /models/unload` returns the device memory: about 6.3GB in use while
+  loaded, about 0.4GB after. The operator's own server on port 8080 was not
+  touched.
+
 ## Socket server
 
 The socket server is `breadram-core/src/serving/server.rs`. It serves the
