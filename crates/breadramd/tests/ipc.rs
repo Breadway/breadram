@@ -16,7 +16,7 @@ use breadram_core::ipc::{
     ResponseBody, ServerMessage, PROTOCOL_MAJOR,
 };
 use breadram_core::ManagementMode;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn temp_socket(tag: &str) -> PathBuf {
@@ -725,6 +725,98 @@ async fn daemon_shutdown_stops_supervised_jobs() {
         }
     };
     assert!(scope_gone, "shutdown must stop the supervised scope");
+    stop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A free loopback port, probed by binding port zero and releasing it.
+async fn free_port() -> u16 {
+    tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("probe a port")
+        .local_addr()
+        .expect("an address")
+        .port()
+}
+
+#[tokio::test]
+async fn an_enabled_gateway_serves_its_configured_route() {
+    use tokio::net::TcpListener;
+
+    // A fake model backend behind the gateway.
+    let backend = TcpListener::bind("127.0.0.1:0").await.expect("backend");
+    let backend_addr = backend.local_addr().expect("an address").to_string();
+    let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_vec();
+    let expected = answer.clone();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = backend.accept().await else {
+            return;
+        };
+        let mut buffered = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let Ok(read) = AsyncReadExt::read(&mut stream, &mut chunk).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            buffered.extend_from_slice(&chunk[..read]);
+            if buffered.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = AsyncWriteExt::write_all(&mut stream, &answer).await;
+    });
+
+    // The daemon serves the gateway from its configuration file.
+    let gateway_port = free_port().await;
+    let dir = std::env::temp_dir().join(format!("breadram-gateway-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("test dir");
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[gateway]\nenabled = true\nlisten = \"127.0.0.1:{gateway_port}\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:llama.service\"\nbackend_addr = \"{backend_addr}\"\n"
+        ),
+    )
+    .expect("config");
+    let socket = dir.join("breadram.sock");
+    let child = Daemon::start(&socket, Some(&config));
+    wait_until_ready(&socket).await;
+
+    // Pointing an HTTP client at the gateway returns the backend's bytes.
+    // The unix socket is ready before the gateway binds, so poll the port.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_port}"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gateway never started listening"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut gateway = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_port}"))
+        .await
+        .expect("connect the gateway");
+    gateway
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write");
+    let mut out = Vec::new();
+    gateway.read_to_end(&mut out).await.expect("read");
+    assert_eq!(
+        out, expected,
+        "the daemon-hosted gateway relays its configured route"
+    );
+
     stop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }

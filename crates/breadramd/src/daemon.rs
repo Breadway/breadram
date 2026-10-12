@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
 };
-use breadram_core::config::{validate, Config, HintState, Priority};
+use breadram_core::config::{validate, ActionKind, Config, GatewayTracking, HintState, Priority};
 use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
 use breadram_core::coordinator::{
     ActionJournal, Cancellation, ChainedExecutor, Coordinator, Executor, OwnerToken,
@@ -39,6 +39,10 @@ use breadram_core::policy::{
     DebouncedActivity, Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState, StateMachine,
     MIN_IDLE_MS,
 };
+use breadram_core::serving::{
+    GatewayServer, Route as GatewayRoute, ServerConfig as GatewayConfig, TrackingCompleteness,
+    WakeSpec as GatewayWakeSpec,
+};
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
     collect_cgroup_swap, collect_gtt, collect_host, collect_swap, Clock, GttMemory, RealFs,
@@ -50,7 +54,7 @@ use breadram_core::trends::{
 use breadram_core::{CapabilityReport, ManagementMode, VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// How many events a slow client may fall behind before it starts dropping.
@@ -69,6 +73,14 @@ const HISTORY_MAX_ACTIONS_PER_WINDOW: usize = 10;
 const OBSERVATION_ONLY_NOTE: &str =
     "breadramd is in monitor mode, which never writes: no action is executed and the journal records none";
 
+/// The default router load path a gateway wake calls.
+const DEFAULT_WAKE_LOAD_PATH: &str = "/models/load";
+/// The default router listing path a gateway wake verifies against.
+const DEFAULT_WAKE_HEALTH_PATH: &str = "/models";
+
+/// The scope unit name prefix for supervised jobs.
+const JOB_SCOPE_PREFIX: &str = "breadram-job-";
+
 /// Why the daemon could not start or stopped unexpectedly.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -80,6 +92,15 @@ pub enum DaemonError {
     Bind {
         /// The socket path.
         path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The gateway listen address could not be bound.
+    #[error("cannot serve the gateway on {addr}: {source}")]
+    GatewayBind {
+        /// The listen address.
+        addr: String,
         /// The underlying error.
         #[source]
         source: std::io::Error,
@@ -126,6 +147,14 @@ struct SharedState {
     job_running: Mutex<HashMap<String, JobCancel>>,
     /// Recently finished jobs, newest last, bounded.
     job_finished: Mutex<VecDeque<FinishedJob>>,
+    /// Scopes the gateway currently holds a lease for. Written by the gateway
+    /// task, read by the monitor, so a request in flight is active evidence
+    /// the planner can see and will not unload from under.
+    gateway_active: RwLock<Vec<String>>,
+    /// Scopes the monitor confirmed an idle unload for. Written by the monitor,
+    /// read by the gateway task, which marks the backend asleep so the next
+    /// request wakes it instead of being forwarded into a miss.
+    gateway_unloaded: Mutex<Vec<String>>,
 }
 
 /// What to execute for one admitted job.
@@ -174,8 +203,6 @@ const JOB_STOP_GRACE: Duration = Duration::from_secs(5);
 const JOB_PEAK_INTERVAL: Duration = Duration::from_millis(100);
 /// The cgroup hierarchy root for scope discovery.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-/// The scope unit name prefix for supervised jobs.
-const JOB_SCOPE_PREFIX: &str = "breadram-job-";
 
 /// The last complete observation.
 ///
@@ -296,7 +323,10 @@ pub async fn run_with_config_path(
                 &mut runtime.history,
                 &runtime.registry,
                 &mut runtime.hints,
-                &ProviderProbes::default(),
+                Observation {
+                    probes: &ProviderProbes::default(),
+                    gateway_active: &[],
+                },
             )
         })
         .await
@@ -320,6 +350,8 @@ pub async fn run_with_config_path(
         job_specs: Mutex::new(HashMap::new()),
         job_running: Mutex::new(HashMap::new()),
         job_finished: Mutex::new(VecDeque::new()),
+        gateway_active: RwLock::new(Vec::new()),
+        gateway_unloaded: Mutex::new(Vec::new()),
         execution_notes: RwLock::new(Vec::new()),
         state_path: default_state_path(),
         cancel: Cancellation::new(),
@@ -338,6 +370,11 @@ pub async fn run_with_config_path(
         *state.jobs_refused.write().await = refused;
         state.execution_notes.write().await.extend(notes);
     }
+
+    // The optional inference gateway serves the configured routes on its own
+    // loopback listener for as long as the daemon runs. It shares nothing with
+    // the monitor pass except the configuration it started from.
+    spawn_gateway(Arc::clone(&state)).await?;
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -490,6 +527,95 @@ impl PolicyRuntime {
     }
 }
 
+/// Serve the optional inference gateway for as long as the daemon runs.
+///
+/// Disabled by default: without `[gateway] enabled` this does nothing. When
+/// enabled, the configuration was already validated, so the listen address and
+/// every backend address are loopback socket addresses.
+async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
+    let (enabled, listen, routes, now_ms) = {
+        let config = state.config.read().await;
+        (
+            config.gateway.enabled,
+            config.gateway.listen.clone(),
+            config.gateway.routes.clone(),
+            state.clock.monotonic_ms(),
+        )
+    };
+    if !enabled {
+        return Ok(());
+    }
+    // Validation requires a listen address when enabled; a programmatically
+    // built configuration without one fails loudly rather than binding a
+    // default nobody asked for.
+    let listen = listen.ok_or_else(|| DaemonError::GatewayBind {
+        addr: "(unset)".to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the gateway is enabled without a listen address",
+        ),
+    })?;
+    let listener = TcpListener::bind(&listen)
+        .await
+        .map_err(|source| DaemonError::GatewayBind {
+            addr: listen.clone(),
+            source,
+        })?;
+    let routes = routes
+        .iter()
+        .map(|route| GatewayRoute {
+            path_prefix: route.path_prefix.clone(),
+            workload_scope: route.workload_scope.clone(),
+            backend_addr: route.backend_addr.clone(),
+            tracking: match route.tracking {
+                GatewayTracking::Complete => TrackingCompleteness::Complete,
+                GatewayTracking::Bypassable => TrackingCompleteness::Bypassable {
+                    provider_proves_idle: false,
+                },
+                GatewayTracking::Unknown => TrackingCompleteness::Unknown,
+            },
+            wake: route.wake_model.as_ref().map(|model| GatewayWakeSpec {
+                load_path: route
+                    .wake_load_path
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_WAKE_LOAD_PATH.to_string()),
+                model_id: model.clone(),
+                health_path: route
+                    .wake_health_path
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_WAKE_HEALTH_PATH.to_string()),
+            }),
+        })
+        .collect();
+    let server = Arc::new(GatewayServer::new(GatewayConfig { routes }, now_ms));
+    // Before the listener opens, so a backend that is already asleep is woken
+    // by the first request instead of being served into a miss. Reconcile
+    // drops leases, which is why it happens here and never again.
+    server.reconcile_startup().await;
+    // Publish the scopes that hold a lease, so the planner sees a request in
+    // flight as active and will not unload the backend from under it.
+    let publishing = Arc::clone(&server);
+    let shared = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            ticker.tick().await;
+            let active = publishing.active_scopes().await;
+            *shared.gateway_active.write().await = active;
+            // Apply the unloads the monitor confirmed, so the next request
+            // wakes the backend instead of missing.
+            let unloaded: Vec<String> = shared.gateway_unloaded.lock().await.drain(..).collect();
+            for scope in unloaded {
+                publishing.note_unloaded(&scope).await;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        server.serve(listener).await;
+    });
+    Ok(())
+}
+
 fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
     tokio::spawn(async move {
         let clock = state.clock;
@@ -581,6 +707,9 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             // applied once.
             let rebuild_config = config.clone();
             let cancel = state.cancel.clone();
+            // A snapshot of the gateway's leases, so a request in flight counts
+            // as active for this pass.
+            let gateway_active = state.gateway_active.read().await.clone();
             let collected = tokio::task::spawn_blocking(move || {
                 let mut current_runtime = current_runtime;
                 if current_runtime.config_version != current {
@@ -596,7 +725,10 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                     &mut current_runtime.history,
                     &current_runtime.registry,
                     &mut current_runtime.hints,
-                    &probes,
+                    Observation {
+                        probes: &probes,
+                        gateway_active: &gateway_active,
+                    },
                 );
                 let (next, pass) = run_execution(
                     current_coordinator,
@@ -652,6 +784,21 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                 None => {}
             }
             *state.execution_notes.write().await = notes;
+            // A confirmed idle unload has to reach the gateway, or the next
+            // request is forwarded into a backend that is no longer serving.
+            if let Some(pass) = &pass {
+                let unloaded: Vec<String> = pass
+                    .results
+                    .iter()
+                    .filter(|result| {
+                        result.kind == ActionKind::UnloadIdleModel && result.is_confirmed()
+                    })
+                    .map(|result| result.scope.clone())
+                    .collect();
+                if !unloaded.is_empty() {
+                    state.gateway_unloaded.lock().await.extend(unloaded);
+                }
+            }
             publish_and_persist(&state, &next_coordinator, wrote).await;
             coordinator = Some(next_coordinator);
 
@@ -929,6 +1076,13 @@ fn policy_history(config: &Config) -> PolicyHistory {
 }
 
 /// Collect one complete observation and run the policy over it.
+/// One observation's inputs that are not the policy state itself.
+struct Observation<'a> {
+    probes: &'a ProviderProbes,
+    /// Scopes the gateway holds a lease for, so a request in flight is active.
+    gateway_active: &'a [String],
+}
+
 fn observe(
     clock: &SystemClock,
     config: &Config,
@@ -936,12 +1090,12 @@ fn observe(
     history: &mut PolicyHistory,
     registry: &AdapterRegistry,
     hints: &mut HintState,
-    probes: &ProviderProbes,
+    observation: Observation<'_>,
 ) -> Published {
     let fs = RealFs;
     // The providers are read first, so the policy reasons about what a backend is
     // doing now rather than about the last answer that happened to succeed.
-    let probe_notes = refresh_adapters(registry, probes, clock);
+    let probe_notes = refresh_adapters(registry, observation.probes, clock);
     let inventory = collect_inventory(&fs);
     // Fold this pass's activity readings into the debounced hints, then build the
     // one activity view the plan and the status both reason about. Promotion is
@@ -949,10 +1103,16 @@ fn observe(
     let raw_activity = registry.activity_source(&inventory.workloads);
     let now_ms = clock.monotonic_ms();
     for workload in &inventory.workloads {
-        let active = matches!(
-            raw_activity.evidence(&workload.id),
-            ActivityEvidence::Active
-        );
+        // A gateway lease is active evidence on its own: a request in flight
+        // must not be unloaded, even when the provider has not answered yet.
+        let active = observation
+            .gateway_active
+            .iter()
+            .any(|scope| scope == &workload.id.scope)
+            || matches!(
+                raw_activity.evidence(&workload.id),
+                ActivityEvidence::Active
+            );
         hints.update(&workload.id.scope, active, now_ms, MIN_IDLE_MS);
     }
     let activity = DebouncedActivity::new(&raw_activity, hints);
@@ -2571,7 +2731,10 @@ async fn apply_config_change(
                 &mut history,
                 &runtime.registry,
                 &mut hints,
-                &ProviderProbes::default(),
+                Observation {
+                    probes: &ProviderProbes::default(),
+                    gateway_active: &[],
+                },
             )
         })
         .await

@@ -28,9 +28,20 @@
 //! monotonic timestamps, so a gateway built on top cannot log a prompt or a
 //! completion through these types even by accident.
 
+pub mod gateway;
+pub mod http;
 pub mod lease;
 pub mod lifecycle;
+pub mod server;
 
+pub use gateway::{
+    classify, disposition, Disposition, Gateway, RouteOutcome, ACCEPT_HEADER, CLIENT_HEADER,
+    EVENT_STREAM, IDEMPOTENCY_HEADER,
+};
+pub use http::{
+    parse_head, parse_response_head, ParseError, RequestHead, ResponseHead, MAX_HEADERS,
+    MAX_HEADER_BYTES,
+};
 pub use lease::{
     Admission, ClientId, Lease, LeaseId, Leases, RequestKind, RequestMeta, WorkloadLeases,
     RETRY_MEMORY,
@@ -38,4 +49,8 @@ pub use lease::{
 pub use lifecycle::{
     AdmitError, Backend, DrainOutcome, ProviderState, ServingPolicy, ServingState, SleepDecision,
     TrackingCompleteness, TransitionError, WakeHealth, WakeRequest, DEFAULT_RETRY_AFTER_MS,
+};
+pub use server::{
+    GatewayServer, Route, ServerConfig, WakeSpec, DIAL_TIMEOUT, HEAD_TIMEOUT, MAX_BODY_BYTES,
+    MAX_HEAD_BYTES, RESPONSE_HEAD_TIMEOUT, WAKE_POLL_INTERVAL,
 };

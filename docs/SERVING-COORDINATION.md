@@ -108,12 +108,145 @@ state from what the provider reports:
 | Serving | `awake` |
 | Nothing | `unverified`, so health is checked before serving |
 
-## Not implemented yet
+## Gateway core
 
-The lifecycle and the leases are complete and tested. The optional local
-inference gateway that would feed them from real traffic is a separate piece of
-work: it must preserve native and OpenAI-compatible request and response
-semantics, including streaming, and it must admit every request through a lease
-before dispatch. Until it exists, the only `ActivitySource` an adapter provides
-is the provider's own answer, and a backend whose idleness cannot be proven is
-reported unsupported rather than guessed at.
+The request-path core is `breadram-core/src/serving/gateway.rs`. It performs no
+I/O: given a request's metadata and the backends, [`Gateway::route`] decides
+whether to forward the request (holding a lease for its whole duration), whether
+to trigger a wake and tell the client to retry, or whether to refuse. The caller
+owns the socket, the provider commands, and the clock.
+
+Routing:
+
+| Backend state | Outcome |
+|---|---|
+| `awake` | `Forward` with the admission: `Started`, `Joined`, or `Replayed` |
+| `sleeping` | `WakeThenRetry`: the wake is begun on the request path, and the client is told when to retry |
+| `waking`, `draining`, `unverified` | `Retry` with the policy's retry hint, nothing dispatched |
+| `unsupported`, `failed`, unknown workload | `Refused` with an actionable reason |
+
+A stream holds its lease until it finishes; a client disconnect releases every
+lease of that client; a retry that carries the same idempotency key joins the
+running request rather than counting twice, and a retry after it finished is
+recognized as `Replayed`. A backend whose idleness cannot be proven (`Unknown`
+tracking, no operator override) is `Unsupported`, so routing refuses rather than
+serving through a path that could be slept from under it.
+
+Nothing in the core stores a body: an outcome carries only a client label, a
+request kind, whether the response is streamed, and an idempotency key, so a
+gateway built on it cannot log a prompt or a completion.
+
+An inbound request is classified from headers only (`classify`): the client label,
+the idempotency key, and whether the client asked for a stream. No body is read.
+An outcome maps to a `Disposition`: proxy the request (streaming when the client
+asked), retry with the hint (reported as 503 with `Retry-After` in seconds), or
+refuse.
+
+When the monitor confirms an idle unload, it tells the gateway, which marks the
+backend asleep provided nothing is in flight. An unload that races a live lease
+loses: the request finishes, and the backend stays awake until the next pass.
+Once the backend is asleep, the next arrival wakes it on the request path, which
+is the whole loop: idle, unload, sleep, wake, serve.
+
+The gateway also implements the policy's `ActivitySource`: each backend's leases
+are its activity evidence, so a workload with a live lease is never released and
+an unknown workload is unknown, never idle. The daemon publishes the scopes
+that currently hold a lease into the monitor pass, where a lease counts as
+active on its own, ahead of whatever the provider last answered. That is how a
+request in flight stops an unload without the planner ever learning that a
+gateway exists.
+
+The wake side is performed; the sleep side is still provider work. The gateway
+wakes and serves, and the drain/sleep lifecycle the adapters drive through
+`SleepDecision` and `DrainOutcome` remains theirs: the gateway only ever
+answers arrivals, it never decides to sleep a backend.
+
+A backend starts awake, which is the safe assumption when nothing is known,
+but a provider that is already asleep at startup would then never be woken.
+Before the listener opens, and only then, the server asks each route that has
+a wake spec for its listing and reconciles: `loaded` means serving, any other
+reported status means asleep, and a provider that cannot be read is
+unverified, which a later request can still wake. Reconcile drops every lease,
+so it never runs once requests are in flight.
+
+## Verified against a real server
+
+llama-server 0.5.0-dev (build 11146) in router mode on loopback, Qwen3 8B
+Q4_K_M from the local Ollama store, context capped at 4096 with one slot so
+the load stays near 6GB of shared device memory rather than the 30GB a default
+context costs:
+
+- The model starts `unloaded`. breadramd with `wake_model = "qwen3-8b"`
+  reconciles that before listening, so the first request to the gateway
+  answers 503 with `Retry-After` and the reason "the wake was begun on the
+  request path", instead of being forwarded into a miss.
+- The gateway then calls `POST /models/load` itself. The next request answers
+  200 and the listing reports the same model id as `loaded`.
+- `POST /models/unload` returns the device memory: about 6.3GB in use while
+  loaded, about 0.4GB after. The operator's own server on port 8080 was not
+  touched.
+
+## Socket server
+
+The socket server is `breadram-core/src/serving/server.rs`. It serves the
+routing core over loopback TCP with one request per connection: it parses each
+head for routing metadata only, admits every request through a lease before
+dispatch, and relays heads and bodies byte for byte in both directions. Streams
+relay until either side closes; a client that disconnects releases its leases
+at once, including while waiting on a slow backend. Refusals are 503 with
+`Retry-After` in seconds for retryable backends, 502 for backends that cannot
+serve, 404 for unrouted paths, and 400/413 for unusable heads and bodies.
+
+Two deliberate boundaries: every `Forward` outcome is proxied, so a joined or
+replayed request duplicates backend work that response sharing would avoid (the
+core still counts it once); and a wake with no configured wake spec holds the
+wake timeout without performing a provider call, which is the honest behavior
+for a backend whose provider API is unknown.
+
+## Request-path wake
+
+A `WakeThenRetry` outcome begins the wake in the lifecycle and spawns the
+provider call, so the client is answered immediately and the serving state is
+resolved in the background. A route with a `wake_model` performs a
+router-shaped wake: `POST` the load path with that model id, then poll the
+listing path until the exact model id carries the `loaded` status, never a
+substring match across entries. The lifecycle's own `wake_timeout_ms` bounds
+the whole thing; a wake that times out returns the backend to a state a later
+request can wake from, and once `max_wake_attempts` is spent the backend is
+failed and arrivals are refused with the reason rather than retried forever.
+
+Routing wakes from a confirmed sleep **and** from an unverified backend. The
+second case matters: a failed wake leaves the backend unverified, and without
+it a single failed attempt would strand the backend in a state no request
+could move.
+
+## Operator configuration
+
+An operator points clients at the gateway through the configuration file, not
+through code. The daemon serves it for as long as it runs:
+
+```toml
+[gateway]
+enabled = true
+listen = "127.0.0.1:8090"
+
+[[gateway.routes]]
+path_prefix = "/v1"
+workload_scope = "unit:llama.service"
+backend_addr = "127.0.0.1:8080"
+wake_model = "qwen3-8b"
+```
+
+Routes match by longest request-target prefix. The listen address and every
+backend address must be loopback socket addresses, so a gateway never exposes
+a model backend beyond the host by configuration; anything else is rejected at
+load. A route's `tracking` is `complete` by default and may be `bypassable` or
+`unknown`, which degrades through the core rather than silently. Pointing an
+OpenAI-compatible client at the listen address produces the same bytes as
+pointing it at the backend directly, for both plain and streamed responses.
+
+`wake_model` opts the route into a request-path wake against that model id,
+using the router's `POST /models/load` and `/models` listing by default;
+`wake_load_path` and `wake_health_path` override those for another shape.
+Without `wake_model` arrivals at a sleeping backend still get the retry hint
+and the wake timeout still applies, but no provider call is made.
