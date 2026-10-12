@@ -61,6 +61,8 @@ pub struct Bridge {
     checked_at_ms: u64,
     /// Whether the bus answered with a compatible version last time.
     supported: bool,
+    /// Test double for the version the bus reports. `None` asks the real bus.
+    version_override: Option<Option<String>>,
 }
 
 impl Bridge {
@@ -95,6 +97,7 @@ impl Bridge {
             inbox,
             checked_at_ms: 0,
             supported: false,
+            version_override: None,
         }
     }
 }
@@ -154,7 +157,11 @@ fn usable(bridge: &mut Bridge, now_ms: u64) -> bool {
         return bridge.supported;
     }
     bridge.checked_at_ms = now_ms;
-    bridge.supported = compatible_api(bridge.client.api_version().as_deref());
+    let reported = match &bridge.version_override {
+        Some(version) => version.clone(),
+        None => bridge.client.api_version(),
+    };
+    bridge.supported = compatible_api(reported.as_deref());
     bridge.supported
 }
 
@@ -375,58 +382,6 @@ fn drive(bridge: &mut Bridge, event: BreadEvent, now_ms: u64) -> Vec<CommandEffe
 mod tests {
     use super::*;
 
-    /// Hides the real bread config and runtime dir for one test.
-    ///
-    /// `resolve_socket_path` prefers `~/.config/bread/breadd.toml`, which on
-    /// this host names the live socket. A test of the absent-bus path has to
-    /// move `HOME` and `XDG_RUNTIME_DIR` or it dials the running daemon.
-    struct AbsentBus {
-        previous_home: Option<String>,
-        previous_runtime: Option<String>,
-    }
-
-    impl AbsentBus {
-        fn enter() -> Self {
-            let previous_home = std::env::var("HOME").ok();
-            let previous_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
-            let dir = std::env::temp_dir().join(format!(
-                "breadram-no-bus-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            // SAFETY: restored on drop. These tests do not spawn threads that
-            // read HOME before this returns, and the client reads it lazily.
-            unsafe {
-                std::env::set_var("HOME", &dir);
-                std::env::set_var("XDG_RUNTIME_DIR", &dir);
-            }
-            Self {
-                previous_home,
-                previous_runtime,
-            }
-        }
-    }
-
-    impl Drop for AbsentBus {
-        fn drop(&mut self) {
-            unsafe {
-                restore("HOME", &self.previous_home);
-                restore("XDG_RUNTIME_DIR", &self.previous_runtime);
-            }
-        }
-    }
-
-    unsafe fn restore(key: &str, previous: &Option<String>) {
-        match previous {
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
     fn command(name: &str, data: Value) -> BreadEvent {
         BreadEvent {
             event: name.to_string(),
@@ -454,10 +409,11 @@ mod tests {
 
     #[test]
     fn absent_bus_does_not_become_usable() {
-        // This host runs breadd. Point the client at a directory with no
-        // socket so the test is actually about an absent bus.
-        let _guard = AbsentBus::enter();
+        // The version lookup is the only thing that dials the bus. Reporting
+        // nothing is what an absent daemon returns, without racing other tests
+        // for HOME: resolve_socket_path reads the process environment.
         let mut bridge = harness();
+        bridge.version_override = Some(None);
         // A missing bus is not a compatible bus, and checking it does not
         // panic or block the caller.
         assert!(!usable(&mut bridge, 1));
@@ -535,8 +491,8 @@ mod tests {
 
     #[test]
     fn reconnect_window_rechecks_a_bus_that_went_away() {
-        let _guard = AbsentBus::enter();
         let mut bridge = harness();
+        bridge.version_override = Some(None);
         bridge.checked_at_ms = 1_000;
         bridge.supported = true;
         // Still inside the window: the last answer stands, so a blip does not
