@@ -147,8 +147,23 @@ are its activity evidence, so a workload with a live lease is never released and
 an unknown workload is unknown, never idle. That is how the policy learns a
 backend is in use without ever learning that a gateway exists.
 
-Still to come for the full gateway: the socket server that preserves native and
-OpenAI-compatible request and response semantics (including streaming and
-cancellation end to end), wiring the provider sleep and wake commands to
-`SleepDecision`, `DrainOutcome`, and `WakeHealth`, and the operator configuration
-that points a client at the gateway.
+Still to come for the full gateway: wiring the provider sleep and wake commands
+to `SleepDecision`, `DrainOutcome`, and `WakeHealth`, and the operator
+configuration that points a client at the gateway.
+
+## Socket server
+
+The socket server is `breadram-core/src/serving/server.rs`. It serves the
+routing core over loopback TCP with one request per connection: it parses each
+head for routing metadata only, admits every request through a lease before
+dispatch, and relays heads and bodies byte for byte in both directions. Streams
+relay until either side closes; a client that disconnects releases its leases
+at once, including while waiting on a slow backend. Refusals are 503 with
+`Retry-After` in seconds for retryable backends, 502 for backends that cannot
+serve, 404 for unrouted paths, and 400/413 for unusable heads and bodies.
+
+Two deliberate boundaries: every `Forward` outcome is proxied, so a joined or
+replayed request duplicates backend work that response sharing would avoid (the
+core still counts it once); and the `WakeThenRetry` wake is recorded in the
+lifecycle with the retry hint served, while performing the provider wake belongs
+to the adapter work named above.
