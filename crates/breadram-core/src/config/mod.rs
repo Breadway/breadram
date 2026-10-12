@@ -272,6 +272,49 @@ impl Default for JobPolicy {
     }
 }
 
+/// How completely a gateway backend's requests are tracked, in configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTracking {
+    /// Every request reaches the backend through the gateway.
+    #[default]
+    Complete,
+    /// Clients can bypass the gateway and the provider cannot prove idleness.
+    Bypassable,
+    /// Nothing proves idleness; automatic unload must not be attempted.
+    Unknown,
+}
+
+/// One gateway route: a request-target prefix served by one backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayRoute {
+    /// The request-target prefix this route serves, for example `/v1`.
+    /// The longest matching prefix wins.
+    pub path_prefix: String,
+    /// The workload scope the backend serves, for example `unit:llama.service`.
+    pub workload_scope: String,
+    /// Where the backend listens, as an IP socket address such as
+    /// `127.0.0.1:8080`. Loopback only.
+    pub backend_addr: String,
+    /// How completely requests are tracked. Complete by default.
+    #[serde(default)]
+    pub tracking: GatewayTracking,
+}
+
+/// The optional local inference gateway.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayPolicy {
+    /// Whether the daemon serves the gateway.
+    pub enabled: bool,
+    /// Where the gateway listens, as an IP socket address such as
+    /// `127.0.0.1:8090`. Required when enabled. Loopback only, so a gateway
+    /// never exposes a model backend beyond the host by configuration.
+    pub listen: Option<String>,
+    /// The routes to backends, matched by longest request-target prefix.
+    pub routes: Vec<GatewayRoute>,
+}
+
 /// Bounded history retention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -316,6 +359,8 @@ pub struct Config {
     pub automation: Automation,
     /// Background job settings.
     pub jobs: JobPolicy,
+    /// The optional local inference gateway.
+    pub gateway: GatewayPolicy,
     /// History retention.
     pub history: History,
     /// Per workload rules.
@@ -338,6 +383,7 @@ impl Default for Config {
             providers: Vec::new(),
             automation: Automation::default(),
             jobs: JobPolicy::default(),
+            gateway: GatewayPolicy::default(),
             history: History::default(),
             rules: Vec::new(),
             legacy_automatic: None,
@@ -466,6 +512,14 @@ pub enum ConfigError {
         /// Why it is invalid.
         reason: String,
     },
+    /// A gateway setting was missing, malformed, or unsafe.
+    #[error("invalid gateway setting {field}: {reason}")]
+    InvalidGateway {
+        /// The field name.
+        field: String,
+        /// Why it is invalid.
+        reason: String,
+    },
     /// The credential file is too permissive.
     #[error("credential file mode {mode:o} is too permissive, expected at most {max:o}")]
     CredentialPermissions {
@@ -485,6 +539,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     validate_rules(&config.rules)?;
     validate_history(&config.history)?;
     validate_jobs(&config.jobs)?;
+    validate_gateway(&config.gateway)?;
     Ok(())
 }
 
@@ -826,6 +881,77 @@ fn validate_jobs(jobs: &JobPolicy) -> Result<(), ConfigError> {
         });
     }
     Ok(())
+}
+
+fn validate_gateway(gateway: &GatewayPolicy) -> Result<(), ConfigError> {
+    let invalid = |field: &str, reason: String| ConfigError::InvalidGateway {
+        field: field.to_string(),
+        reason,
+    };
+    if gateway.enabled {
+        let Some(listen) = &gateway.listen else {
+            return Err(invalid(
+                "listen",
+                "a listen address such as 127.0.0.1:8090 is required when the gateway is enabled"
+                    .to_string(),
+            ));
+        };
+        parse_loopback_socket(listen, "listen")?;
+        if gateway.routes.is_empty() {
+            return Err(invalid(
+                "routes",
+                "at least one route is required when the gateway is enabled".to_string(),
+            ));
+        }
+    }
+    // Routes are validated even while disabled, so enabling later cannot
+    // surprise an operator with an unsafe or unusable route.
+    let mut seen: Vec<&str> = Vec::new();
+    for route in &gateway.routes {
+        if seen.contains(&route.path_prefix.as_str()) {
+            return Err(invalid(
+                "path_prefix",
+                format!("duplicate route for prefix {}", route.path_prefix),
+            ));
+        }
+        seen.push(&route.path_prefix);
+        if !route.path_prefix.starts_with('/') {
+            return Err(invalid(
+                "path_prefix",
+                format!(
+                    "route prefix {} must start with '/', such as /v1",
+                    route.path_prefix
+                ),
+            ));
+        }
+        if !route.workload_scope.contains(':') {
+            return Err(invalid(
+                "workload_scope",
+                format!(
+                    "route for {} names the scope {}, which is not a scope key such as unit:llama.service",
+                    route.path_prefix, route.workload_scope
+                ),
+            ));
+        }
+        parse_loopback_socket(&route.backend_addr, "backend_addr")?;
+    }
+    Ok(())
+}
+
+/// Parse an IP socket address that must be loopback, so neither the gateway
+/// nor its backends are exposed beyond the host by configuration.
+fn parse_loopback_socket(addr: &str, field: &str) -> Result<std::net::SocketAddr, ConfigError> {
+    let parsed: std::net::SocketAddr = addr.parse().map_err(|_| ConfigError::InvalidGateway {
+        field: field.to_string(),
+        reason: format!("{addr} is not an IP socket address such as 127.0.0.1:8090"),
+    })?;
+    if !parsed.ip().is_loopback() {
+        return Err(ConfigError::InvalidGateway {
+            field: field.to_string(),
+            reason: format!("{addr} is not loopback: the gateway serves the host only"),
+        });
+    }
+    Ok(parsed)
 }
 
 /// Holds the current valid configuration and reloads it atomically.
@@ -1192,6 +1318,64 @@ budget_bytes = 2147483648
         assert!(!config.jobs.auto_launch);
         let config = Config::from_toml("[jobs]\nenabled = true\nauto_launch = true\n").unwrap();
         assert!(config.jobs.enabled && config.jobs.auto_launch);
+    }
+
+    #[test]
+    fn a_gateway_needs_a_loopback_listen_and_loopback_backends() {
+        let good = "[gateway]\nenabled = true\nlisten = \"127.0.0.1:8090\"\n\
+                    [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+                    workload_scope = \"unit:llama.service\"\nbackend_addr = \"127.0.0.1:8080\"\n";
+        let config = Config::from_toml(good).expect("a loopback gateway is accepted");
+        assert!(config.gateway.enabled);
+        assert_eq!(config.gateway.routes.len(), 1);
+        assert_eq!(config.gateway.routes[0].tracking, GatewayTracking::Complete);
+
+        // Disabled without a listen address is valid: nothing is served.
+        let off = "[gateway]\nenabled = false\n";
+        assert!(Config::from_toml(off).is_ok());
+
+        for bad in [
+            // Enabled without a listen address.
+            "[gateway]\nenabled = true\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:llama.service\"\nbackend_addr = \"127.0.0.1:8080\"\n",
+            // Enabled without a route.
+            "[gateway]\nenabled = true\nlisten = \"127.0.0.1:8090\"\n",
+            // A non-loopback listen address would expose models beyond the host.
+            "[gateway]\nenabled = true\nlisten = \"0.0.0.0:8090\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:llama.service\"\nbackend_addr = \"127.0.0.1:8080\"\n",
+            // A non-loopback backend likewise.
+            "[gateway]\nenabled = true\nlisten = \"127.0.0.1:8090\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:llama.service\"\nbackend_addr = \"192.168.1.10:8080\"\n",
+            // Not a socket address at all.
+            "[gateway]\nenabled = true\nlisten = \"localhost:8090\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:llama.service\"\nbackend_addr = \"127.0.0.1:8080\"\n",
+            // A prefix that cannot match a request target.
+            "[gateway]\nenabled = true\nlisten = \"127.0.0.1:8090\"\n\
+             [[gateway.routes]]\npath_prefix = \"v1\"\n\
+             workload_scope = \"unit:llama.service\"\nbackend_addr = \"127.0.0.1:8080\"\n",
+            // Not a scope key.
+            "[gateway]\nenabled = true\nlisten = \"127.0.0.1:8090\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"llama\"\nbackend_addr = \"127.0.0.1:8080\"\n",
+            // Two routes for one prefix.
+            "[gateway]\nenabled = true\nlisten = \"127.0.0.1:8090\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:a.service\"\nbackend_addr = \"127.0.0.1:8081\"\n\
+             [[gateway.routes]]\npath_prefix = \"/v1\"\n\
+             workload_scope = \"unit:b.service\"\nbackend_addr = \"127.0.0.1:8082\"\n",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_toml(bad),
+                    Err(ConfigError::InvalidGateway { .. })
+                ),
+                "rejected: {bad}"
+            );
+        }
     }
 
     #[test]

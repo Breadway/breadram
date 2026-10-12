@@ -167,3 +167,27 @@ replayed request duplicates backend work that response sharing would avoid (the
 core still counts it once); and the `WakeThenRetry` wake is recorded in the
 lifecycle with the retry hint served, while performing the provider wake belongs
 to the adapter work named above.
+
+## Operator configuration
+
+An operator points clients at the gateway through the configuration file, not
+through code. The daemon serves it for as long as it runs:
+
+```toml
+[gateway]
+enabled = true
+listen = "127.0.0.1:8090"
+
+[[gateway.routes]]
+path_prefix = "/v1"
+workload_scope = "unit:llama.service"
+backend_addr = "127.0.0.1:8080"
+```
+
+Routes match by longest request-target prefix. The listen address and every
+backend address must be loopback socket addresses, so a gateway never exposes
+a model backend beyond the host by configuration; anything else is rejected at
+load. A route's `tracking` is `complete` by default and may be `bypassable` or
+`unknown`, which degrades through the core rather than silently. Pointing an
+OpenAI-compatible client at the listen address produces the same bytes as
+pointing it at the backend directly, for both plain and streamed responses.

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
 };
-use breadram_core::config::{validate, Config, HintState, Priority};
+use breadram_core::config::{validate, Config, GatewayTracking, HintState, Priority};
 use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
 use breadram_core::coordinator::{
     ActionJournal, Cancellation, ChainedExecutor, Coordinator, Executor, OwnerToken,
@@ -39,6 +39,9 @@ use breadram_core::policy::{
     DebouncedActivity, Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState, StateMachine,
     MIN_IDLE_MS,
 };
+use breadram_core::serving::{
+    GatewayServer, Route as GatewayRoute, ServerConfig as GatewayConfig, TrackingCompleteness,
+};
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
     collect_cgroup_swap, collect_gtt, collect_host, collect_swap, Clock, GttMemory, RealFs,
@@ -50,7 +53,7 @@ use breadram_core::trends::{
 use breadram_core::{CapabilityReport, ManagementMode, VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// How many events a slow client may fall behind before it starts dropping.
@@ -80,6 +83,15 @@ pub enum DaemonError {
     Bind {
         /// The socket path.
         path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The gateway listen address could not be bound.
+    #[error("cannot serve the gateway on {addr}: {source}")]
+    GatewayBind {
+        /// The listen address.
+        addr: String,
         /// The underlying error.
         #[source]
         source: std::io::Error,
@@ -339,6 +351,11 @@ pub async fn run_with_config_path(
         state.execution_notes.write().await.extend(notes);
     }
 
+    // The optional inference gateway serves the configured routes on its own
+    // loopback listener for as long as the daemon runs. It shares nothing with
+    // the monitor pass except the configuration it started from.
+    spawn_gateway(Arc::clone(&state)).await?;
+
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -488,6 +505,62 @@ impl PolicyRuntime {
             config_version,
         }
     }
+}
+
+/// Serve the optional inference gateway for as long as the daemon runs.
+///
+/// Disabled by default: without `[gateway] enabled` this does nothing. When
+/// enabled, the configuration was already validated, so the listen address and
+/// every backend address are loopback socket addresses.
+async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
+    let (enabled, listen, routes, now_ms) = {
+        let config = state.config.read().await;
+        (
+            config.gateway.enabled,
+            config.gateway.listen.clone(),
+            config.gateway.routes.clone(),
+            state.clock.monotonic_ms(),
+        )
+    };
+    if !enabled {
+        return Ok(());
+    }
+    // Validation requires a listen address when enabled; a programmatically
+    // built configuration without one fails loudly rather than binding a
+    // default nobody asked for.
+    let listen = listen.ok_or_else(|| DaemonError::GatewayBind {
+        addr: "(unset)".to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the gateway is enabled without a listen address",
+        ),
+    })?;
+    let listener = TcpListener::bind(&listen)
+        .await
+        .map_err(|source| DaemonError::GatewayBind {
+            addr: listen.clone(),
+            source,
+        })?;
+    let routes = routes
+        .iter()
+        .map(|route| GatewayRoute {
+            path_prefix: route.path_prefix.clone(),
+            workload_scope: route.workload_scope.clone(),
+            backend_addr: route.backend_addr.clone(),
+            tracking: match route.tracking {
+                GatewayTracking::Complete => TrackingCompleteness::Complete,
+                GatewayTracking::Bypassable => TrackingCompleteness::Bypassable {
+                    provider_proves_idle: false,
+                },
+                GatewayTracking::Unknown => TrackingCompleteness::Unknown,
+            },
+        })
+        .collect();
+    let server = GatewayServer::new(GatewayConfig { routes }, now_ms);
+    tokio::spawn(async move {
+        server.serve(listener).await;
+    });
+    Ok(())
 }
 
 fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
