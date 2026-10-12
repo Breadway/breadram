@@ -6,8 +6,10 @@
 //! rejection are verified through the same interface a user drives.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::time::Duration;
+
+mod support;
+use support::{wait_until_ready, Daemon};
 
 use breadram_core::ipc::{
     decode, encode, ApiError, Client, ClientError, ClientMessage, ErrorCode, Hello, RequestBody,
@@ -21,24 +23,8 @@ fn temp_socket(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("breadram-it-{tag}-{}.sock", std::process::id()))
 }
 
-fn spawn_daemon(socket: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_breadramd"))
-        .arg("--socket")
-        .arg(socket)
-        .arg("--mode")
-        .arg("monitor")
-        .spawn()
-        .expect("spawn breadramd")
-}
-
-async fn wait_until_ready(socket: &Path) {
-    for _ in 0..400 {
-        if UnixStream::connect(socket).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("daemon did not become ready at {}", socket.display());
+fn spawn_daemon(socket: &Path) -> Daemon {
+    Daemon::start(socket, None)
 }
 
 async fn connect(socket: &Path) -> Client {
@@ -47,9 +33,8 @@ async fn connect(socket: &Path) -> Client {
     client
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn stop(child: Daemon) {
+    child.stop();
 }
 
 #[tokio::test]
