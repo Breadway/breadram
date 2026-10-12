@@ -26,3 +26,5 @@ RAM-14 remains doing. Still required: request-lease drain and dispatch integrati
 bounded multi-step operations and confirmations, disabled-sleep and live-stream
 integration, worker failure handling on a real deployment, successful inference
 after restore, exact tested version/backend, and independent memory measurement.
+The lease-gated control path is blocked on RAM-11 request tracking (doing) and
+the RAM-45 gateway that feeds it, so no sleep is driven until those land.
