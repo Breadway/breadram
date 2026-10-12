@@ -6,25 +6,19 @@
 //! Recovery is exercised across a simulated restart, with a conflicting external
 //! change in the middle.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
-
 use breadram_core::config::ActionKind;
 use breadram_core::coordinator::{
-    ActionRequest, ActionState, AppliedChange, Cancellation, Confirmation, Coordinator, Executor,
-    ExecutorError, MemoryObservation, OwnedValue, OwnerToken, Precondition, RestoreOutcome,
+    ActionRequest, ActionState, AppliedChange, Cancellation, Confirmation, Coordinator,
+    ExecutorError, OwnerToken, Precondition, RestoreOutcome,
 };
 use breadram_core::inventory::{ControlLevel, MemoryAccounting, Workload, WorkloadId};
 
+mod support;
+
+use support::fake_executor::{lock, owned, FakeExecutor};
+
 const KEY: &str = "cgroup:unit:app.service/memory.high";
 const GIB: u64 = 1024 * 1024 * 1024;
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
 
 fn workload(scope: &str, generation: u64, name: &str) -> Workload {
     Workload {
@@ -53,136 +47,6 @@ fn request(scope: &str, generation: u64) -> ActionRequest {
         1_000,
     )
     .with_expected_host_ram_delta(-(2 * GIB as i64))
-}
-
-#[derive(Default)]
-struct FakeExecutor {
-    supported: Mutex<Vec<ActionKind>>,
-    precondition: Mutex<Option<Precondition>>,
-    applies: Mutex<VecDeque<Result<AppliedChange, ExecutorError>>>,
-    confirmations: Mutex<VecDeque<Confirmation>>,
-    observations: Mutex<HashMap<String, MemoryObservation>>,
-    after_observation: Mutex<Option<MemoryObservation>>,
-    values: Mutex<HashMap<String, String>>,
-    writes: Mutex<Vec<(String, String)>>,
-    apply_calls: Mutex<usize>,
-}
-
-impl FakeExecutor {
-    fn with(kinds: &[ActionKind], initial_host_ram: u64, after_host_ram: u64) -> Self {
-        let executor = Self {
-            supported: Mutex::new(kinds.to_vec()),
-            ..Self::default()
-        };
-        lock(&executor.observations).insert(
-            "unit:app.service".to_string(),
-            MemoryObservation {
-                host_ram_bytes: Some(initial_host_ram),
-                device_ram_bytes: Some(8 * GIB),
-            },
-        );
-        *lock(&executor.after_observation) = Some(MemoryObservation {
-            host_ram_bytes: Some(after_host_ram),
-            device_ram_bytes: Some(6 * GIB),
-        });
-        executor
-    }
-
-    fn script_apply(self, outcome: Result<AppliedChange, ExecutorError>) -> Self {
-        lock(&self.applies).push_back(outcome);
-        self
-    }
-
-    fn script_confirmation(self, confirmation: Confirmation) -> Self {
-        lock(&self.confirmations).push_back(confirmation);
-        self
-    }
-
-    fn set_precondition(&self, precondition: Precondition) {
-        *lock(&self.precondition) = Some(precondition);
-    }
-
-    fn revoke_support(&self, kind: ActionKind) {
-        lock(&self.supported).retain(|candidate| *candidate != kind);
-    }
-
-    fn set_value(&self, key: &str, value: &str) {
-        lock(&self.values).insert(key.to_string(), value.to_string());
-    }
-
-    fn value(&self, key: &str) -> Option<String> {
-        lock(&self.values).get(key).cloned()
-    }
-
-    fn apply_count(&self) -> usize {
-        *lock(&self.apply_calls)
-    }
-
-    fn write_count(&self) -> usize {
-        lock(&self.writes).len()
-    }
-}
-
-fn owned(key: &str, original: &str, last_applied: &str) -> OwnedValue {
-    OwnedValue {
-        key: key.to_string(),
-        original: original.to_string(),
-        last_applied: last_applied.to_string(),
-        owner: OwnerToken("instance-1".to_string()),
-    }
-}
-
-impl Executor for FakeExecutor {
-    fn supports(&self, kind: ActionKind) -> bool {
-        lock(&self.supported).contains(&kind)
-    }
-
-    fn precondition(&self, _request: &ActionRequest) -> Precondition {
-        lock(&self.precondition)
-            .clone()
-            .unwrap_or(Precondition::Ready)
-    }
-
-    fn apply(&self, _request: &ActionRequest) -> Result<AppliedChange, ExecutorError> {
-        *lock(&self.apply_calls) += 1;
-        let outcome = lock(&self.applies)
-            .pop_front()
-            .unwrap_or_else(|| Ok(AppliedChange::default()));
-        if outcome.is_ok() {
-            if let Some(after) = *lock(&self.after_observation) {
-                lock(&self.observations).insert("unit:app.service".to_string(), after);
-            }
-            if let Ok(change) = &outcome {
-                for value in &change.values {
-                    self.set_value(&value.key, &value.last_applied);
-                }
-            }
-        }
-        outcome
-    }
-
-    fn confirm(&self, _request: &ActionRequest) -> Confirmation {
-        lock(&self.confirmations)
-            .pop_front()
-            .unwrap_or(Confirmation::Confirmed)
-    }
-
-    fn observe(&self, target: &WorkloadId) -> MemoryObservation {
-        lock(&self.observations)
-            .get(&target.scope)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn read_value(&self, key: &str) -> Result<Option<String>, ExecutorError> {
-        Ok(self.value(key))
-    }
-
-    fn write_value(&self, key: &str, value: &str) -> Result<(), ExecutorError> {
-        lock(&self.writes).push((key.to_string(), value.to_string()));
-        self.set_value(key, value);
-        Ok(())
-    }
 }
 
 fn coordinator() -> Coordinator {

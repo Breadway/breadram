@@ -7,6 +7,9 @@
 
 #![allow(dead_code)]
 
+pub mod fake_executor;
+pub mod fake_provider;
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 

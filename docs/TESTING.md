@@ -1,4 +1,4 @@
-# Isolated CPU and gated hardware testing (RAM-29, part)
+# Isolated CPU and gated hardware testing (RAM-29)
 
 Run from the repository root:
 
@@ -27,6 +27,10 @@ share, so a new suite does not rebuild them:
 - `cgroup_workload(name, scope, bytes)`, the cgroup-accounted workload fixture.
 - `have(program)`, a PATH probe for a gated test.
 - `capped_scope(...)`, the capped disposable pressure harness below.
+- `fake_provider`, the in-process fake Ollama loopback service used by
+  `provider_execution`, with its model constants and fixed reference instant.
+- `fake_executor`, the scripted coordinator executor with failure injection
+  used by `action_coordinator`, with the lock and owned-value helpers.
 
 ## Capped pressure harness
 
@@ -56,7 +60,7 @@ desktop action runs.
 
 ## Remaining on this card
 
-The telemetry and workload fixtures are shared, but the in-process fake provider
-server and the action fixtures still live beside the suites that use them
-(`provider_execution.rs`, `action_coordinator.rs`). Moving them into `support`
-is the remaining work. No hardware suite was run here.
+None. The telemetry and workload fixtures, the in-process fake provider server,
+and the action fixtures all live in shared `support` now. No hardware suite was
+run here: `hardware_gate` reports the llama-server and vllm availability as
+skips on hosts without them.
