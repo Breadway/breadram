@@ -23,6 +23,7 @@ pub mod execution;
 pub mod inventory;
 pub mod ipc;
 pub mod jobs;
+pub mod launch;
 pub mod mode;
 pub mod policy;
 pub mod serving;

@@ -106,6 +106,20 @@ enum Command {
         #[arg(long)]
         persist: bool,
     },
+    /// Run a program in a managed user scope.
+    ///
+    /// The program and its descendants stay in `breadram-launch-<name>.scope`.
+    /// If there is no systemd user session the program still runs, in the
+    /// caller's cgroup, and that fallback is printed. A missing breadram
+    /// daemon does not block the launch: this command never opens the socket.
+    Launch {
+        /// Short scope name: letters, digits, '-' and '_'.
+        #[arg(long)]
+        name: String,
+        /// The program and its arguments. The program must be an absolute path.
+        #[arg(last = true, required = true)]
+        program: Vec<String>,
+    },
     /// Stop protecting workloads.
     Unprotect {
         /// Scope keys to unprotect.
@@ -212,6 +226,10 @@ async fn run(cli: &Cli, socket: &Path) -> Result<(), CliError> {
         _ => None,
     };
 
+    if let Command::Launch { name, program } = &cli.command {
+        return launch_program(name, program);
+    }
+
     let mut client = Client::connect(socket).await?;
     client.handshake("breadram-cli").await?;
 
@@ -303,6 +321,10 @@ async fn run(cli: &Cli, socket: &Path) -> Result<(), CliError> {
                 .await?;
             emit(cli.json, &applied, human_applied)
         }
+        Command::Launch { .. } => {
+            // Handled before the socket is opened.
+            Ok(())
+        }
         Command::Unprotect { scopes, persist } => {
             let applied = client
                 .set_protection(Vec::new(), scopes.clone(), *persist)
@@ -310,6 +332,33 @@ async fn run(cli: &Cli, socket: &Path) -> Result<(), CliError> {
             emit(cli.json, &applied, human_applied)
         }
     }
+}
+
+/// Replace this process with the program, inside a scope when one is available.
+///
+/// A missing user session is not an error: the program runs directly and the
+/// fallback is printed on stderr, which is the visible sign the card asks for.
+fn launch_program(name: &str, program: &[String]) -> Result<(), CliError> {
+    let session = std::env::var_os("XDG_RUNTIME_DIR").is_some();
+    let systemd_run = which_systemd_run();
+    let plan = breadram_core::launch::plan_launch(name, program, session && systemd_run)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    if !plan.fallback.is_empty() {
+        eprintln!("breadram: {}", plan.fallback);
+    }
+    let mut command = std::process::Command::new(&plan.argv[0]);
+    command.args(&plan.argv[1..]);
+    use std::os::unix::process::CommandExt;
+    let err = command.exec();
+    Err(CliError::Io(err))
+}
+
+/// Whether `systemd-run` can be found on `PATH`.
+fn which_systemd_run() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join("systemd-run").is_file())
 }
 
 /// Render a response as JSON or as a human summary.
