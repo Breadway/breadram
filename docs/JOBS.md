@@ -74,23 +74,39 @@ Launch needs a systemd user session. Without `systemd-run` or
 ## Cooperative concurrency (RAM-25)
 
 A supervised job is started with `BREADRAM_WORKERS_FILE` pointing at
-`<state dir>/concurrency/<id>.workers`. The file holds one line, `run <n>` or
-`reduce <n>`. The job reads it at its own safe point and drops workers down to
-`n`. breadram writes `run 1` at launch and deletes the file when the job
-finishes, so a reused id cannot inherit a stale instruction.
+`<state dir>/concurrency/<id>.workers`. The file holds one line:
+
+- `run <n>`: keep n workers
+- `reduce <n>`: drop to n workers at the next safe point
+- `pause <n> <resume-unix-ms>`: take no new work until that absolute time,
+  then run n workers again
+
+breadram writes `run 1` at launch and deletes the file when the job finishes,
+so a reused id cannot inherit a stale instruction. A pause the daemon writes
+is at most 30 seconds (`MAX_PAUSE`). The deadline is in the file, so the job
+resumes when it passes even if the daemon has exited and the file still says
+`pause`. A missing or garbled file means keep one worker going: it is not a
+stop and it is not a pause.
 
 This is the only concurrency control. An arbitrary program that never reads
 the file is not claimed to support a changed worker count, and breadram does
-not freeze it. Reducing workers does not release memory the process already
-holds. A missing file means keep going: a daemon that exits leaves the job
-running at its last reading rather than paused forever, because nothing here
-pauses it.
+not freeze it. Pausing does not release memory the process already holds
+unless the job itself frees it at the safe point.
 
-The example is `examples/cooperative-job.sh`. It starts one extra worker when
-the file says `run` with a count above 1, and stops that worker when the file
-says `reduce 1` or disappears. Measured on this host: the extra worker is a
-`sleep`, so the memory delta is a process, not a workload, and there is no
-throughput number to report for it.
+The example is `examples/cooperative-job`. Each worker hashes a private 8 MiB
+buffer and counts rounds. On `pause` it joins those workers, which frees the
+buffers, and after the deadline it starts them again. `scripts/measure-cooperative.sh`
+records units per half second and RSS across run, pause, and resume, refuses a
+second pause inside an open deadline, and starts a fresh process against an
+already-expired pause with no writer left to clear it.
+
+Measured on this host (debug build, two workers, 8 s, then a 2.5 s pause):
+average delta 13.1 units per half second while running two workers, 3.2 while
+paused; RSS about 16201 KiB running and 2864 KiB paused. The restart process
+reported `paused: false` for every sample. The residual pause delta is the
+last rounds already in flight when the workers were joined, not work accepted
+during the pause. A job that exits during a pause is a normal exit; the daemon
+removes the file in `finish_job`, same as any other finish.
 
 ## Automatic admission
 

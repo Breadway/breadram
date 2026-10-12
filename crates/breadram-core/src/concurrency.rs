@@ -2,50 +2,91 @@
 //!
 //! breadram cannot change how many workers an arbitrary program started with.
 //! A job that wants to yield under pressure reads a small file breadram writes
-//! and drops its own extra workers at a safe point. Nothing here freezes a
-//! process, and nothing here claims that pausing releases memory the process
-//! already holds.
+//! and drops its own extra workers, or pauses, at a safe point. Nothing here
+//! freezes a process, and nothing here claims that pausing releases memory the
+//! process already holds.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// How long a pause may last before the job must resume on its own.
+///
+/// A daemon that dies mid-pause must not leave the job sitting forever. The
+/// deadline is written into the file, so the job can honor it without the
+/// daemon still being alive.
+pub const MAX_PAUSE: Duration = Duration::from_secs(30);
 
 /// What an opted-in job should do with its own worker count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerDirective {
-    /// Keep the worker count the job was started with.
+    /// Keep `workers` running.
     Run { workers: u32 },
     /// Drop to `workers` at the next safe point. Not a freeze.
     Reduce { workers: u32 },
+    /// Stop taking new work until `resume_unix_ms`, then run `workers` again.
+    ///
+    /// The deadline is absolute so a dead daemon cannot extend it. Holding
+    /// already-allocated memory is the job's own choice: this is not a request
+    /// to release it.
+    Pause { workers: u32, resume_unix_ms: u64 },
 }
 
 impl WorkerDirective {
-    /// The worker count the directive names.
+    /// The worker count the directive names for when the job is running.
     pub fn workers(self) -> u32 {
         match self {
-            WorkerDirective::Run { workers } | WorkerDirective::Reduce { workers } => workers,
+            WorkerDirective::Run { workers }
+            | WorkerDirective::Reduce { workers }
+            | WorkerDirective::Pause { workers, .. } => workers,
         }
     }
 
-    fn verb(self) -> &'static str {
+    fn encode(self) -> String {
         match self {
-            WorkerDirective::Run { .. } => "run",
-            WorkerDirective::Reduce { .. } => "reduce",
+            WorkerDirective::Run { workers } => format!("run {workers}\n"),
+            WorkerDirective::Reduce { workers } => format!("reduce {workers}\n"),
+            WorkerDirective::Pause {
+                workers,
+                resume_unix_ms,
+            } => format!("pause {workers} {resume_unix_ms}\n"),
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        let (verb, count) = text.trim().split_once(' ')?;
-        let workers = count.parse::<u32>().ok()?;
+        let mut parts = text.trim().split_whitespace();
+        let verb = parts.next()?;
+        let workers = parts.next()?.parse::<u32>().ok()?;
         if workers == 0 {
             return None;
         }
         match verb {
-            "run" => Some(WorkerDirective::Run { workers }),
-            "reduce" => Some(WorkerDirective::Reduce { workers }),
+            "run" if parts.next().is_none() => Some(WorkerDirective::Run { workers }),
+            "reduce" if parts.next().is_none() => Some(WorkerDirective::Reduce { workers }),
+            "pause" => {
+                let resume_unix_ms = parts.next()?.parse::<u64>().ok()?;
+                if parts.next().is_some() {
+                    return None;
+                }
+                Some(WorkerDirective::Pause {
+                    workers,
+                    resume_unix_ms,
+                })
+            }
             _ => None,
         }
+    }
+}
+
+/// A pause the job should still be honoring at `now_unix_ms`.
+///
+/// Past the deadline the pause is over even if the file still says pause:
+/// the daemon may have died and must not be required to clear it.
+pub fn pause_active(directive: WorkerDirective, now_unix_ms: u64) -> bool {
+    match directive {
+        WorkerDirective::Pause { resume_unix_ms, .. } => now_unix_ms < resume_unix_ms,
+        _ => false,
     }
 }
 
@@ -61,7 +102,6 @@ pub fn directive_path(dir: &Path, job_id: &str) -> PathBuf {
 pub fn write_directive(dir: &Path, job_id: &str, directive: WorkerDirective) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let path = directive_path(dir, job_id);
-    let body = format!("{} {}\n", directive.verb(), directive.workers());
     let tmp = dir.join(format!(
         ".{job_id}.{}.tmp",
         SystemTime::now()
@@ -69,14 +109,14 @@ pub fn write_directive(dir: &Path, job_id: &str, directive: WorkerDirective) -> 
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    fs::write(&tmp, body)?;
+    fs::write(&tmp, directive.encode())?;
     fs::rename(&tmp, &path)
 }
 
 /// Read the directive, or `None` when the file is missing or not understood.
 ///
 /// A missing file means the job keeps its own count. It is not an error and
-/// it is not a request to stop.
+/// it is not a request to stop or to stay paused.
 pub fn read_directive(dir: &Path, job_id: &str) -> Option<WorkerDirective> {
     let text = fs::read_to_string(directive_path(dir, job_id)).ok()?;
     WorkerDirective::parse(&text)
@@ -88,6 +128,14 @@ pub fn clear_directive(dir: &Path, job_id: &str) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
+}
+
+/// Unix time in milliseconds, for pause deadlines.
+pub fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -131,6 +179,40 @@ mod tests {
         let dir = scratch();
         fs::write(directive_path(&dir, "job-2"), "freeze 0\n").unwrap();
         assert!(read_directive(&dir, "job-2").is_none());
+        fs::write(directive_path(&dir, "job-2"), "pause 1\n").unwrap();
+        assert!(read_directive(&dir, "job-2").is_none());
+        fs::write(directive_path(&dir, "job-2"), "run 0\n").unwrap();
+        assert!(read_directive(&dir, "job-2").is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pause_ends_at_its_deadline_without_the_daemon() {
+        let dir = scratch();
+        let now = 1_000_000_u64;
+        write_directive(
+            &dir,
+            "job-3",
+            WorkerDirective::Pause {
+                workers: 1,
+                resume_unix_ms: now + 1_000,
+            },
+        )
+        .unwrap();
+        let directive = read_directive(&dir, "job-3").unwrap();
+        assert!(pause_active(directive, now));
+        assert!(pause_active(directive, now + 999));
+        assert!(!pause_active(directive, now + 1_000));
+        // The file can still say pause. The deadline, not a live daemon, ends it.
+        assert!(matches!(
+            read_directive(&dir, "job-3"),
+            Some(WorkerDirective::Pause { .. })
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pause_longer_than_the_cap_is_the_callers_mistake_to_avoid() {
+        assert_eq!(MAX_PAUSE, Duration::from_secs(30));
     }
 }
