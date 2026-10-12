@@ -299,6 +299,17 @@ pub struct GatewayRoute {
     /// How completely requests are tracked. Complete by default.
     #[serde(default)]
     pub tracking: GatewayTracking,
+    /// The model id to load when a request arrives at a sleeping backend.
+    /// Absent means no provider wake is performed: arrivals still get the
+    /// retry hint and the wake timeout still applies.
+    #[serde(default)]
+    pub wake_model: Option<String>,
+    /// The load path the wake calls. Defaults to `/models/load`.
+    #[serde(default)]
+    pub wake_load_path: Option<String>,
+    /// The listing path the wake verifies against. Defaults to `/models`.
+    #[serde(default)]
+    pub wake_health_path: Option<String>,
 }
 
 /// The optional local inference gateway.
@@ -932,6 +943,30 @@ fn validate_gateway(gateway: &GatewayPolicy) -> Result<(), ConfigError> {
                     route.path_prefix, route.workload_scope
                 ),
             ));
+        }
+        if let Some(model) = &route.wake_model {
+            if model.is_empty() {
+                return Err(invalid(
+                    "wake_model",
+                    format!("route {} names an empty wake model", route.path_prefix),
+                ));
+            }
+        }
+        for (field, path) in [
+            ("wake_load_path", &route.wake_load_path),
+            ("wake_health_path", &route.wake_health_path),
+        ] {
+            if let Some(path) = path {
+                if !path.starts_with('/') {
+                    return Err(invalid(
+                        field,
+                        format!(
+                            "route {} path {path} must start with '/'",
+                            route.path_prefix
+                        ),
+                    ));
+                }
+            }
         }
         parse_loopback_socket(&route.backend_addr, "backend_addr")?;
     }

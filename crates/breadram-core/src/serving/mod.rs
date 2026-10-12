@@ -51,6 +51,6 @@ pub use lifecycle::{
     TrackingCompleteness, TransitionError, WakeHealth, WakeRequest, DEFAULT_RETRY_AFTER_MS,
 };
 pub use server::{
-    GatewayServer, Route, ServerConfig, DIAL_TIMEOUT, HEAD_TIMEOUT, MAX_BODY_BYTES, MAX_HEAD_BYTES,
-    RESPONSE_HEAD_TIMEOUT,
+    GatewayServer, Route, ServerConfig, WakeSpec, DIAL_TIMEOUT, HEAD_TIMEOUT, MAX_BODY_BYTES,
+    MAX_HEAD_BYTES, RESPONSE_HEAD_TIMEOUT, WAKE_POLL_INTERVAL,
 };

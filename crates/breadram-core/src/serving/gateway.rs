@@ -100,8 +100,15 @@ impl Gateway {
                 reason: "no backend serves this workload".to_string(),
             };
         };
-        // Demand-driven wake: an arrival at a confirmed sleep begins the wake.
-        if matches!(backend.state(), ServingState::Sleeping { .. }) {
+        // Demand-driven wake: an arrival at a confirmed sleep, or at a backend
+        // whose last wake failed and left its health unverified, begins the
+        // wake on the request path. Without the unverified case a single
+        // failed attempt would strand the backend: routing only wakes from a
+        // state a request can reach, and nothing else moves unverified on.
+        if matches!(
+            backend.state(),
+            ServingState::Sleeping { .. } | ServingState::Unverified { .. }
+        ) {
             let retry_after_ms = backend.policy().retry_after_ms;
             return match backend.wake_request(now_ms) {
                 Ok(wake) => RouteOutcome::WakeThenRetry {
@@ -262,6 +269,32 @@ mod tests {
         ));
         backend.sleep_confirmed(1_000_000).unwrap();
         backend
+    }
+
+    #[test]
+    fn an_arrival_at_an_unverified_backend_begins_another_wake() {
+        // A failed wake leaves the backend unverified. Routing must let a
+        // later arrival wake it again, or one failed attempt strands it with
+        // no state a request can move.
+        let mut gateway = Gateway::new(vec![asleep(TrackingCompleteness::Complete)]);
+        assert!(matches!(
+            gateway.route(&workload(), RequestMeta::new("c1"), 1_000_001),
+            RouteOutcome::WakeThenRetry { .. }
+        ));
+        // The wake fails: unverified, with the attempt counted.
+        gateway.backend_mut(&workload()).unwrap().wake_timed_out(2);
+        assert!(matches!(
+            gateway.backend(&workload()).unwrap().state(),
+            ServingState::Unverified { .. }
+        ));
+        // A later arrival begins the next attempt rather than being stuck.
+        assert!(
+            matches!(
+                gateway.route(&workload(), RequestMeta::new("c2"), 3),
+                RouteOutcome::WakeThenRetry { wake, .. } if wake.attempt == 2
+            ),
+            "an unverified backend must wake on the request path"
+        );
     }
 
     #[test]

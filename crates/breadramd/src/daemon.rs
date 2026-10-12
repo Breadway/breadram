@@ -41,6 +41,7 @@ use breadram_core::policy::{
 };
 use breadram_core::serving::{
     GatewayServer, Route as GatewayRoute, ServerConfig as GatewayConfig, TrackingCompleteness,
+    WakeSpec as GatewayWakeSpec,
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
@@ -71,6 +72,14 @@ const HISTORY_MAX_ACTIONS_PER_WINDOW: usize = 10;
 /// when it is not.
 const OBSERVATION_ONLY_NOTE: &str =
     "breadramd is in monitor mode, which never writes: no action is executed and the journal records none";
+
+/// The default router load path a gateway wake calls.
+const DEFAULT_WAKE_LOAD_PATH: &str = "/models/load";
+/// The default router listing path a gateway wake verifies against.
+const DEFAULT_WAKE_HEALTH_PATH: &str = "/models";
+
+/// The scope unit name prefix for supervised jobs.
+const JOB_SCOPE_PREFIX: &str = "breadram-job-";
 
 /// Why the daemon could not start or stopped unexpectedly.
 #[derive(Debug, thiserror::Error)]
@@ -186,8 +195,6 @@ const JOB_STOP_GRACE: Duration = Duration::from_secs(5);
 const JOB_PEAK_INTERVAL: Duration = Duration::from_millis(100);
 /// The cgroup hierarchy root for scope discovery.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-/// The scope unit name prefix for supervised jobs.
-const JOB_SCOPE_PREFIX: &str = "breadram-job-";
 
 /// The last complete observation.
 ///
@@ -554,6 +561,17 @@ async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
                 },
                 GatewayTracking::Unknown => TrackingCompleteness::Unknown,
             },
+            wake: route.wake_model.as_ref().map(|model| GatewayWakeSpec {
+                load_path: route
+                    .wake_load_path
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_WAKE_LOAD_PATH.to_string()),
+                model_id: model.clone(),
+                health_path: route
+                    .wake_health_path
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_WAKE_HEALTH_PATH.to_string()),
+            }),
         })
         .collect();
     let server = GatewayServer::new(GatewayConfig { routes }, now_ms);

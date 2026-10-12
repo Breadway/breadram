@@ -55,7 +55,7 @@ use super::http::{
     parse_head, parse_response_head, ParseError, RequestHead, ResponseHead, MAX_HEADER_BYTES,
 };
 use super::lease::{Admission, ClientId, LeaseId, RequestKind};
-use super::lifecycle::{Backend, ServingPolicy, TrackingCompleteness};
+use super::lifecycle::{Backend, ServingPolicy, TrackingCompleteness, WakeHealth, WakeRequest};
 
 /// The largest head accepted, in bytes.
 pub const MAX_HEAD_BYTES: usize = MAX_HEADER_BYTES;
@@ -81,6 +81,27 @@ pub struct Route {
     /// How completely requests are tracked. The gateway itself is complete
     /// tracking; anything else degrades honestly through the core.
     pub tracking: TrackingCompleteness,
+    /// How to wake this backend on the request path, when configured. Without
+    /// it the server still serves the retry hint and enforces the wake
+    /// timeout, but no provider wake is performed.
+    pub wake: Option<WakeSpec>,
+}
+
+/// How the server wakes one backend on the request path.
+///
+/// Router-shaped on purpose: the load call names a model id, and health is the
+/// same structured id-plus-status listing the adapter confirms against. Other
+/// shapes have no wake configured, and their arrivals keep the retry hint
+/// without a wake anyone could verify.
+#[derive(Debug, Clone)]
+pub struct WakeSpec {
+    /// The load path, for example `/models/load`.
+    pub load_path: String,
+    /// The model id to load.
+    pub model_id: String,
+    /// The listing path that reports the model id with its status, for
+    /// example `/models`.
+    pub health_path: String,
 }
 
 /// The gateway's static configuration.
@@ -211,6 +232,7 @@ async fn serve_conn(state: Arc<Inner>, mut client: TcpStream) {
         .get(&scope)
         .cloned()
         .unwrap_or_else(|| route.backend_addr.clone());
+    let wake_spec = route.wake.clone();
     let meta = classify(
         head.header(CLIENT_HEADER),
         head.header(IDEMPOTENCY_HEADER),
@@ -247,7 +269,18 @@ async fn serve_conn(state: Arc<Inner>, mut client: TcpStream) {
         }
         Disposition::Retry { retry_after_ms } => {
             let reason = match &outcome {
-                RouteOutcome::WakeThenRetry { .. } => {
+                RouteOutcome::WakeThenRetry { wake, .. } => {
+                    // The lifecycle began the wake; performing it is this
+                    // task's job, with the lifecycle's own timeout as the
+                    // bound. The client is answered at once either way.
+                    let driver = Arc::clone(&state);
+                    let scope = scope.clone();
+                    let addr = addr.clone();
+                    let wake = wake.clone();
+                    let spec = wake_spec.clone();
+                    tokio::spawn(async move {
+                        drive_wake(driver, scope, addr, wake, spec).await;
+                    });
                     "the backend is waking: the wake was begun on the request path; \
                      retry after the hint"
                         .to_string()
@@ -293,6 +326,205 @@ async fn read_head(
             Err(ParseError::Malformed) => return Err(400),
         }
     }
+}
+
+/// How often a waking backend is polled for health.
+pub const WAKE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// The largest health listing read, in bytes.
+const MAX_HEALTH_BYTES: u64 = 1024 * 1024;
+
+/// Perform one request-path wake: run the provider load, then verify health
+/// until the lifecycle's own timeout.
+///
+/// Without a wake spec there is nothing to perform, so the task simply holds
+/// the timeout: the lifecycle still bounds the waking state either way. A
+/// result that arrives after the backend already moved on is ignored by the
+/// lifecycle rather than applied, so a slow poll cannot corrupt the state.
+async fn drive_wake(
+    state: Arc<Inner>,
+    scope: String,
+    addr: String,
+    wake: WakeRequest,
+    spec: Option<WakeSpec>,
+) {
+    let timeout = Duration::from_millis(wake.timeout_ms);
+    let health = match tokio::time::timeout(timeout, perform_wake(&addr, &spec)).await {
+        Ok(health) => health,
+        Err(_) => {
+            let now = state.started.elapsed().as_millis() as u64;
+            state
+                .gateway
+                .lock()
+                .await
+                .backend_mut(&workload(&scope))
+                .map(|backend| backend.wake_timed_out(now));
+            return;
+        }
+    };
+    let now = state.started.elapsed().as_millis() as u64;
+    state
+        .gateway
+        .lock()
+        .await
+        .backend_mut(&workload(&scope))
+        .map(|backend| backend.wake_completed(health, now));
+}
+
+/// Run the provider wake and verify it, or explain why it did not happen.
+async fn perform_wake(addr: &str, spec: &Option<WakeSpec>) -> WakeHealth {
+    let Some(spec) = spec else {
+        // No provider wake is configured: hold the timeout so the lifecycle
+        // still bounds the waking state, then report through the timeout path.
+        std::future::pending::<()>().await;
+        unreachable!("the timeout fires first");
+    };
+    if let Err(reason) = post_load(addr, spec).await {
+        return WakeHealth::Unhealthy { reason };
+    }
+    poll_loaded(addr, spec).await
+}
+
+/// POST the load call: one attempt, reported honestly either way.
+async fn post_load(addr: &str, spec: &WakeSpec) -> Result<(), String> {
+    let body = format!(
+        "{{\"model\":{}}}",
+        serde_json::to_string(&spec.model_id)
+            .map_err(|err| format!("the model id could not be encoded: {err}"))?
+    );
+    let head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        spec.load_path,
+        addr,
+        body.len(),
+        body
+    );
+    let mut backend = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("the backend at {addr} could not be reached"))?
+        .map_err(|_| format!("the backend at {addr} could not be reached"))?;
+    backend
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|_| format!("the backend at {addr} closed the connection"))?;
+    backend
+        .flush()
+        .await
+        .map_err(|_| format!("the backend at {addr} closed the connection"))?;
+    let (response, _) = read_response_head(&mut backend)
+        .await
+        .map_err(|_| format!("the backend at {addr} answered nothing usable"))?;
+    if (200..300).contains(&response.status) {
+        Ok(())
+    } else {
+        Err(format!("the load call answered {}", response.status))
+    }
+}
+
+/// Poll the listing until the model id carries the loaded status.
+///
+/// Transport failures keep polling until the caller's deadline: a backend that
+/// is still starting answers nothing for a while. A listing that parses but
+/// names another outcome is also waited out. Only a listing that cannot be a
+/// router listing at all is an immediate failure.
+async fn poll_loaded(addr: &str, spec: &WakeSpec) -> WakeHealth {
+    loop {
+        tokio::time::sleep(WAKE_POLL_INTERVAL).await;
+        let mut backend = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            _ => continue,
+        };
+        let head = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            spec.health_path, addr
+        );
+        if backend.write_all(head.as_bytes()).await.is_err() {
+            continue;
+        }
+        let Ok((response, buffered)) = read_response_head(&mut backend).await else {
+            continue;
+        };
+        if !(200..300).contains(&response.status) {
+            continue;
+        }
+        let body = match read_body_exact(&mut backend, &response, buffered).await {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        match model_status(&body, &spec.model_id) {
+            ModelStatus::Loaded => return WakeHealth::Healthy,
+            ModelStatus::Unparseable => {
+                return WakeHealth::Unhealthy {
+                    reason: "the health listing is not a router listing".to_string(),
+                };
+            }
+            ModelStatus::Other => continue,
+        }
+    }
+}
+
+/// What the listing says about one model id.
+enum ModelStatus {
+    Loaded,
+    Other,
+    Unparseable,
+}
+
+/// Read the structured id-plus-status listing: the exact model id carrying
+/// the loaded status, never a substring match across entries.
+fn model_status(body: &[u8], model_id: &str) -> ModelStatus {
+    let Ok(listing) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ModelStatus::Unparseable;
+    };
+    let Some(entries) = listing.get("data").and_then(|data| data.as_array()) else {
+        return ModelStatus::Unparseable;
+    };
+    for entry in entries {
+        if entry.get("id").and_then(|id| id.as_str()) != Some(model_id) {
+            continue;
+        }
+        let status = entry
+            .get("status")
+            .and_then(|status| status.get("value"))
+            .and_then(|value| value.as_str());
+        match status {
+            Some("loaded") => return ModelStatus::Loaded,
+            Some(_) => return ModelStatus::Other,
+            None => return ModelStatus::Unparseable,
+        }
+    }
+    ModelStatus::Other
+}
+
+/// Read one response body by its framing, bounded for health listings.
+async fn read_body_exact(
+    backend: &mut TcpStream,
+    head: &ResponseHead,
+    mut buffered: Vec<u8>,
+) -> Result<Vec<u8>, ()> {
+    let mut body = buffered.split_off(head.body_offset);
+    let rest = if head.chunked {
+        return Err(());
+    } else if let Some(length) = head.content_length {
+        length.saturating_sub(body.len() as u64)
+    } else {
+        // Health listings always declare a length; anything else is not one.
+        return Err(());
+    };
+    if body.len() as u64 + rest > MAX_HEALTH_BYTES {
+        return Err(());
+    }
+    let mut chunk = [0u8; 8192];
+    let mut remaining = rest;
+    while remaining > 0 {
+        let want = remaining.min(chunk.len() as u64) as usize;
+        let read = backend.read(&mut chunk[..want]).await.map_err(|_| ())?;
+        if read == 0 {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk[..read]);
+        remaining -= read as u64;
+    }
+    Ok(body)
 }
 
 /// Read one response head from a backend, with a timeout.
@@ -809,6 +1041,7 @@ mod tests {
             workload_scope: SCOPE.to_string(),
             backend_addr: addr.to_string(),
             tracking,
+            wake: None,
         }
     }
 
@@ -1175,12 +1408,14 @@ mod tests {
                 workload_scope: "a".to_string(),
                 backend_addr: "127.0.0.1:1".to_string(),
                 tracking: TrackingCompleteness::Complete,
+                wake: None,
             },
             Route {
                 path_prefix: "/v1/special".to_string(),
                 workload_scope: "b".to_string(),
                 backend_addr: "127.0.0.1:2".to_string(),
                 tracking: TrackingCompleteness::Complete,
+                wake: None,
             },
         ];
         assert_eq!(
@@ -1201,5 +1436,292 @@ mod tests {
         assert_eq!(retry_after_secs(1), 1);
         assert_eq!(retry_after_secs(1000), 1);
         assert_eq!(retry_after_secs(1001), 2);
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::serving::lifecycle::{DrainOutcome, SleepDecision};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    const SCOPE: &str = "unit:llama.service";
+
+    /// A router-shaped fake: unloaded until asked to load, then loaded
+    /// unless constructed to never flip.
+    struct RouterState {
+        loaded: Mutex<bool>,
+        loads: AtomicUsize,
+        flip: bool,
+    }
+
+    fn flip_state() -> Arc<RouterState> {
+        Arc::new(RouterState {
+            loaded: Mutex::new(false),
+            loads: AtomicUsize::new(0),
+            flip: true,
+        })
+    }
+
+    fn stuck_state() -> Arc<RouterState> {
+        Arc::new(RouterState {
+            loaded: Mutex::new(false),
+            loads: AtomicUsize::new(0),
+            flip: false,
+        })
+    }
+
+    async fn start_router(state: Arc<RouterState>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let addr = listener.local_addr().expect("an address").to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut buffered = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head = loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffered.extend_from_slice(&chunk[..read]);
+                        match parse_head(&buffered) {
+                            Ok(head) => break head,
+                            Err(ParseError::Incomplete) => continue,
+                            Err(_) => return,
+                        }
+                    };
+                    // Read the declared body, if any.
+                    let length = head.content_length.unwrap_or(0).min(1024 * 1024) as usize;
+                    while buffered.len() < head.body_offset + length {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        buffered.extend_from_slice(&chunk[..read]);
+                    }
+                    let body = String::from_utf8_lossy(&buffered[head.body_offset..]).to_string();
+                    let answer = if head.method == "POST" && head.target == "/models/load" {
+                        state.loads.fetch_add(1, Ordering::Relaxed);
+                        *state.loaded.lock().await = body.contains("\"qwen3-8b\"") && state.flip;
+                        "{\"success\":true}".to_string()
+                    } else if head.method == "GET" && head.target == "/models" {
+                        let loaded = *state.loaded.lock().await;
+                        format!(
+                            "{{\"data\":[{{\"id\":\"qwen3-8b\",\"status\":{{\"value\":\"{}\"}}}}]}}",
+                            if loaded { "loaded" } else { "unloaded" }
+                        )
+                    } else {
+                        "{\"ok\":true}".to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        answer.len(),
+                        answer
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn asleep_with_policy(policy: ServingPolicy) -> Backend {
+        let workload = WorkloadId {
+            scope: SCOPE.to_string(),
+            generation: 1,
+        };
+        let mut backend = Backend::new(workload, TrackingCompleteness::Complete, policy, 0);
+        assert!(matches!(
+            backend.begin_drain(1_000_000),
+            SleepDecision::Allowed { .. }
+        ));
+        assert!(matches!(
+            backend.drain_outcome(1_000_000),
+            DrainOutcome::Ready { .. }
+        ));
+        backend.sleep_confirmed(1_000_000).expect("sleep");
+        backend
+    }
+
+    fn short_policy(wake_timeout_ms: u64, max_wake_attempts: u32) -> ServingPolicy {
+        ServingPolicy {
+            wake_timeout_ms,
+            max_wake_attempts,
+            ..ServingPolicy::default()
+        }
+    }
+
+    async fn start_gateway_with(
+        addr: &str,
+        backends: Vec<Backend>,
+        wake: Option<WakeSpec>,
+    ) -> (String, Arc<GatewayServer>) {
+        let config = ServerConfig {
+            routes: vec![Route {
+                path_prefix: "/v1".to_string(),
+                workload_scope: SCOPE.to_string(),
+                backend_addr: addr.to_string(),
+                tracking: TrackingCompleteness::Complete,
+                wake,
+            }],
+        };
+        let server = Arc::new(GatewayServer::with_backends(config, backends));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let gateway = listener.local_addr().expect("an address").to_string();
+        let serving = Arc::clone(&server);
+        tokio::spawn(async move {
+            serving.serve(listener).await;
+        });
+        (gateway, server)
+    }
+
+    fn wake_spec() -> WakeSpec {
+        WakeSpec {
+            load_path: "/models/load".to_string(),
+            model_id: "qwen3-8b".to_string(),
+            health_path: "/models".to_string(),
+        }
+    }
+
+    async fn get(gateway: &str, target: &str) -> Vec<u8> {
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        let request = format!("GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.expect("read");
+        out
+    }
+
+    fn status_of(response: &[u8]) -> String {
+        String::from_utf8_lossy(response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_sleeping_backend_wakes_and_serves_on_retry() {
+        let state = flip_state();
+        let addr = start_router(Arc::clone(&state)).await;
+        let backend = asleep_with_policy(ServingPolicy::default());
+        let (gateway, server) = start_gateway_with(&addr, vec![backend], Some(wake_spec())).await;
+
+        // The arrival begins the wake and answers the retry hint.
+        let first = get(&gateway, "/v1/models").await;
+        assert!(status_of(&first).contains("503"), "{}", status_of(&first));
+
+        // The wake runs the provider load and verifies health: the next
+        // arrival is served instead of refused.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let second = loop {
+            let response = get(&gateway, "/v1/models").await;
+            if status_of(&response).contains("200") {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the backend never woke: {}",
+                String::from_utf8_lossy(&response)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(state.loads.load(Ordering::Relaxed) >= 1);
+        assert!(
+            String::from_utf8_lossy(&second).contains("\"ok\":true"),
+            "the retry is proxied to the woken backend"
+        );
+        assert!(
+            !matches!(server.evidence(SCOPE).await, ActivityEvidence::Active),
+            "the completed wake leaves no lease behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_that_never_completes_returns_to_sleep() {
+        // The load is performed but health never arrives: the wake must time
+        // out rather than sit in waking forever.
+        let state = stuck_state();
+        let addr = start_router(Arc::clone(&state)).await;
+        let backend = asleep_with_policy(short_policy(1000, 5));
+        let (gateway, _) = start_gateway_with(&addr, vec![backend], Some(wake_spec())).await;
+
+        let first = get(&gateway, "/v1/models").await;
+        assert!(status_of(&first).contains("503"));
+
+        // Past the wake timeout, a new arrival begins a new wake instead of
+        // meeting a backend stuck waking: the reason names a begun wake.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let second = get(&gateway, "/v1/models").await;
+        assert!(status_of(&second).contains("503"));
+        assert!(
+            String::from_utf8_lossy(&second).contains("begun on the request path"),
+            "a fresh wake begins after the timeout: {}",
+            String::from_utf8_lossy(&second)
+        );
+        assert!(
+            state.loads.load(Ordering::Relaxed) >= 1,
+            "the provider load was performed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_without_a_spec_still_times_out() {
+        // No wake is configured, so nothing is performed: the timeout alone
+        // must return the backend to sleep rather than leaving it waking.
+        let state = flip_state();
+        let addr = start_router(Arc::clone(&state)).await;
+        let backend = asleep_with_policy(short_policy(1000, 5));
+        let (gateway, _) = start_gateway_with(&addr, vec![backend], None).await;
+
+        let first = get(&gateway, "/v1/models").await;
+        assert!(status_of(&first).contains("503"));
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let second = get(&gateway, "/v1/models").await;
+        assert!(status_of(&second).contains("503"));
+        assert!(
+            String::from_utf8_lossy(&second).contains("begun on the request path"),
+            "a fresh wake begins after the timeout: {}",
+            String::from_utf8_lossy(&second)
+        );
+        assert_eq!(
+            state.loads.load(Ordering::Relaxed),
+            0,
+            "no provider call without a configured wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_wake_attempts_fail_open_with_a_reason() {
+        let state = stuck_state();
+        let addr = start_router(Arc::clone(&state)).await;
+        let backend = asleep_with_policy(short_policy(500, 1));
+        let (gateway, _) = start_gateway_with(&addr, vec![backend], None).await;
+
+        assert!(status_of(&get(&gateway, "/v1/models").await).contains("503"));
+        // One attempt is allowed: after its timeout the backend is failed,
+        // and arrivals are refused rather than retried forever.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let refused = get(&gateway, "/v1/models").await;
+        assert!(
+            status_of(&refused).contains("502"),
+            "an unwakeable backend is refused: {}",
+            status_of(&refused)
+        );
     }
 }

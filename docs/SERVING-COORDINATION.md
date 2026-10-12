@@ -147,9 +147,10 @@ are its activity evidence, so a workload with a live lease is never released and
 an unknown workload is unknown, never idle. That is how the policy learns a
 backend is in use without ever learning that a gateway exists.
 
-Still to come for the full gateway: wiring the provider sleep and wake commands
-to `SleepDecision`, `DrainOutcome`, and `WakeHealth`, and the operator
-configuration that points a client at the gateway.
+The wake side is performed; the sleep side is still provider work. The gateway
+wakes and serves, and the drain/sleep lifecycle the adapters drive through
+`SleepDecision` and `DrainOutcome` remains theirs: the gateway only ever
+answers arrivals, it never decides to sleep a backend.
 
 ## Socket server
 
@@ -164,9 +165,26 @@ serve, 404 for unrouted paths, and 400/413 for unusable heads and bodies.
 
 Two deliberate boundaries: every `Forward` outcome is proxied, so a joined or
 replayed request duplicates backend work that response sharing would avoid (the
-core still counts it once); and the `WakeThenRetry` wake is recorded in the
-lifecycle with the retry hint served, while performing the provider wake belongs
-to the adapter work named above.
+core still counts it once); and a wake with no configured wake spec holds the
+wake timeout without performing a provider call, which is the honest behavior
+for a backend whose provider API is unknown.
+
+## Request-path wake
+
+A `WakeThenRetry` outcome begins the wake in the lifecycle and spawns the
+provider call, so the client is answered immediately and the serving state is
+resolved in the background. A route with a `wake_model` performs a
+router-shaped wake: `POST` the load path with that model id, then poll the
+listing path until the exact model id carries the `loaded` status, never a
+substring match across entries. The lifecycle's own `wake_timeout_ms` bounds
+the whole thing; a wake that times out returns the backend to a state a later
+request can wake from, and once `max_wake_attempts` is spent the backend is
+failed and arrivals are refused with the reason rather than retried forever.
+
+Routing wakes from a confirmed sleep **and** from an unverified backend. The
+second case matters: a failed wake leaves the backend unverified, and without
+it a single failed attempt would strand the backend in a state no request
+could move.
 
 ## Operator configuration
 
@@ -182,6 +200,7 @@ listen = "127.0.0.1:8090"
 path_prefix = "/v1"
 workload_scope = "unit:llama.service"
 backend_addr = "127.0.0.1:8080"
+wake_model = "qwen3-8b"
 ```
 
 Routes match by longest request-target prefix. The listen address and every
@@ -191,3 +210,9 @@ load. A route's `tracking` is `complete` by default and may be `bypassable` or
 `unknown`, which degrades through the core rather than silently. Pointing an
 OpenAI-compatible client at the listen address produces the same bytes as
 pointing it at the backend directly, for both plain and streamed responses.
+
+`wake_model` opts the route into a request-path wake against that model id,
+using the router's `POST /models/load` and `/models` listing by default;
+`wake_load_path` and `wake_health_path` override those for another shape.
+Without `wake_model` arrivals at a sleeping backend still get the retry hint
+and the wake timeout still applies, but no provider call is made.
