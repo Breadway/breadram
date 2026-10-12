@@ -76,11 +76,18 @@ What is not there yet, named rather than implied:
   correct; the gateway that reports real requests is RAM-45, and a deployment
   that declares complete tracking is what makes a resident but unused model
   releasable. Nothing infers it.
-- Only the Ollama adapter and the generic hook adapter exist. llama.cpp
-  (RAM-13), vLLM (RAM-14), breadsearch (RAM-18), and the workload mapping for
-  containers and services (RAM-16) are open. The transport speaks loopback
-  `http` only: `https` endpoints are refused with a reason rather than sent in
-  the clear. Hook programs run under the safeguards in `docs/HOOKS.md`.
+- The Ollama adapter is the only one that can act on a single-model server. The
+  llama.cpp adapter (RAM-13) observes servers and, when automation is enabled,
+  can unload one loaded router model, confirmed by the exact model id and its
+  status in the same listing; verified on build 11146 with Qwen3 8B with
+  inference after relief and separately measured host vs device effects
+  (`docs/LLAMACPP.md` records the evidence). Single-model immediate manual
+  sleep is not documented. The
+  generic hook adapter (RAM-15) also exists and runs under the safeguards in
+  `docs/HOOKS.md`. vLLM (RAM-14),
+  breadsearch (RAM-18), and the workload mapping for containers and services
+  (RAM-16) are open. The transport speaks loopback `http` only: `https` is
+  refused with a reason rather than sent in the clear.
 - Background jobs (RAM-17), priorities and budgets beyond the per scope budget
   (RAM-21), swap and OOM diagnostics (RAM-23), trends (RAM-28), and the shared
   test fixtures (RAM-29) are still open.

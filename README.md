@@ -88,6 +88,7 @@ packaging/             user service, example config, installer
 - `docs/ADAPTER-CONTRACT.md`: the optional workload adapter interface.
 - `docs/HOOKS.md`: the cooperative hook protocol for runtimes without an adapter.
 - `docs/INSTALL.md`: installing the user service, with hardening and recovery notes.
+- `docs/LLAMACPP.md`: the llama.cpp server and router adapter, router unload administration, and the real-server verification.
 - `docs/SERVING-COORDINATION.md`: request leases and the drain, sleep, and wake lifecycle.
 - `CONTRIBUTING.md`: branch model and checks.
 

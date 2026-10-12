@@ -778,6 +778,7 @@ impl WorkloadAdapter for HookAdapter {
                 request: ProbeRequest::get(self.status_url()),
                 expect_body_contains: None,
                 expect_body_absent: None,
+                expect_model_status: None,
             },
         })
     }

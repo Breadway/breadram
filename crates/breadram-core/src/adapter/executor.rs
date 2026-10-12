@@ -648,6 +648,12 @@ fn operation_note(
 
 /// Why a response body does not confirm the effect.
 fn unconfirmed(confirmation: &super::Confirmation, body: &str) -> String {
+    if let Some(check) = &confirmation.expect_model_status {
+        return format!(
+            "the provider does not report model {} with status {}, so the effect is not visible yet",
+            check.id, check.status
+        );
+    }
     match (
         &confirmation.expect_body_contains,
         &confirmation.expect_body_absent,

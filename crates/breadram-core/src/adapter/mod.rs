@@ -28,6 +28,7 @@ pub mod capability;
 pub mod executor;
 pub mod hook;
 pub mod http;
+pub mod llamacpp;
 pub mod mock;
 pub mod ollama;
 pub mod probe;
@@ -39,6 +40,7 @@ pub use hook::{
     HookRunner, HookStatus, HookVerb, HookWake, ProcessHookRunner,
 };
 pub use http::HttpTransport;
+pub use llamacpp::{LlamaCppAdapter, ModelStatus, ReportedModel};
 pub use mock::MockAdapter;
 pub use ollama::{LoadedModel, OllamaAdapter, OllamaError, GENERATE_PATH, PS_PATH, VERSION_PATH};
 pub use probe::{
@@ -112,6 +114,19 @@ impl OperationRequest {
     }
 }
 
+/// A structured confirmation: a specific model id must carry a specific status
+/// in the listing the probe returns.
+///
+/// This is preferred over the substring checks, which cannot tell two models
+/// apart when one id or status contains the other as a substring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelStatusCheck {
+    /// The exact model id to find.
+    pub id: String,
+    /// The status that id must have.
+    pub status: String,
+}
+
 /// A read-only check that an operation took effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confirmation {
@@ -127,6 +142,9 @@ pub struct Confirmation {
     /// A confirmation that checks neither is refused as unverifiable rather than
     /// treated as successful.
     pub expect_body_absent: Option<String>,
+    /// A structured model id plus status check, preferred over the substring
+    /// checks when present.
+    pub expect_model_status: Option<ModelStatusCheck>,
 }
 
 impl Confirmation {
@@ -136,6 +154,7 @@ impl Confirmation {
             request,
             expect_body_contains: Some(expected.into()),
             expect_body_absent: None,
+            expect_model_status: None,
         }
     }
 
@@ -145,14 +164,38 @@ impl Confirmation {
             request,
             expect_body_contains: None,
             expect_body_absent: Some(unexpected.into()),
+            expect_model_status: None,
+        }
+    }
+
+    /// A confirmation that a specific model id carries a specific status.
+    ///
+    /// This is the only form that cannot be fooled by a substring: it matches
+    /// the exact id and reads that entry's own status.
+    pub fn model_status(
+        request: ProbeRequest,
+        id: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            request,
+            expect_body_contains: None,
+            expect_body_absent: None,
+            expect_model_status: Some(ModelStatusCheck {
+                id: id.into(),
+                status: status.into(),
+            }),
         }
     }
 
     /// Whether a response body confirms the effect.
     ///
     /// An unverifiable confirmation, one that checks nothing, is never a
-    /// success.
+    /// success. A structured check is used in preference to the substrings.
     pub fn confirms(&self, body: &str) -> bool {
+        if let Some(check) = &self.expect_model_status {
+            return model_status_matches(body, check);
+        }
         match (&self.expect_body_contains, &self.expect_body_absent) {
             (None, None) => false,
             (contains, absent) => {
@@ -164,6 +207,37 @@ impl Confirmation {
                         .is_none_or(|unexpected| !body.contains(unexpected.as_str()))
             }
         }
+    }
+}
+
+/// Whether the listing names `check.id` and gives it exactly `check.status`.
+///
+/// The listing may be a bare array or wrapped in a `data` array. Two models that
+/// share a substring cannot cross-confirm, because the id must match exactly and
+/// the status is read from that same entry.
+fn model_status_matches(body: &str, check: &ModelStatusCheck) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let entries = match parsed.as_array() {
+        Some(entries) => entries,
+        None => match parsed.get("data").and_then(|value| value.as_array()) {
+            Some(entries) => entries,
+            None => return false,
+        },
+    };
+    entries.iter().any(|entry| {
+        entry.get("id").and_then(|value| value.as_str()) == Some(check.id.as_str())
+            && entry_status(entry) == Some(check.status.as_str())
+    })
+}
+
+/// The status of a listing entry, whether it is a bare string or an object with
+/// a `value` field, which is how the llama.cpp router nests it.
+fn entry_status(entry: &serde_json::Value) -> Option<&str> {
+    match entry.get("status")? {
+        serde_json::Value::String(status) => Some(status.as_str()),
+        other => other.get("value").and_then(|value| value.as_str()),
     }
 }
 
@@ -414,6 +488,36 @@ impl AdapterRegistry {
                             "provider {} is a hook with an invalid command, so it contributes nothing",
                             provider.name
                         )),
+                    }
+                }
+                ProviderKind::LlamaCpp => {
+                    let mut observation = vec![
+                        AdapterCapability::Discovery,
+                        AdapterCapability::Inventory,
+                        AdapterCapability::Activity,
+                    ];
+                    if provider.allow_automation {
+                        observation.push(AdapterCapability::UnloadModel);
+                    }
+                    let capabilities = AdapterCapabilities::configured(&observation);
+                    registry.register(Box::new(
+                        LlamaCppAdapter::new(
+                            provider.name.clone(),
+                            provider.url.clone(),
+                            scope.to_string(),
+                        )
+                        .with_capabilities(capabilities),
+                    ));
+                    if provider.allow_automation {
+                        notes.push(format!(
+                            "provider {} may unload a router model when automation allows it; the unload is confirmed by the exact model id and its status, and no host or device memory change is measured",
+                            provider.name
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "provider {} is observation only: automation is off, so no unload is offered; single-model manual sleep is not documented; generic controls apply",
+                            provider.name
+                        ));
                     }
                 }
                 other => notes.push(format!(
@@ -785,5 +889,25 @@ mod tests {
         let requests = registry.discovery_requests();
         assert_eq!(requests.len(), 1, "a shared endpoint is asked once");
         assert_eq!(requests[0].url, "http://127.0.0.1:2/breadram/capabilities");
+    }
+
+    #[test]
+    fn a_structured_model_check_cannot_be_fooled_by_a_substring() {
+        // Two ids where one contains the other, and statuses where one is a
+        // substring of the other. A substring confirmation can cross-confirm; the
+        // structured check reads the exact id's own status and must not.
+        let body = r#"[{"id":"llama","status":"loading"},{"id":"llama-2","status":"loaded"}]"#;
+        let request = || ProbeRequest::get("http://127.0.0.1:1/models");
+        assert!(
+            Confirmation::contains(request(), "loaded").confirms(body),
+            "a bare substring matches llama-2's status even when the question is about llama"
+        );
+        assert!(Confirmation::model_status(request(), "llama-2", "loaded").confirms(body));
+        assert!(
+            !Confirmation::model_status(request(), "llama", "loaded").confirms(body),
+            "llama is loading, so it must not be confirmed as loaded by its sibling"
+        );
+        assert!(!Confirmation::model_status(request(), "llama-3", "loaded").confirms(body));
+        assert!(Confirmation::model_status(request(), "llama", "loading").confirms(body));
     }
 }
