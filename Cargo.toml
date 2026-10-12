@@ -15,6 +15,10 @@ repository = "https://git.breadway.dev/Breadway/breadram"
 
 [workspace.dependencies]
 breadram-core = { path = "crates/breadram-core" }
+# The released bread client. Only the daemon links it, and only to publish
+# optional events and accept optional commands: everything it does degrades to
+# a no-op when breadd is absent, so breadram never requires bread.
+bread-utils = { git = "https://git.breadway.dev/Breadway/bread-ecosystem", tag = "v0.8.0", default-features = false, features = ["bread-client"] }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

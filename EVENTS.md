@@ -1,21 +1,39 @@
-# Optional bread integration: pending transport (RAM-17)
+# Optional bread integration (RAM-17)
 
-No bread event is emitted or command honored by this build yet. Standalone IPC
-remains the actual interface. The core has bounded correlation and timeout
-tracking with restricted request IDs and exact command namespace validation.
+breadram publishes bounded events and honors a small set of commands, but only
+while breadd is running and reports API version `1.7.0`. The client is
+`bread-utils` `v0.8.0` with the `bread-client` feature. Every call degrades to
+doing nothing when the bus is absent, slow, or speaks another version, so
+standalone IPC stays the interface and memory management never depends on bread.
 
-Planned schema version 1 commands: `bread.command.ram.status`, `.mode`, `.action`.
-Each payload must contain `version: 1` and `request_id` (1-128 ASCII alphanumeric,
-underscore or hyphen bytes). Mode adds a validated management mode; action adds
-an authorized stable target and supported action kind. Completion is a matching
-`bread.ram.<verb>.done` or `.failed`, with the same version and request ID. A
-publish acknowledgement, no listener, timeout, duplicate ID, or late reply is
-not successful execution. No arbitrary command/program field is allowed.
+The bus is rechecked at most every five seconds, and the command subscription
+reconnects on its own, so a bus that appears or restarts later is picked up
+without restarting breadram.
 
-Remaining acceptance: register `ram` in bread's current KNOWN_APPS, identify a
-released bread-utils revision containing the current client API, wire nonblocking
-daemon publication/subscription and reconnect, specify bounded pressure/capability
-and action payloads with units, test unsupported API versions and actual bus
-disconnects, and coordinate the cross-repo PR. Documentation.md lines 1600-1613
-is the reference read for this work, not historical memory. No registry change
-or released dependency support is claimed here.
+## Events
+
+Schema version 1. `bread.ram.pressure` carries `version`, `state` (healthy,
+recovering, pressured, or critical), `mode`, `available_bytes`, and
+`observed_at_ms`. Publishing is best effort: nobody listening is not a failure.
+
+## Commands
+
+`bread.command.ram.status`, `.mode`, and `.action`. Each payload must contain
+`version: 1` and `request_id` (1-128 ASCII alphanumeric, underscore, or hyphen
+bytes). Mode adds `mode` of `monitor` or `automatic`. Action adds `kind` of
+`unload_idle_model` or `cgroup_soft_limit`, and nothing that names a program.
+
+Completion is `bread.ram.<verb>.done` or `.failed` with the same version and
+request id. A duplicate, empty, or oversized id, an unsupported version, an
+unknown mode or kind, or a command that produces nothing within five seconds is
+a failure. A publish acknowledgement or a late reply is not success.
+
+A mode command changes the running mode in memory only. It does not rewrite the
+configuration file, and a restart returns to the mode in that file.
+
+## Still outside this build
+
+`ram` is registered in bread's `KNOWN_APPS` by a separate change in the bread
+repo, and commands are refused by the bus until that lands. Action commands are
+validated and answered here; carrying one out still goes through the planner,
+which only acts in automatic mode. No payload carries capabilities yet.
