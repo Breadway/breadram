@@ -17,10 +17,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use breadram_core::config::{ActionKind, Priority};
 use breadram_core::ipc::{
-    ActionJournalRecord, ActionsPayload, AppliedPayload, ClientMessage, DiagnosticsPayload,
-    ErrorCode, JournalSummary, MemoryBreakdown, OwnedValueRecord, PlanPayload,
-    PlannedActionPayload, PressureSummary, RequestBody, ResponseBody, RulesPayload, ServerMessage,
-    StatusPayload, WorkloadSummary, WorkloadsPayload, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ActionJournalRecord, ActionsPayload, AdmittedJobView, AppliedPayload, ClientMessage,
+    DiagnosticsPayload, ErrorCode, JobsPayload, JournalSummary, MemoryBreakdown, OwnedValueRecord,
+    PendingJobView, PlanPayload, PlannedActionPayload, PressureSummary, RequestBody, ResponseBody,
+    RulesPayload, ServerMessage, StatusPayload, WorkloadSummary, WorkloadsPayload, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 use breadram_core::telemetry::{
     CgroupSwap, OomManagement, SwapArea, SwapKind, SwapLayout, SwapLimit, WorkloadSwap, ZramDevice,
@@ -134,6 +135,28 @@ fn serve(stream: UnixStream) -> std::io::Result<()> {
             RequestBody::Rules => ResponseBody::Rules(Box::new(rules())),
             RequestBody::Actions => ResponseBody::Actions(Box::new(actions())),
             RequestBody::Diagnostics => ResponseBody::Diagnostics(Box::new(diagnostics())),
+            RequestBody::Jobs => ResponseBody::Jobs(Box::new(jobs())),
+            RequestBody::SubmitJob {
+                job_id,
+                estimate_bytes,
+                ..
+            } => {
+                let mut queue = jobs();
+                queue.pending.push(PendingJobView {
+                    id: job_id,
+                    reservation_bytes: estimate_bytes,
+                });
+                ResponseBody::Jobs(Box::new(queue))
+            }
+            RequestBody::LaunchJob { job_id } => {
+                let mut queue = jobs();
+                queue.admitted.push(AdmittedJobView {
+                    id: job_id,
+                    reservation_bytes: 0,
+                });
+                ResponseBody::Jobs(Box::new(queue))
+            }
+            RequestBody::CancelJob { .. } => ResponseBody::Jobs(Box::new(jobs())),
             RequestBody::SetMode { mode, persist } => {
                 ResponseBody::Applied(Box::new(AppliedPayload {
                     summary: format!("management mode set to {mode} (persist {persist})"),
@@ -373,6 +396,77 @@ fn diagnostics() -> DiagnosticsPayload {
     }
 }
 
+fn jobs() -> JobsPayload {
+    JobsPayload {
+        enabled: true,
+        total_budget_bytes: 8 * 1024 * 1024 * 1024,
+        reserved_bytes: 0,
+        pending: Vec::new(),
+        admitted: Vec::new(),
+        running: Vec::new(),
+        finished: Vec::new(),
+        admission_ready: true,
+        readiness_note: None,
+        notes: Vec::new(),
+    }
+}
+
+#[test]
+fn jobs_list_submit_and_cancel_round_trip_through_the_daemon() {
+    let socket = temp_socket("jobs");
+    start_daemon(&socket);
+    let socket_arg = socket.display().to_string();
+
+    let output = run(&["--socket", &socket_arg, "jobs"]);
+    assert_eq!(exit_code(&output), OK);
+    let text = stdout(&output);
+    assert!(text.contains("queue:      enabled"), "{text}");
+    assert!(text.contains("queued:     0 pending, 0 admitted"), "{text}");
+
+    let output = run(&[
+        "--socket",
+        &socket_arg,
+        "jobs",
+        "submit",
+        "--id",
+        "nightly-build",
+        "--estimate-bytes",
+        "1073741824",
+        "--",
+        "/usr/bin/make",
+        "-j4",
+    ]);
+    assert_eq!(exit_code(&output), OK);
+    let text = stdout(&output);
+    assert!(text.contains("pending:    nightly-build"), "{text}");
+
+    let output = run(&[
+        "--socket",
+        &socket_arg,
+        "jobs",
+        "launch",
+        "--id",
+        "nightly-build",
+    ]);
+    assert_eq!(exit_code(&output), OK);
+    let text = stdout(&output);
+    assert!(text.contains("admitted:   nightly-build"), "{text}");
+
+    let output = run(&[
+        "--socket",
+        &socket_arg,
+        "--json",
+        "jobs",
+        "cancel",
+        "--id",
+        "nightly-build",
+    ]);
+    assert_eq!(exit_code(&output), OK);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("valid JSON");
+    assert_eq!(value["pending"].as_array().expect("pending").len(), 0);
+    assert_eq!(value["enabled"], true);
+}
+
 #[test]
 fn a_missing_daemon_is_an_unavailable_exit_not_a_crash() {
     let socket = temp_socket("missing");
@@ -417,6 +511,7 @@ fn help_lists_the_core_commands() {
         "rules",
         "actions",
         "diagnostics",
+        "jobs",
         "mode",
         "protect",
     ] {

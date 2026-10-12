@@ -33,8 +33,9 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// to the diagnostics report. 3 adds the bounded trend samples. 4 adds the
 /// growth report paired with recorded relief. 5 adds the per workload priority
 /// and its source. 6 adds the per workload effective memory limit. 7 adds
-/// integrated GPU shared memory. Nothing was removed or renumbered.
-pub const PROTOCOL_MINOR: u16 = 7;
+/// integrated GPU shared memory. 8 adds the background job queue requests and
+/// the jobs report. Nothing was removed or renumbered.
+pub const PROTOCOL_MINOR: u16 = 8;
 
 /// The largest single message, in bytes. Oversized messages are rejected.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -130,6 +131,39 @@ pub enum RequestBody {
     Actions,
     /// The full diagnostic bundle.
     Diagnostics,
+    /// The background job queue: pending and admitted reservations.
+    Jobs,
+    /// Submit an explicitly opted-in background job to the queue.
+    SubmitJob {
+        /// The job id: 1 to 128 ASCII alphanumeric, hyphen, or underscore bytes.
+        /// Named job_id because the message envelope already carries id.
+        job_id: String,
+        /// The conservative upper-bound memory estimate in bytes. Zero means
+        /// the configured default estimate.
+        #[serde(default)]
+        estimate_bytes: u64,
+        /// The program and its arguments, executed directly with no shell.
+        /// The first entry must be an absolute path.
+        #[serde(default)]
+        argv: Vec<String>,
+        /// The working directory. The daemon's own when absent.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Extra environment entries as KEY=VALUE strings, applied over the
+        /// inherited environment. Never stored beyond the running job.
+        #[serde(default)]
+        env: Vec<String>,
+    },
+    /// Admit a queued job and launch it under supervision.
+    LaunchJob {
+        /// The queued job id to admit and launch.
+        job_id: String,
+    },
+    /// Cancel a queued job. Never stops an already admitted job.
+    CancelJob {
+        /// The job id to remove from the pending queue.
+        job_id: String,
+    },
     /// Change the management mode.
     SetMode {
         /// The mode to switch to.
@@ -269,6 +303,8 @@ pub enum ResponseBody {
     Actions(Box<ActionsPayload>),
     /// The diagnostic bundle.
     Diagnostics(Box<DiagnosticsPayload>),
+    /// The background job queue.
+    Jobs(Box<JobsPayload>),
     /// The result of a configuration change.
     Applied(Box<AppliedPayload>),
     /// An error.
@@ -423,6 +459,81 @@ pub struct ActionsPayload {
     pub history_capacity: usize,
     /// Why the history is empty, when the daemon is not executing anything.
     pub history_note: Option<String>,
+}
+
+/// One pending background job, as the daemon sees it.
+///
+/// Metadata only: no arguments, environment, working directory, prompts, or
+/// credentials are stored or reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingJobView {
+    /// The job id.
+    pub id: String,
+    /// The conservative upper-bound memory estimate in bytes.
+    pub reservation_bytes: u64,
+}
+
+/// One admitted reservation the daemon holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedJobView {
+    /// The job id.
+    pub id: String,
+    /// The reserved upper bound in bytes, raised by observed usage.
+    pub reservation_bytes: u64,
+}
+
+/// One running job under supervision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningJobView {
+    /// The job id.
+    pub id: String,
+    /// The reserved upper bound in bytes.
+    pub reservation_bytes: u64,
+}
+
+/// One finished job, remembered in a bounded list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishedJobView {
+    /// The job id.
+    pub id: String,
+    /// The exit code, absent when a signal ended the job.
+    pub exit_code: Option<i32>,
+    /// What happened, in words: exited, cancelled by the operator, or failed.
+    pub note: String,
+    /// The peak memory observed while it ran, when it could be read.
+    pub peak_bytes: Option<u64>,
+}
+
+/// The background job queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobsPayload {
+    /// Whether job admission is enabled in the daemon configuration.
+    pub enabled: bool,
+    /// The conservative total admission budget in bytes.
+    pub total_budget_bytes: u64,
+    /// Bytes currently reserved by admitted jobs.
+    pub reserved_bytes: u64,
+    /// Jobs waiting for admission, oldest first.
+    pub pending: Vec<PendingJobView>,
+    /// Reservations the daemon holds, by id.
+    pub admitted: Vec<AdmittedJobView>,
+    /// Jobs running under supervision, by id.
+    #[serde(default)]
+    pub running: Vec<RunningJobView>,
+    /// Recently finished jobs, newest last, bounded by the daemon.
+    #[serde(default)]
+    pub finished: Vec<FinishedJobView>,
+    /// Whether the daemon would admit right now: an observation exists and
+    /// pressure is healthy. Unknown or unhealthy pressure refuses all new
+    /// admissions. Defaults to false so an older report never reads as ready.
+    #[serde(default)]
+    pub admission_ready: bool,
+    /// Why admission is held, when it is. Absent when ready.
+    #[serde(default)]
+    pub readiness_note: Option<String>,
+    /// Anything a human should know when reading this report.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// The host memory figures, each from its own source.
@@ -693,9 +804,9 @@ pub fn default_socket_path() -> PathBuf {
 pub mod client {
     use super::{
         check_protocol, decode, encode, ActionsPayload, ApiError, AppliedPayload, ClientMessage,
-        DiagnosticsPayload, EventPayload, Hello, IpcError, PlanPayload, RequestBody, ResponseBody,
-        RulesPayload, ServerMessage, StatusPayload, WorkloadsPayload, MAX_MESSAGE_BYTES,
-        PROTOCOL_MAJOR, PROTOCOL_MINOR,
+        DiagnosticsPayload, EventPayload, Hello, IpcError, JobsPayload, PlanPayload, RequestBody,
+        ResponseBody, RulesPayload, ServerMessage, StatusPayload, WorkloadsPayload,
+        MAX_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
     };
     use crate::{CapabilityReport, ManagementMode};
     use std::path::Path;
@@ -836,6 +947,59 @@ pub mod client {
         pub async fn diagnostics(&mut self) -> Result<DiagnosticsPayload, ClientError> {
             match self.call(RequestBody::Diagnostics).await? {
                 ResponseBody::Diagnostics(diagnostics) => Ok(*diagnostics),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Request the background job queue.
+        pub async fn jobs(&mut self) -> Result<JobsPayload, ClientError> {
+            match self.call(RequestBody::Jobs).await? {
+                ResponseBody::Jobs(jobs) => Ok(*jobs),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Submit an explicitly opted-in background job. Zero estimates use the
+        /// configured default. Returns the queue after the change.
+        pub async fn submit_job(
+            &mut self,
+            job_id: String,
+            estimate_bytes: u64,
+            argv: Vec<String>,
+            cwd: Option<String>,
+            env: Vec<String>,
+        ) -> Result<JobsPayload, ClientError> {
+            match self
+                .call(RequestBody::SubmitJob {
+                    job_id,
+                    estimate_bytes,
+                    argv,
+                    cwd,
+                    env,
+                })
+                .await?
+            {
+                ResponseBody::Jobs(jobs) => Ok(*jobs),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Admit a queued job and launch it under supervision.
+        pub async fn launch_job(&mut self, job_id: String) -> Result<JobsPayload, ClientError> {
+            match self.call(RequestBody::LaunchJob { job_id }).await? {
+                ResponseBody::Jobs(jobs) => Ok(*jobs),
+                ResponseBody::Error(err) => Err(ClientError::Api(err)),
+                other => Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+
+        /// Cancel a queued job. Returns the queue after the change.
+        pub async fn cancel_job(&mut self, job_id: String) -> Result<JobsPayload, ClientError> {
+            match self.call(RequestBody::CancelJob { job_id }).await? {
+                ResponseBody::Jobs(jobs) => Ok(*jobs),
                 ResponseBody::Error(err) => Err(ClientError::Api(err)),
                 other => Err(ClientError::Unexpected(format!("{other:?}"))),
             }
@@ -991,14 +1155,39 @@ mod tests {
     }
 
     #[test]
+    fn a_jobs_report_round_trips() {
+        let message = ServerMessage {
+            id: 9,
+            body: ResponseBody::Jobs(Box::new(JobsPayload {
+                enabled: true,
+                total_budget_bytes: 8 * 1024 * 1024 * 1024,
+                reserved_bytes: 0,
+                pending: vec![PendingJobView {
+                    id: "nightly-build".to_string(),
+                    reservation_bytes: 1024,
+                }],
+                admitted: Vec::new(),
+                running: Vec::new(),
+                finished: Vec::new(),
+                admission_ready: true,
+                readiness_note: None,
+                notes: vec!["admission runs only in automatic mode".to_string()],
+            })),
+        };
+        let line = encode(&message).unwrap();
+        let decoded: ServerMessage = decode(&line).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
     fn a_diagnostics_payload_from_the_previous_minor_version_still_decodes() {
         // The swap section was added in minor version 2, the trend samples in 3, the
         // growth report in 4, the per workload priority and source in 5, the per
-        // workload effective memory limit in 6, and integrated GPU shared memory in
-        // 7. A client that speaks an older minor must still be able to read a report
+        // workload effective memory limit in 6, integrated GPU shared memory in
+        // 7, and the background job queue in 8. A client that speaks an older minor must still be able to read a report
         // from this build, and a report written before each addition must still
         // decode here, which is why those fields are defaulted rather than required.
-        assert_eq!(PROTOCOL_MINOR, 7);
+        assert_eq!(PROTOCOL_MINOR, 8);
         let older = r#"{
             "mode": "monitor",
             "version": "0.1.0",
@@ -1059,6 +1248,20 @@ mod tests {
             RequestBody::Rules,
             RequestBody::Actions,
             RequestBody::Diagnostics,
+            RequestBody::Jobs,
+            RequestBody::SubmitJob {
+                job_id: "nightly-build".to_string(),
+                estimate_bytes: 0,
+                argv: vec!["/usr/bin/make".to_string()],
+                cwd: None,
+                env: Vec::new(),
+            },
+            RequestBody::LaunchJob {
+                job_id: "nightly-build".to_string(),
+            },
+            RequestBody::CancelJob {
+                job_id: "nightly-build".to_string(),
+            },
             RequestBody::SetMode {
                 mode: ManagementMode::Automatic,
                 persist: true,

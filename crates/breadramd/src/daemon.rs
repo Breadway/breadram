@@ -6,10 +6,11 @@
 //! slow or stalled client can only affect itself. Optional integrations do not
 //! exist yet, so an absent integration cannot stall anything.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
@@ -24,10 +25,14 @@ use breadram_core::execution::{execute_plan, ExecutionPass};
 use breadram_core::inventory::{collect_inventory, MemoryAccounting, Workload};
 use breadram_core::ipc::{
     self, control_level_name, decode, encode, pressure_state_name, ActionJournalRecord,
-    ActionsPayload, ApiError, AppliedPayload, ClientMessage, DiagnosticsPayload, ErrorCode,
-    EventPayload, JournalSummary, MemoryBreakdown, PlanPayload, PressureSummary, RequestBody,
-    ResponseBody, RulesPayload, ServerMessage, StatusPayload, WorkloadSummary, WorkloadsPayload,
+    ActionsPayload, AdmittedJobView, ApiError, AppliedPayload, ClientMessage, DiagnosticsPayload,
+    ErrorCode, EventPayload, FinishedJobView, JobsPayload, JournalSummary, MemoryBreakdown,
+    PendingJobView, PlanPayload, PressureSummary, RequestBody, ResponseBody, RulesPayload,
+    RunningJobView, ServerMessage, StatusPayload, WorkloadSummary, WorkloadsPayload,
     MAX_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+};
+use breadram_core::jobs::{
+    AdmissionQueue, PendingJob, PersistedAdmissions, MAX_PERSISTED_ADMISSIONS,
 };
 use breadram_core::policy::{
     explain_priority, plan as plan_actions, serves_protected, ActivityEvidence, ActivitySource,
@@ -46,7 +51,7 @@ use breadram_core::{CapabilityReport, ManagementMode, VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// How many events a slow client may fall behind before it starts dropping.
 const EVENT_CHANNEL_CAPACITY: usize = 16;
@@ -106,7 +111,71 @@ struct SharedState {
     interval_ms: u64,
     socket_uid: u32,
     clock: SystemClock,
+    /// Explicitly opted-in background jobs waiting for or holding admission
+    /// reservations. The daemon owns the queue and supervises what launches
+    /// from it, explicitly or through the opted-in automatic loop.
+    jobs: Mutex<AdmissionQueue>,
+    /// Admission ids a previous run recorded. This run refuses to reuse them:
+    /// it cannot prove a recorded process is still its own.
+    jobs_refused: RwLock<Vec<String>>,
+    /// Launch specifications by job id. Memory only: never persisted,
+    /// journalled, or reported, so arguments, directories, and environment
+    /// never leave the running daemon.
+    job_specs: Mutex<HashMap<String, JobSpec>>,
+    /// Supervised children by job id, for cancellation.
+    job_running: Mutex<HashMap<String, JobCancel>>,
+    /// Recently finished jobs, newest last, bounded.
+    job_finished: Mutex<VecDeque<FinishedJob>>,
 }
+
+/// What to execute for one admitted job.
+///
+/// Arguments, the working directory, and the environment travel only as far as
+/// the spawn call: they are never persisted, journalled, or reported.
+#[derive(Debug, Clone)]
+struct JobSpec {
+    /// The program and its arguments, executed directly with no shell.
+    argv: Vec<String>,
+    /// The working directory. The daemon's own when absent.
+    cwd: Option<String>,
+    /// Extra environment entries as KEY=VALUE strings, applied over the
+    /// inherited environment.
+    env: Vec<String>,
+}
+
+/// How to stop one supervised job.
+struct JobCancel {
+    /// Cancelling the supervisor stops the scope and the waiter.
+    cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+/// One finished job, remembered in a bounded list.
+#[derive(Debug, Clone)]
+struct FinishedJob {
+    /// The job id.
+    id: String,
+    /// The exit code, absent when a signal ended the job.
+    exit_code: Option<i32>,
+    /// What happened, in words.
+    note: String,
+    /// The peak memory observed while it ran, when it could be read.
+    peak_bytes: Option<u64>,
+}
+
+/// How many finished jobs the report remembers.
+const MAX_FINISHED_JOBS: usize = 32;
+/// The most arguments one submit may carry.
+const MAX_JOB_ARGC: usize = 128;
+/// The most bytes one argument may carry.
+const MAX_JOB_ARG_BYTES: usize = 4096;
+/// How long a cancelled scope has to empty after SIGTERM before SIGKILL.
+const JOB_STOP_GRACE: Duration = Duration::from_secs(5);
+/// How often a running job's memory peak is sampled.
+const JOB_PEAK_INTERVAL: Duration = Duration::from_millis(100);
+/// The cgroup hierarchy root for scope discovery.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+/// The scope unit name prefix for supervised jobs.
+const JOB_SCOPE_PREFIX: &str = "breadram-job-";
 
 /// The last complete observation.
 ///
@@ -152,6 +221,19 @@ enum Action {
     Continue,
     Close,
     Subscribed(broadcast::Receiver<EventPayload>),
+    /// Start supervision for an admitted job, then remember the queue.
+    LaunchJob {
+        /// The job id.
+        id: String,
+        /// What to execute. Memory only, never persisted.
+        spec: JobSpec,
+        /// The admitted reservation in bytes.
+        reservation: u64,
+        /// The scope unit the job runs in.
+        scope_unit: String,
+        /// The supervisor's cancellation receiver.
+        cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    },
 }
 
 /// Run the daemon until it receives SIGINT or SIGTERM.
@@ -222,6 +304,7 @@ pub async fn run_with_config_path(
     };
 
     let journal_capacity = config.history.max_records as usize;
+    let job_capacity = config.jobs.max_queued as usize;
     let (events, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     let state = Arc::new(SharedState {
         trends: RwLock::new(TrendHistory::new(0, 0)),
@@ -232,6 +315,11 @@ pub async fn run_with_config_path(
         config_path,
         socket: socket.clone(),
         journal: RwLock::new(ActionJournal::new(journal_capacity)),
+        jobs: Mutex::new(AdmissionQueue::new(job_capacity)),
+        jobs_refused: RwLock::new(Vec::new()),
+        job_specs: Mutex::new(HashMap::new()),
+        job_running: Mutex::new(HashMap::new()),
+        job_finished: Mutex::new(VecDeque::new()),
         execution_notes: RwLock::new(Vec::new()),
         state_path: default_state_path(),
         cancel: Cancellation::new(),
@@ -242,6 +330,14 @@ pub async fn run_with_config_path(
     });
 
     spawn_monitor(Arc::clone(&state), interval);
+
+    // A previous run's admission record is refused, never re-admitted: this
+    // run cannot prove a recorded process is still its own.
+    {
+        let (refused, notes) = load_refused_admissions(state.state_path.as_deref());
+        *state.jobs_refused.write().await = refused;
+        state.execution_notes.write().await.extend(notes);
+    }
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -261,6 +357,13 @@ pub async fn run_with_config_path(
         }
     }
 
+    // Owned lifecycle: the daemon stops the jobs it supervises before it
+    // goes away, so nothing it admitted keeps running unmanaged. Scopes from
+    // a violently killed run are not touched here: their ids stay refused and
+    // a launch collides with a lingering scope by name, so they cannot be
+    // mistaken for this run's work.
+    stop_all_jobs(&state).await;
+
     // Ask a write in flight to stop before the last one starts. Nothing is
     // interrupted part way through: the flag is only read between actions.
     state.cancel.cancel();
@@ -268,6 +371,37 @@ pub async fn run_with_config_path(
     drop(listener);
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+/// Stop every supervised job: SIGTERM to each scope, a short grace, then
+/// SIGKILL to stragglers. Best effort and bounded, so shutdown stays prompt.
+async fn stop_all_jobs(state: &SharedState) {
+    let ids: Vec<String> = state.job_running.lock().await.keys().cloned().collect();
+    if ids.is_empty() {
+        return;
+    }
+    for id in &ids {
+        kill_scope_unit(&job_scope_unit(id), "TERM");
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if ids
+            .iter()
+            .all(|id| find_scope_dir(Path::new(CGROUP_ROOT), &job_scope_unit(id)).is_none())
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for id in &ids {
+        let unit = job_scope_unit(id);
+        if find_scope_dir(Path::new(CGROUP_ROOT), &unit).is_some() {
+            kill_scope_unit(&unit, "KILL");
+        }
+    }
 }
 
 /// The bounded path to the configured providers.
@@ -534,6 +668,16 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                 );
             }
             *state.published.write().await = published;
+            {
+                let config = state.config.read().await;
+                if config.mode == ManagementMode::Automatic
+                    && config.jobs.enabled
+                    && config.jobs.auto_launch
+                {
+                    drop(config);
+                    auto_launch(&state).await;
+                }
+            }
             let _ = state.events.send(EventPayload {
                 kind: "status".to_string(),
                 observed_at_ms: status.observed_at_ms,
@@ -987,6 +1131,31 @@ async fn serve_connection(stream: UnixStream, state: Arc<SharedState>) -> std::i
             Action::Continue => {}
             Action::Close => break,
             Action::Subscribed(receiver) => next_subscription = Some(receiver),
+            Action::LaunchJob {
+                id,
+                spec,
+                reservation,
+                scope_unit,
+                cancel_rx,
+            } => {
+                // Supervision starts first. The record is re-read under the
+                // lock afterward, so a completion that already ran is never
+                // overwritten by this launch's record.
+                tokio::spawn(supervise_job(
+                    Arc::clone(&state),
+                    id,
+                    spec,
+                    reservation,
+                    scope_unit,
+                    cancel_rx,
+                ));
+                let queue = state.jobs.lock().await;
+                let record =
+                    PersistedAdmissions::from_queue(&queue, MAX_PERSISTED_ADMISSIONS).encode();
+                let empty = queue.pending().count() == 0 && queue.admitted().count() == 0;
+                drop(queue);
+                persist_jobs(&state, record, empty).await;
+            }
         }
         if let Some(receiver) = next_subscription {
             subscription = Some(receiver);
@@ -1149,6 +1318,140 @@ async fn handle_request(
             };
             send_result(write, message.id, result).await
         }
+        RequestBody::Jobs => {
+            let queue = state.jobs.lock().await;
+            let payload = jobs_report(state, &queue).await;
+            send_message(write, message.id, ResponseBody::Jobs(Box::new(payload))).await?;
+            Ok(Action::Continue)
+        }
+        RequestBody::SubmitJob {
+            job_id,
+            estimate_bytes,
+            argv,
+            cwd,
+            env,
+        } => {
+            let config = state.config.read().await.clone();
+            if !config.jobs.enabled {
+                return send_result(
+                    write,
+                    message.id,
+                    Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "background job admission is disabled: set [jobs] enabled to use it",
+                    )),
+                )
+                .await;
+            }
+            let estimate = if estimate_bytes == 0 {
+                config.jobs.default_estimate_bytes
+            } else {
+                estimate_bytes
+            };
+            let result = match check_submit_spec(&argv, &cwd, &env) {
+                Err(reason) => Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("the job was not queued: {reason}"),
+                )),
+                Ok(()) => {
+                    let mut queue = state.jobs.lock().await;
+                    if state.jobs_refused.read().await.contains(&job_id) {
+                        Err(ApiError::new(
+                            ErrorCode::BadRequest,
+                            format!(
+                                "the id {job_id} was admitted by a previous run: choose a new id"
+                            ),
+                        ))
+                    } else {
+                        match queue.submit(
+                            PendingJob {
+                                id: job_id.clone(),
+                                reservation_bytes: estimate,
+                            },
+                            true,
+                        ) {
+                            Ok(()) => {
+                                state.job_specs.lock().await.insert(
+                                    job_id.clone(),
+                                    JobSpec {
+                                        argv: argv.clone(),
+                                        cwd: cwd.clone(),
+                                        env: env.clone(),
+                                    },
+                                );
+                                let payload = jobs_report(state, &queue).await;
+                                let record = PersistedAdmissions::from_queue(
+                                    &queue,
+                                    MAX_PERSISTED_ADMISSIONS,
+                                )
+                                .encode();
+                                let empty =
+                                    queue.pending().count() == 0 && queue.admitted().count() == 0;
+                                drop(queue);
+                                persist_jobs(state, record, empty).await;
+                                Ok(ResponseBody::Jobs(Box::new(payload)))
+                            }
+                            Err(err) => Err(ApiError::new(
+                                ErrorCode::BadRequest,
+                                format!("the job was not queued: {err:?}"),
+                            )),
+                        }
+                    }
+                }
+            };
+            send_result(write, message.id, result).await
+        }
+        RequestBody::LaunchJob { job_id } => match launch_job(state, &job_id).await {
+            Ok(launch) => {
+                send_message(
+                    write,
+                    message.id,
+                    ResponseBody::Jobs(Box::new(launch.payload)),
+                )
+                .await?;
+                Ok(Action::LaunchJob {
+                    id: launch.id,
+                    spec: launch.spec,
+                    reservation: launch.reservation,
+                    scope_unit: launch.scope_unit,
+                    cancel_rx: launch.cancel_rx,
+                })
+            }
+            Err(err) => send_result(write, message.id, Err(err)).await,
+        },
+        RequestBody::CancelJob { job_id } => {
+            // A running job stops through its supervisor; a pending job leaves
+            // the queue. The report that follows describes the queue after the
+            // change in both cases.
+            // Bind the removal first: a guard held by an if-let scrutinee
+            // lives through the body, which would deadlock the report below
+            // when it locks the same map.
+            let handle = state.job_running.lock().await.remove(&job_id);
+            if let Some(handle) = handle {
+                let _ = handle.cancel.send(());
+                let queue = state.jobs.lock().await;
+                let payload = jobs_report(state, &queue).await;
+                send_message(write, message.id, ResponseBody::Jobs(Box::new(payload))).await?;
+                return Ok(Action::Continue);
+            }
+            let mut queue = state.jobs.lock().await;
+            let result = if queue.cancel(&job_id) {
+                state.job_specs.lock().await.remove(&job_id);
+                let payload = jobs_report(state, &queue).await;
+                let record =
+                    PersistedAdmissions::from_queue(&queue, MAX_PERSISTED_ADMISSIONS).encode();
+                let empty = queue.pending().count() == 0 && queue.admitted().count() == 0;
+                drop(queue);
+                persist_jobs(state, record, empty).await;
+                Ok(ResponseBody::Jobs(Box::new(payload)))
+            } else {
+                Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("no queued job named {job_id}: only pending jobs can be cancelled"),
+                ))
+            };
+            send_result(write, message.id, result).await
+        }
         RequestBody::SetMode { mode, persist } => {
             let mut next = state.config.read().await.clone();
             next.mode = mode;
@@ -1220,6 +1523,693 @@ fn workloads_payload(published: &Published) -> WorkloadsPayload {
             .map(|workload| workload_summary(workload, &published.priorities))
             .collect(),
         capabilities: published.inventory_capabilities.clone(),
+    }
+}
+
+/// Try one automatic launch per monitor pass: with auto_launch set, the head
+/// of the queue starts as soon as pressure and budget permit. Only the head
+/// is attempted, so a younger job never overtakes an older one, and an
+/// over-budget head simply waits for completions. Routine refusals stay at
+/// debug level; only supervision startup failures are warned about by the
+/// paths they already travel.
+async fn auto_launch(state: &Arc<SharedState>) {
+    let head = {
+        let queue = state.jobs.lock().await;
+        let mut pending = queue.pending();
+        let head = pending.next().map(|job| job.id.clone());
+        drop(pending);
+        head
+    };
+    let Some(id) = head else {
+        return;
+    };
+    match launch_job(state, &id).await {
+        Ok(launch) => {
+            let Launch {
+                id,
+                spec,
+                reservation,
+                scope_unit,
+                cancel_rx,
+                ..
+            } = launch;
+            tokio::spawn(supervise_job(
+                Arc::clone(state),
+                id,
+                spec,
+                reservation,
+                scope_unit,
+                cancel_rx,
+            ));
+            let queue = state.jobs.lock().await;
+            let record = PersistedAdmissions::from_queue(&queue, MAX_PERSISTED_ADMISSIONS).encode();
+            let empty = queue.pending().count() == 0 && queue.admitted().count() == 0;
+            drop(queue);
+            persist_jobs(state, record, empty).await;
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "automatic launch held the queue head");
+        }
+    }
+}
+
+/// Present the background job queue for the wire.
+///
+/// Reads no lock the caller holds: every arm reads configuration and
+/// observation first, then locks the queue, then reports.
+async fn jobs_report(state: &SharedState, queue: &AdmissionQueue) -> JobsPayload {
+    let config = state.config.read().await.clone();
+    let published = state.published.read().await.clone();
+    let refused = state.jobs_refused.read().await.clone();
+    let running = state
+        .job_running
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let finished = state.job_finished.lock().await.clone();
+    jobs_payload(&config, queue, &published, &refused, &running, &finished)
+}
+
+/// What a launch admitted: everything the connection loop needs to start
+/// supervision and remember it.
+struct Launch {
+    /// The job id.
+    id: String,
+    /// What to execute. Memory only, never persisted.
+    spec: JobSpec,
+    /// The admitted reservation in bytes.
+    reservation: u64,
+    /// The scope unit the job runs in.
+    scope_unit: String,
+    /// The supervisor's cancellation receiver.
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    /// The queue report after admission.
+    payload: JobsPayload,
+}
+
+/// Admit the oldest pending job when it is the requested one, and prepare its
+/// supervision.
+///
+/// Admission stays strict FIFO: only the head of the queue can launch, so a
+/// younger job never overtakes an older one. Launches arrive explicitly or
+/// from the opted-in automatic loop; either way the daemon supervises exactly
+/// what an operator asked it to run. The caller spawns supervision first and
+/// persists second, so a completion that already ran is never overwritten by
+/// a stale record.
+async fn launch_job(state: &SharedState, job_id: &str) -> Result<Launch, ApiError> {
+    let config = state.config.read().await.clone();
+    if !config.jobs.enabled {
+        return Err(ApiError::new(
+            ErrorCode::Unavailable,
+            "background job admission is disabled: set [jobs] enabled to use it",
+        ));
+    }
+    if !have_job_supervision() {
+        return Err(ApiError::new(
+            ErrorCode::Unavailable,
+            "launch needs a systemd user session: systemd-run is unavailable or XDG_RUNTIME_DIR is unset",
+        ));
+    }
+    let spec = state
+        .job_specs
+        .lock()
+        .await
+        .get(job_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("no queued job named {job_id}: submit it before launching"),
+            )
+        })?;
+    if let Err(reason) = check_launch_paths(&spec.argv, &spec.cwd) {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            format!("the job cannot launch: {reason}"),
+        ));
+    }
+    let scope_unit = job_scope_unit(job_id);
+    if find_scope_dir(Path::new(CGROUP_ROOT), &scope_unit).is_some() {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            format!("a scope for {job_id} already exists: it outlived a previous run"),
+        ));
+    }
+    let published = state.published.read().await.clone();
+    let healthy = published.snapshot.is_some() && published.pressure == PressureState::Healthy;
+    if !healthy {
+        return Err(ApiError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "pressure is {}: launch is refused until the host is healthy",
+                pressure_state_name(published.pressure)
+            ),
+        ));
+    }
+    let mut queue = state.jobs.lock().await;
+    let head_is_mine = queue
+        .pending()
+        .next()
+        .map(|job| job.id == job_id)
+        .unwrap_or(false);
+    if !head_is_mine {
+        let ahead = queue
+            .pending()
+            .next()
+            .map(|job| job.id.clone())
+            .unwrap_or_default();
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            if ahead.is_empty() {
+                format!("no queued job named {job_id}: submit it before launching")
+            } else {
+                format!("{ahead} is ahead of {job_id}: the queue launches in order")
+            },
+        ));
+    }
+    let admitted = queue
+        .admit(Some(config.jobs.total_budget_bytes), true)
+        .filter(|job| job.id == job_id)
+        .map(|job| job.reservation_bytes);
+    let Some(reservation) = admitted else {
+        let remaining = config
+            .jobs
+            .total_budget_bytes
+            .saturating_sub(queue.reserved_bytes());
+        return Err(ApiError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "the reservation does not fit the remaining budget ({remaining} bytes left): \
+                 cancel it or raise [jobs] total_budget_bytes"
+            ),
+        ));
+    };
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    state
+        .job_running
+        .lock()
+        .await
+        .insert(job_id.to_string(), JobCancel { cancel: cancel_tx });
+    let payload = jobs_report(state, &queue).await;
+    drop(queue);
+    Ok(Launch {
+        id: job_id.to_string(),
+        spec,
+        reservation,
+        scope_unit,
+        cancel_rx,
+        payload,
+    })
+}
+
+/// How a supervised job ended.
+enum Supervised {
+    /// The waiter observed an exit status.
+    Exited(std::process::ExitStatus),
+    /// The waiter itself failed before any status arrived.
+    Failed(String),
+    /// The operator cancelled it.
+    Cancelled,
+}
+
+/// Run one admitted job to completion inside a transient user scope.
+///
+/// The scope bounds memory at the reservation and cleans up when it empties;
+/// the program runs directly with no shell. Standard streams are discarded:
+/// output is data the queue must never hold.
+async fn supervise_job(
+    state: Arc<SharedState>,
+    id: String,
+    spec: JobSpec,
+    reservation: u64,
+    scope_unit: String,
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut command = tokio::process::Command::new("systemd-run");
+    // All systemd-run options precede the `--` separator: anything after it
+    // is the job's own command line, passed verbatim with no shell.
+    command.args([
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        &format!("--unit={scope_unit}"),
+        "-p",
+        &format!("MemoryMax={reservation}"),
+        "-p",
+        &format!("MemorySwapMax={reservation}"),
+    ]);
+    if let Some(dir) = &spec.cwd {
+        command.arg(format!("--working-directory={dir}"));
+    }
+    command.arg("--").args(&spec.argv);
+    for entry in &spec.env {
+        if let Some((key, value)) = entry.split_once('=') {
+            command.env(key, value);
+        }
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            finish_job(
+                &state,
+                &id,
+                None,
+                format!("the job failed to start: {err}"),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+    let mut peak = 0u64;
+    let outcome = loop {
+        tokio::select! {
+            status = child.wait() => break match status {
+                Ok(exit) => Supervised::Exited(exit),
+                Err(err) => Supervised::Failed(err.to_string()),
+            },
+            _ = &mut cancel => break Supervised::Cancelled,
+            _ = tokio::time::sleep(JOB_PEAK_INTERVAL) => {
+                if let Some(sample) = read_scope_peak(Path::new(CGROUP_ROOT), &scope_unit) {
+                    peak = peak.max(sample);
+                }
+            }
+        }
+    };
+    match outcome {
+        Supervised::Cancelled => {
+            // Stop the scope gracefully, then forcefully: the waiter alone
+            // cannot stop the scope's members.
+            kill_scope_unit(&scope_unit, "TERM");
+            let deadline = Instant::now() + JOB_STOP_GRACE;
+            while find_scope_dir(Path::new(CGROUP_ROOT), &scope_unit).is_some()
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if find_scope_dir(Path::new(CGROUP_ROOT), &scope_unit).is_some() {
+                kill_scope_unit(&scope_unit, "KILL");
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            finish_job(
+                &state,
+                &id,
+                None,
+                "cancelled by the operator".to_string(),
+                Some(peak),
+            )
+            .await;
+        }
+        Supervised::Exited(status) => {
+            if let Some(sample) = read_scope_peak(Path::new(CGROUP_ROOT), &scope_unit) {
+                peak = peak.max(sample);
+            }
+            let (code, note) = exit_note(&status);
+            finish_job(&state, &id, code, note, Some(peak)).await;
+        }
+        Supervised::Failed(err) => {
+            finish_job(
+                &state,
+                &id,
+                None,
+                format!("the supervisor failed before any status arrived: {err}"),
+                Some(peak),
+            )
+            .await;
+        }
+    }
+}
+
+/// Describe an exit status without inventing one.
+fn exit_note(status: &std::process::ExitStatus) -> (Option<i32>, String) {
+    use std::os::unix::process::ExitStatusExt;
+    match status.code() {
+        Some(code) => (
+            Some(code),
+            if code == 0 {
+                "exited cleanly".to_string()
+            } else {
+                format!("exited with code {code}")
+            },
+        ),
+        None => (
+            None,
+            format!(
+                "ended by signal {}",
+                status
+                    .signal()
+                    .map(|signal| signal.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            ),
+        ),
+    }
+}
+
+/// Remember a finished job in the bounded list, newest last.
+fn push_finished(finished: &mut VecDeque<FinishedJob>, item: FinishedJob) {
+    finished.push_back(item);
+    while finished.len() > MAX_FINISHED_JOBS {
+        finished.pop_front();
+    }
+}
+
+/// Release a job's reservation, remember how it ended, and persist the queue.
+///
+/// Runs once per job, from the supervisor that owned it.
+async fn finish_job(
+    state: &Arc<SharedState>,
+    id: &str,
+    exit_code: Option<i32>,
+    note: String,
+    peak_bytes: Option<u64>,
+) {
+    let mut queue = state.jobs.lock().await;
+    if let Some(peak) = peak_bytes {
+        queue.observe_usage(id, peak);
+    }
+    queue.complete(id);
+    state.job_specs.lock().await.remove(id);
+    state.job_running.lock().await.remove(id);
+    {
+        let mut finished = state.job_finished.lock().await;
+        push_finished(
+            &mut finished,
+            FinishedJob {
+                id: id.to_string(),
+                exit_code,
+                note,
+                peak_bytes,
+            },
+        );
+    }
+    let record = PersistedAdmissions::from_queue(&queue, MAX_PERSISTED_ADMISSIONS).encode();
+    let empty = queue.pending().count() == 0 && queue.admitted().count() == 0;
+    drop(queue);
+    persist_jobs(state, record, empty).await;
+}
+
+/// Remember the queue beside the journal state file, when there is somewhere
+/// to put it. A restart refuses the record rather than re-admitting it.
+///
+/// An empty queue removes the record instead of writing one, so submitting and
+/// then cancelling every job leaves no file behind: a missing file stays the
+/// ordinary first run.
+async fn persist_jobs(state: &SharedState, record: String, empty: bool) {
+    let Some(path) = jobs_state_path(state.state_path.as_deref()) else {
+        return;
+    };
+    let written = tokio::task::spawn_blocking(move || {
+        if empty {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        write_state_file(&path, &record)
+    })
+    .await;
+    if let Ok(Err(err)) = written {
+        tracing::warn!(error = %err, "the job queue could not be written");
+    }
+}
+
+/// Check a submit's execution fields before anything is queued.
+///
+/// Arguments, the directory, and the environment are validated here so a job
+/// that could never launch is refused at submit time rather than at launch.
+fn check_submit_spec(argv: &[String], cwd: &Option<String>, env: &[String]) -> Result<(), String> {
+    if argv.is_empty() {
+        return Err(
+            "submit needs a program: pass arguments after --, for example -- /usr/bin/make -j4"
+                .to_string(),
+        );
+    }
+    if argv.len() > MAX_JOB_ARGC {
+        return Err(format!("at most {MAX_JOB_ARGC} arguments are accepted"));
+    }
+    for arg in argv {
+        if arg.len() > MAX_JOB_ARG_BYTES {
+            return Err(format!("an argument exceeds {MAX_JOB_ARG_BYTES} bytes"));
+        }
+        if arg.contains('\0') {
+            return Err("arguments must not contain NUL bytes".to_string());
+        }
+    }
+    if !argv[0].starts_with('/') {
+        return Err(format!(
+            "the program must be an absolute path, not {}: no PATH lookup is performed",
+            argv[0]
+        ));
+    }
+    if let Some(dir) = cwd {
+        if dir.is_empty() {
+            return Err("the working directory must not be empty".to_string());
+        }
+        if dir.contains('\0') {
+            return Err("the working directory must not contain NUL bytes".to_string());
+        }
+    }
+    for entry in env {
+        let (key, _) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("environment entry {entry:?} must be KEY=VALUE"))?;
+        if key.is_empty() || key.contains('\0') {
+            return Err(format!("environment entry {entry:?} has no usable key"));
+        }
+    }
+    Ok(())
+}
+
+/// Check the launch-time facts a submit cannot prove: the program exists and
+/// is executable, and the working directory exists and is a directory.
+fn check_launch_paths(argv: &[String], cwd: &Option<String>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let program = &argv[0];
+    let metadata = std::fs::metadata(program)
+        .map_err(|_| format!("the program {program} could not be read"))?;
+    if !metadata.is_file() {
+        return Err(format!("the program {program} is not a file"));
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!("the program {program} is not executable"));
+    }
+    if let Some(dir) = cwd {
+        let metadata =
+            std::fs::metadata(dir).map_err(|_| format!("the directory {dir} could not be read"))?;
+        if !metadata.is_dir() {
+            return Err(format!("the working directory {dir} is not a directory"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a systemd user session can supervise a job here.
+fn have_job_supervision() -> bool {
+    if std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|dir| dir.is_empty())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    std::process::Command::new("systemd-run")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The scope unit name for a job id. Ids are restricted to unit-safe bytes at
+/// submit time, so no further sanitizing is needed.
+fn job_scope_unit(id: &str) -> String {
+    format!("{JOB_SCOPE_PREFIX}{id}.scope")
+}
+
+/// Find a scope unit's cgroup directory under a hierarchy root.
+fn find_scope_dir(root: &Path, unit: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, unit: &str, depth: usize, found: &mut Option<PathBuf>) {
+        if found.is_some() || depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(unit) {
+                *found = Some(path);
+                return;
+            }
+            if path.is_dir() {
+                walk(&path, unit, depth - 1, found);
+            }
+        }
+    }
+    let mut found = None;
+    walk(root, unit, 8, &mut found);
+    found
+}
+
+/// Read a scope's peak memory in bytes, when the scope still exists.
+fn read_scope_peak(root: &Path, unit: &str) -> Option<u64> {
+    let dir = find_scope_dir(root, unit)?;
+    let text = std::fs::read_to_string(dir.join("memory.peak")).ok()?;
+    text.trim().parse().ok()
+}
+
+/// Signal every process in a scope unit, best effort.
+fn kill_scope_unit(unit: &str, signal: &str) {
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "kill", unit, &format!("--signal={signal}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// The job queue record beside the journal state file, when there is somewhere
+/// to put it.
+fn jobs_state_path(state_path: Option<&Path>) -> Option<PathBuf> {
+    let path = state_path?;
+    Some(path.parent()?.join("jobs.json"))
+}
+
+/// Read the admission record a previous run left behind.
+///
+/// A missing file is the ordinary first run. Anything recorded is reported as
+/// refused rather than re-admitted: this run cannot prove a recorded process
+/// is still its own.
+fn load_refused_admissions(path: Option<&Path>) -> (Vec<String>, Vec<String>) {
+    let Some(path) = jobs_state_path(path) else {
+        return (
+            Vec::new(),
+            vec!["no state directory is available, so the job queue cannot be remembered across a restart".to_string()],
+        );
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), Vec::new()),
+        Err(err) => {
+            return (
+                Vec::new(),
+                vec![format!(
+                    "the job queue file at {} could not be read, so no previous admissions were refused: {err}",
+                    path.display()
+                )],
+            )
+        }
+    };
+    match PersistedAdmissions::decode(&text) {
+        Some(record) => (
+            record.refused().iter().map(|id| id.to_string()).collect(),
+            Vec::new(),
+        ),
+        None => (
+            Vec::new(),
+            vec![format!(
+                "the job queue file at {} was not understood, so no previous admissions were refused",
+                path.display()
+            )],
+        ),
+    }
+}
+/// Present one queue for the wire, with its admission readiness.
+///
+/// Readiness is pressure plus observation: an observation must exist and
+/// pressure must be healthy, or admission is held. Unknown or unhealthy
+/// pressure refuses all new admissions, so the report says so instead of
+/// leaving an operator to guess why nothing is admitted.
+fn jobs_payload(
+    config: &Config,
+    queue: &AdmissionQueue,
+    published: &Published,
+    refused: &[String],
+    running: &[String],
+    finished: &VecDeque<FinishedJob>,
+) -> JobsPayload {
+    let mut notes = Vec::new();
+    if !config.jobs.enabled {
+        notes.push(
+            "background job admission is disabled: the queue accepts nothing \
+             until [jobs] enabled is set"
+                .to_string(),
+        );
+    }
+    if !refused.is_empty() {
+        notes.push(format!(
+            "a previous run admitted {} job(s); this run refuses to reuse those ids: {}",
+            refused.len(),
+            refused.join(", ")
+        ));
+    }
+    let (admission_ready, readiness_note) = match &published.snapshot {
+        None => (
+            false,
+            Some("no observation yet: admission is held".to_string()),
+        ),
+        Some(_) if published.pressure != PressureState::Healthy => (
+            false,
+            Some(format!(
+                "pressure is {}: admission is held",
+                pressure_state_name(published.pressure)
+            )),
+        ),
+        Some(_) => (true, None),
+    };
+    if queue.pending().count() > 0 || queue.admitted().count() > 0 {
+        notes.push(
+            "reservations are metadata only: launch specifications live in \
+             daemon memory, and a restart does not reconstruct running work"
+                .to_string(),
+        );
+    }
+    JobsPayload {
+        enabled: config.jobs.enabled,
+        total_budget_bytes: config.jobs.total_budget_bytes,
+        reserved_bytes: queue.reserved_bytes(),
+        pending: queue
+            .pending()
+            .map(|job| PendingJobView {
+                id: job.id.clone(),
+                reservation_bytes: job.reservation_bytes,
+            })
+            .collect(),
+        admitted: queue
+            .admitted()
+            .map(|(id, reservation_bytes)| AdmittedJobView {
+                id: id.to_string(),
+                reservation_bytes,
+            })
+            .collect(),
+        running: queue
+            .admitted()
+            .filter(|(id, _)| running.iter().any(|live| live == id))
+            .map(|(id, reservation_bytes)| RunningJobView {
+                id: id.to_string(),
+                reservation_bytes,
+            })
+            .collect(),
+        finished: finished
+            .iter()
+            .map(|done| FinishedJobView {
+                id: done.id.clone(),
+                exit_code: done.exit_code,
+                note: done.note.clone(),
+                peak_bytes: done.peak_bytes,
+            })
+            .collect(),
+        admission_ready,
+        readiness_note,
+        notes,
     }
 }
 
@@ -2135,5 +3125,223 @@ mod tests {
         let (persisted, notes) = load_persisted(None);
         assert!(persisted.is_empty());
         assert!(notes[0].contains("no state directory"), "{notes:?}");
+    }
+
+    #[test]
+    fn the_job_queue_record_survives_a_state_file_and_refusals_are_reported() {
+        let directory = TempDir::new("jobs-state-file");
+        let journal = directory.path().join("journal.json");
+
+        // The record lives beside the journal state file.
+        assert_eq!(
+            jobs_state_path(Some(&journal)),
+            Some(directory.path().join("jobs.json"))
+        );
+        assert_eq!(jobs_state_path(None), None);
+
+        // A first run has no record, which is not a problem to report.
+        let (refused, notes) = load_refused_admissions(Some(&journal));
+        assert!(refused.is_empty());
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // After a write, the admissions come back as refusals, never re-admitted.
+        let mut queue = AdmissionQueue::new(8);
+        queue
+            .submit(
+                PendingJob {
+                    id: "a".into(),
+                    reservation_bytes: 10,
+                },
+                true,
+            )
+            .unwrap();
+        queue
+            .submit(
+                PendingJob {
+                    id: "b".into(),
+                    reservation_bytes: 20,
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(queue.admit(Some(100), true).unwrap().id, "a");
+        let record = PersistedAdmissions::from_queue(&queue, MAX_PERSISTED_ADMISSIONS);
+        let path = jobs_state_path(Some(&journal)).expect("a path");
+        write_state_file(&path, &record.encode()).expect("writes");
+        let (refused, notes) = load_refused_admissions(Some(&journal));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(refused, vec!["a".to_string()]);
+
+        // A file this build cannot read is reported and nothing is refused.
+        std::fs::write(&path, "{ not json").expect("writes");
+        let (refused, notes) = load_refused_admissions(Some(&journal));
+        assert!(refused.is_empty());
+        assert_eq!(notes.len(), 1);
+
+        // Without a state directory the daemon says so.
+        let (refused, notes) = load_refused_admissions(None);
+        assert!(refused.is_empty());
+        assert!(notes[0].contains("no state directory"), "{notes:?}");
+        // The directory removes itself when this test ends.
+    }
+
+    #[test]
+    fn the_jobs_report_states_admission_readiness_honestly() {
+        use breadram_core::config::JobPolicy;
+
+        let config = Config {
+            jobs: JobPolicy {
+                enabled: true,
+                ..JobPolicy::default()
+            },
+            ..Config::default()
+        };
+        let queue = AdmissionQueue::new(8);
+
+        // No observation yet: admission is held, and the report says why.
+        let published = unavailable(ManagementMode::Automatic, 0);
+        let payload = jobs_payload(&config, &queue, &published, &[], &[], &VecDeque::new());
+        assert!(!payload.admission_ready);
+        assert!(
+            payload
+                .readiness_note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no observation"),
+            "{:?}",
+            payload.readiness_note
+        );
+
+        // A healthy observation: ready, with nothing to explain.
+        let mut observed = unavailable(ManagementMode::Automatic, 0);
+        observed.snapshot = Some(MemorySnapshot {
+            observed_at_ms: 0,
+            meminfo: breadram_core::telemetry::MemInfo {
+                total: 8 * GIB,
+                free: 0,
+                available: Some(4 * GIB),
+                buffers: 0,
+                cached: 0,
+                swap_total: 0,
+                swap_free: 0,
+                anon: None,
+                shmem: None,
+            },
+            psi: None,
+            vmstat: breadram_core::telemetry::VmStat::default(),
+            capabilities: CapabilityReport::new(),
+        });
+        observed.pressure = PressureState::Healthy;
+        let payload = jobs_payload(&config, &queue, &observed, &[], &[], &VecDeque::new());
+        assert!(payload.admission_ready);
+        assert!(payload.readiness_note.is_none());
+
+        // Critical pressure: held, with the state named.
+        observed.pressure = PressureState::Critical;
+        let payload = jobs_payload(&config, &queue, &observed, &[], &[], &VecDeque::new());
+        assert!(!payload.admission_ready);
+        assert!(
+            payload
+                .readiness_note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("critical"),
+            "{:?}",
+            payload.readiness_note
+        );
+
+        // Refused ids from a previous run are named in the notes.
+        let payload = jobs_payload(
+            &config,
+            &queue,
+            &observed,
+            &["old-job".to_string()],
+            &[],
+            &VecDeque::new(),
+        );
+        assert!(
+            payload.notes.iter().any(|note| note.contains("old-job")),
+            "{:?}",
+            payload.notes
+        );
+    }
+
+    #[test]
+    fn a_submit_without_a_runnable_program_is_refused_before_queueing() {
+        assert!(check_submit_spec(&[], &None, &[]).is_err());
+        assert!(check_submit_spec(&["relative/bin".to_string()], &None, &[]).is_err());
+        assert!(check_submit_spec(&["/bin/true".to_string()], &Some(String::new()), &[]).is_err());
+        assert!(
+            check_submit_spec(&["/bin/true".to_string()], &None, &["NOEQUALS".to_string()])
+                .is_err()
+        );
+        assert!(check_submit_spec(
+            &["/bin/true".to_string()],
+            &None,
+            &["GOOD=1".to_string(), "EMPTY=".to_string()],
+        )
+        .is_ok());
+        let many = vec!["/bin/true".to_string(); MAX_JOB_ARGC + 1];
+        assert!(check_submit_spec(&many, &None, &[]).is_err());
+
+        assert!(check_launch_paths(&["/bin/true".to_string()], &None).is_ok());
+        assert!(check_launch_paths(&["/does/not/exist".to_string()], &None).is_err());
+        assert!(check_launch_paths(&["/tmp".to_string()], &None).is_err());
+        assert!(check_launch_paths(
+            &["/bin/true".to_string()],
+            &Some("/does/not/exist".to_string())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn scope_peak_reads_honestly_from_a_scope_directory() {
+        let root = TempDir::new("cgroup-root");
+        let nested = root.path().join("user.slice").join("user-1000.slice");
+        let owned = nested.join("breadram-job-old.scope");
+        std::fs::create_dir_all(&owned).expect("scope dir");
+        std::fs::create_dir_all(nested.join("other.scope")).expect("other scope");
+        std::fs::write(root.path().join("not-a-dir"), b"x").expect("file");
+
+        assert_eq!(
+            find_scope_dir(&root.path(), "breadram-job-old.scope"),
+            Some(owned.clone())
+        );
+        assert_eq!(
+            find_scope_dir(&root.path(), "breadram-job-gone.scope"),
+            None
+        );
+        assert_eq!(
+            read_scope_peak(&root.path(), "breadram-job-old.scope"),
+            None,
+            "no peak file means no reading, never zero"
+        );
+        std::fs::write(owned.join("memory.peak"), b"1048576\n").expect("peak");
+        assert_eq!(
+            read_scope_peak(&root.path(), "breadram-job-old.scope"),
+            Some(1048576)
+        );
+    }
+
+    #[test]
+    fn the_finished_list_stays_bounded_with_the_newest_last() {
+        let mut finished = VecDeque::new();
+        for index in 0..MAX_FINISHED_JOBS + 5 {
+            push_finished(
+                &mut finished,
+                FinishedJob {
+                    id: format!("job-{index}"),
+                    exit_code: Some(0),
+                    note: "exited cleanly".to_string(),
+                    peak_bytes: None,
+                },
+            );
+        }
+        assert_eq!(finished.len(), MAX_FINISHED_JOBS);
+        assert_eq!(finished.front().expect("first").id, "job-5");
+        assert_eq!(
+            finished.back().expect("last").id,
+            format!("job-{}", MAX_FINISHED_JOBS + 4)
+        );
     }
 }

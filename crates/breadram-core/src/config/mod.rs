@@ -250,6 +250,14 @@ pub struct JobPolicy {
     pub max_queued: u32,
     /// The default per job memory estimate in bytes.
     pub default_estimate_bytes: u64,
+    /// The conservative total admission budget in bytes. The queue admits
+    /// against this configured total, not MemAvailable, so admitted
+    /// allocations are not subtracted twice from free memory.
+    pub total_budget_bytes: u64,
+    /// Whether the monitor loop launches the queue head by itself in automatic
+    /// mode. Off by default: launching stays explicit unless an operator opts
+    /// in. Inert without `enabled`.
+    pub auto_launch: bool,
 }
 
 impl Default for JobPolicy {
@@ -258,6 +266,8 @@ impl Default for JobPolicy {
             enabled: false,
             max_queued: 32,
             default_estimate_bytes: 2 * 1024 * 1024 * 1024,
+            total_budget_bytes: 8 * 1024 * 1024 * 1024,
+            auto_launch: false,
         }
     }
 }
@@ -809,6 +819,12 @@ fn validate_jobs(jobs: &JobPolicy) -> Result<(), ConfigError> {
             reason: "must be greater than 0 when job admission is enabled".to_string(),
         });
     }
+    if jobs.enabled && jobs.total_budget_bytes == 0 {
+        return Err(ConfigError::InvalidJob {
+            field: "total_budget_bytes".to_string(),
+            reason: "must be greater than 0 when job admission is enabled".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -1155,6 +1171,27 @@ budget_bytes = 2147483648
             Config::from_toml("[protection]\nprotected = [\"unit:sshd.service\"]\n").unwrap();
         assert!(config.providers.is_empty());
         assert_eq!(config.protection.protected.len(), 1);
+    }
+
+    #[test]
+    fn a_zero_job_budget_is_rejected_when_enabled() {
+        let text = "[jobs]\nenabled = true\ntotal_budget_bytes = 0\n";
+        assert!(matches!(
+            Config::from_toml(text),
+            Err(ConfigError::InvalidJob { .. })
+        ));
+        let disabled = "[jobs]\nenabled = false\ntotal_budget_bytes = 0\n";
+        assert!(Config::from_toml(disabled).is_ok());
+        let full = Config::from_toml(FULL).unwrap();
+        assert!(full.jobs.total_budget_bytes > 0);
+    }
+
+    #[test]
+    fn automatic_launch_is_opt_in_and_defaults_off() {
+        let config = Config::from_toml("").unwrap();
+        assert!(!config.jobs.auto_launch);
+        let config = Config::from_toml("[jobs]\nenabled = true\nauto_launch = true\n").unwrap();
+        assert!(config.jobs.enabled && config.jobs.auto_launch);
     }
 
     #[test]

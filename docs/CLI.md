@@ -21,6 +21,10 @@ outside the bread ecosystem.
 | `breadram rules` | The settings in effect: mode, configuration file, permitted automatic actions, protection, budgets, rules |
 | `breadram actions` | The plan the daemon would follow, plus every recorded action with its result and its measured effect |
 | `breadram diagnostics` | A full bundle for a bug report, including memory split by source |
+| `breadram jobs` | The background job queue: pending and admitted reservations, with the budget |
+| `breadram jobs submit --id <id> [--estimate-bytes <n>] [--cwd <dir>] [--env <k=v>]... -- <program> [args]` | Queues an explicitly opted-in background job; runs on launch or the opted-in loop |
+| `breadram jobs launch --id <id>` | Admits the oldest pending job and launches it under supervision |
+| `breadram jobs cancel --id <id>` | Cancels a queued job, or stops a running one |
 | `breadram mode <monitor\|automatic>` | Changes the management mode |
 | `breadram protect <scope>...` | Adds workloads that must not be touched automatically |
 | `breadram unprotect <scope>...` | Removes protected workloads |

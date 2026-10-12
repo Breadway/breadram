@@ -21,6 +21,7 @@ pub mod coordinator;
 pub mod execution;
 pub mod inventory;
 pub mod ipc;
+pub mod jobs;
 pub mod mode;
 pub mod policy;
 pub mod serving;

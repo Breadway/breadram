@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use breadram_core::config::ActionKind;
 use breadram_core::ipc::{
     default_socket_path, ActionsPayload, AppliedPayload, Client, ClientError, DiagnosticsPayload,
-    EventPayload, PlanPayload, RulesPayload, StatusPayload, WorkloadsPayload,
+    EventPayload, JobsPayload, PlanPayload, RulesPayload, StatusPayload, WorkloadsPayload,
 };
 use breadram_core::telemetry::{SwapKind, SwapLayout, WorkloadSwap};
 use breadram_core::trends::{Growth, GrowthReport};
@@ -83,6 +83,12 @@ enum Command {
     Diagnostics,
     /// Export bounded numeric workload memory samples from the daemon.
     Trends,
+    /// Inspect the background job queue, or submit and cancel queued jobs.
+    Jobs {
+        /// What to do: list when omitted.
+        #[command(subcommand)]
+        action: Option<JobsAction>,
+    },
     /// Change the management mode.
     Mode {
         /// The mode to switch to: monitor or automatic.
@@ -108,6 +114,45 @@ enum Command {
         /// Also write the change to the configuration file.
         #[arg(long)]
         persist: bool,
+    },
+}
+
+/// What to do with the background job queue.
+#[derive(Subcommand)]
+enum JobsAction {
+    /// Submit an explicitly opted-in background job to the queue. Queueing
+    /// alone launches nothing: the job runs on an explicit launch, or on the
+    /// monitor loop when automatic admission is opted in.
+    Submit {
+        /// The job id: 1 to 128 ASCII alphanumeric, hyphen, or underscore bytes.
+        #[arg(long)]
+        id: String,
+        /// The conservative upper-bound memory estimate in bytes. Zero means
+        /// the configured default estimate.
+        #[arg(long, default_value_t = 0)]
+        estimate_bytes: u64,
+        /// The working directory. The daemon's own when absent.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Extra environment entries as KEY=VALUE strings, repeatable.
+        #[arg(long)]
+        env: Vec<String>,
+        /// The program and its arguments, executed directly with no shell.
+        /// The first entry must be an absolute path.
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// Admit the oldest pending job and launch it under supervision.
+    Launch {
+        /// The queued job id to launch. Only the head of the queue launches.
+        #[arg(long)]
+        id: String,
+    },
+    /// Cancel a queued job, or stop a running one.
+    Cancel {
+        /// The job id to remove from the pending queue or stop.
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -221,6 +266,31 @@ async fn run(cli: &Cli, socket: &Path) -> Result<(), CliError> {
                     diagnostics.trends.len()
                 ))
             }
+        }
+        Command::Jobs { action } => {
+            let payload = match action {
+                None => client.jobs().await?,
+                Some(JobsAction::Submit {
+                    id,
+                    estimate_bytes,
+                    cwd,
+                    env,
+                    argv,
+                }) => {
+                    client
+                        .submit_job(
+                            id.clone(),
+                            *estimate_bytes,
+                            argv.clone(),
+                            cwd.clone(),
+                            env.clone(),
+                        )
+                        .await?
+                }
+                Some(JobsAction::Launch { id }) => client.launch_job(id.clone()).await?,
+                Some(JobsAction::Cancel { id }) => client.cancel_job(id.clone()).await?,
+            };
+            emit(cli.json, &payload, human_jobs)
         }
         Command::Mode { persist, .. } => {
             let mode = mode.expect("the mode was parsed before the socket was opened");
@@ -727,6 +797,81 @@ fn human_growth(growth: &[GrowthReport]) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// The background job queue, as the daemon holds it.
+fn human_jobs(payload: &JobsPayload) -> String {
+    let mut lines = vec![
+        format!(
+            "queue:      {}",
+            if payload.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!(
+            "budget:     {} total, {} reserved",
+            human_bytes(payload.total_budget_bytes),
+            human_bytes(payload.reserved_bytes)
+        ),
+        format!(
+            "queued:     {} pending, {} admitted",
+            payload.pending.len(),
+            payload.admitted.len()
+        ),
+        format!(
+            "admission:  {}",
+            if payload.admission_ready {
+                "ready".to_string()
+            } else {
+                format!(
+                    "held{}",
+                    payload
+                        .readiness_note
+                        .as_deref()
+                        .map(|note| format!(": {note}"))
+                        .unwrap_or_default()
+                )
+            }
+        ),
+    ];
+    for job in &payload.pending {
+        lines.push(format!(
+            "pending:    {} ({})",
+            job.id,
+            human_bytes(job.reservation_bytes)
+        ));
+    }
+    for job in &payload.admitted {
+        lines.push(format!(
+            "admitted:   {} ({})",
+            job.id,
+            human_bytes(job.reservation_bytes)
+        ));
+    }
+    for job in &payload.running {
+        lines.push(format!(
+            "running:    {} ({})",
+            job.id,
+            human_bytes(job.reservation_bytes)
+        ));
+    }
+    for job in &payload.finished {
+        lines.push(format!(
+            "finished:   {} ({})",
+            job.id,
+            match job.exit_code {
+                Some(code) => format!("exit {code}"),
+                None => "no exit code".to_string(),
+            }
+        ));
+        lines.push(format!("            {}", job.note));
+    }
+    for note in &payload.notes {
+        lines.push(format!("note:       {note}"));
+    }
+    lines.join("\n")
 }
 
 fn human_applied(applied: &AppliedPayload) -> String {

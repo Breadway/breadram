@@ -36,6 +36,13 @@ impl Daemon {
         self.socket = PathBuf::new();
     }
 
+    /// The daemon process id, for signalling it in shutdown tests.
+    /// Only the ipc suite uses it; the shared module compiles per target.
+    #[allow(dead_code)]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     fn kill_and_wait(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
