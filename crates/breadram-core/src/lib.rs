@@ -15,6 +15,7 @@
 
 pub mod adapter;
 pub mod capability;
+pub mod concurrency;
 pub mod config;
 pub mod control;
 pub mod coordinator;

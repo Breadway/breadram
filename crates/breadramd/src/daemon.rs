@@ -1940,6 +1940,22 @@ async fn supervise_job(
         command.arg(format!("--working-directory={dir}"));
     }
     command.arg("--").args(&spec.argv);
+    // An opted-in job can read this and drop workers at its own safe point.
+    // The path is published only while the job runs, and removed when it ends,
+    // so a reused id cannot inherit a stale instruction. A job that never
+    // looks at the file is unchanged: this is not a freeze and it does not
+    // release memory the process already holds.
+    if let Some(dir) = concurrency_dir(state.state_path.as_deref()) {
+        let _ = breadram_core::concurrency::write_directive(
+            &dir,
+            &id,
+            breadram_core::concurrency::WorkerDirective::Run { workers: 1 },
+        );
+        command.env(
+            "BREADRAM_WORKERS_FILE",
+            breadram_core::concurrency::directive_path(&dir, &id),
+        );
+    }
     for entry in &spec.env {
         if let Some((key, value)) = entry.split_once('=') {
             command.env(key, value);
@@ -2072,6 +2088,9 @@ async fn finish_job(
         queue.observe_usage(id, peak);
     }
     queue.complete(id);
+    if let Some(dir) = concurrency_dir(state.state_path.as_deref()) {
+        let _ = breadram_core::concurrency::clear_directive(&dir, id);
+    }
     state.job_specs.lock().await.remove(id);
     state.job_running.lock().await.remove(id);
     {
@@ -2253,6 +2272,12 @@ fn kill_scope_unit(unit: &str, signal: &str) {
 
 /// The job queue record beside the journal state file, when there is somewhere
 /// to put it.
+/// Where a running job reads how many workers to keep.
+fn concurrency_dir(state_path: Option<&Path>) -> Option<PathBuf> {
+    let path = state_path?;
+    Some(path.parent()?.join("concurrency"))
+}
+
 fn jobs_state_path(state_path: Option<&Path>) -> Option<PathBuf> {
     let path = state_path?;
     Some(path.parent()?.join("jobs.json"))

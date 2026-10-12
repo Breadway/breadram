@@ -71,6 +71,27 @@ the daemon admitted keeps running unmanaged.
 Launch needs a systemd user session. Without `systemd-run` or
 `XDG_RUNTIME_DIR` it is refused plainly rather than run half supervised.
 
+## Cooperative concurrency (RAM-25)
+
+A supervised job is started with `BREADRAM_WORKERS_FILE` pointing at
+`<state dir>/concurrency/<id>.workers`. The file holds one line, `run <n>` or
+`reduce <n>`. The job reads it at its own safe point and drops workers down to
+`n`. breadram writes `run 1` at launch and deletes the file when the job
+finishes, so a reused id cannot inherit a stale instruction.
+
+This is the only concurrency control. An arbitrary program that never reads
+the file is not claimed to support a changed worker count, and breadram does
+not freeze it. Reducing workers does not release memory the process already
+holds. A missing file means keep going: a daemon that exits leaves the job
+running at its last reading rather than paused forever, because nothing here
+pauses it.
+
+The example is `examples/cooperative-job.sh`. It starts one extra worker when
+the file says `run` with a count above 1, and stops that worker when the file
+says `reduce 1` or disappears. Measured on this host: the extra worker is a
+`sleep`, so the memory delta is a process, not a workload, and there is no
+throughput number to report for it.
+
 ## Automatic admission
 
 With `[jobs] auto_launch` set, the monitor loop launches the queue head by
