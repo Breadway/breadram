@@ -167,6 +167,22 @@ impl GatewayServer {
         self.inner.started.elapsed().as_millis() as u64
     }
 
+    /// Record that the daemon unloaded one scope, so the next request wakes it.
+    ///
+    /// Returns whether the backend moved to sleep. It does not when a lease is in
+    /// flight, because an unload that raced a request must not strand that
+    /// request behind a wake.
+    pub async fn note_unloaded(&self, workload_scope: &str) -> bool {
+        let now = self.now_ms();
+        self.inner
+            .gateway
+            .lock()
+            .await
+            .backend_mut(&workload(workload_scope))
+            .and_then(|backend| backend.unloaded(now).ok())
+            .is_some()
+    }
+
     /// The scopes that currently hold a lease.
     ///
     /// This is the bridge to the policy planner, which only sees activity

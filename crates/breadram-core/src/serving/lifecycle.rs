@@ -598,6 +598,34 @@ impl Backend {
         }
     }
 
+    /// Record that the provider unloaded this backend while it was idle.
+    ///
+    /// The daemon's plan confirms an unload outside the gateway, and the gateway
+    /// has to learn about it or the next request is forwarded into a backend
+    /// that is no longer serving. This is only safe when nothing is in flight:
+    /// a live lease means the unload raced a request, and the request wins.
+    pub fn unloaded(&mut self, now_ms: u64) -> Result<ServingState, TransitionError> {
+        if self.leases.in_flight() > 0 {
+            return Err(TransitionError::Busy {
+                in_flight: self.leases.in_flight(),
+            });
+        }
+        if !matches!(
+            self.state,
+            ServingState::Awake | ServingState::Draining { .. }
+        ) {
+            return Err(TransitionError::WrongState {
+                state: self.state.name(),
+                transition: "record an unload",
+            });
+        }
+        self.state = ServingState::Sleeping {
+            since_ms: now_ms,
+            wake_attempts: 0,
+        };
+        Ok(self.state.clone())
+    }
+
     /// Record that the provider confirmed the sleep.
     pub fn sleep_confirmed(&mut self, now_ms: u64) -> Result<ServingState, TransitionError> {
         if let ServingState::Draining { .. } = self.state {
@@ -784,5 +812,45 @@ impl Backend {
             attempts: 0,
         };
         self.state.clone()
+    }
+}
+
+#[cfg(test)]
+mod unload_tests {
+    use super::*;
+    use crate::serving::lease::RequestMeta;
+
+    fn backend() -> Backend {
+        Backend::new(
+            WorkloadId {
+                scope: "unit:llama.service".to_string(),
+                generation: 1,
+            },
+            TrackingCompleteness::Complete,
+            ServingPolicy::default(),
+            0,
+        )
+    }
+
+    #[test]
+    fn an_unload_of_an_idle_backend_puts_it_to_sleep() {
+        let mut backend = backend();
+        assert!(backend.unloaded(1_000).is_ok());
+        assert!(matches!(backend.state(), ServingState::Sleeping { .. }));
+        // And the next request can wake it.
+        assert!(backend.wake_request(2_000).is_ok());
+    }
+
+    #[test]
+    fn an_unload_that_races_a_request_does_not_strand_it() {
+        let mut backend = backend();
+        let admission = backend.admit(RequestMeta::new("c1"), 1).expect("admitted");
+        assert!(
+            matches!(backend.unloaded(2), Err(TransitionError::Busy { .. })),
+            "a live lease wins over the unload"
+        );
+        assert!(matches!(backend.state(), ServingState::Awake));
+        backend.finish(admission.lease(), 3);
+        assert!(backend.unloaded(4).is_ok());
     }
 }

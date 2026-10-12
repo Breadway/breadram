@@ -142,6 +142,12 @@ An outcome maps to a `Disposition`: proxy the request (streaming when the client
 asked), retry with the hint (reported as 503 with `Retry-After` in seconds), or
 refuse.
 
+When the monitor confirms an idle unload, it tells the gateway, which marks the
+backend asleep provided nothing is in flight. An unload that races a live lease
+loses: the request finishes, and the backend stays awake until the next pass.
+Once the backend is asleep, the next arrival wakes it on the request path, which
+is the whole loop: idle, unload, sleep, wake, serve.
+
 The gateway also implements the policy's `ActivitySource`: each backend's leases
 are its activity evidence, so a workload with a live lease is never released and
 an unknown workload is unknown, never idle. The daemon publishes the scopes

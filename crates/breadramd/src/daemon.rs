@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
 };
-use breadram_core::config::{validate, Config, GatewayTracking, HintState, Priority};
+use breadram_core::config::{validate, ActionKind, Config, GatewayTracking, HintState, Priority};
 use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
 use breadram_core::coordinator::{
     ActionJournal, Cancellation, ChainedExecutor, Coordinator, Executor, OwnerToken,
@@ -151,6 +151,10 @@ struct SharedState {
     /// task, read by the monitor, so a request in flight is active evidence
     /// the planner can see and will not unload from under.
     gateway_active: RwLock<Vec<String>>,
+    /// Scopes the monitor confirmed an idle unload for. Written by the monitor,
+    /// read by the gateway task, which marks the backend asleep so the next
+    /// request wakes it instead of being forwarded into a miss.
+    gateway_unloaded: Mutex<Vec<String>>,
 }
 
 /// What to execute for one admitted job.
@@ -347,6 +351,7 @@ pub async fn run_with_config_path(
         job_running: Mutex::new(HashMap::new()),
         job_finished: Mutex::new(VecDeque::new()),
         gateway_active: RwLock::new(Vec::new()),
+        gateway_unloaded: Mutex::new(Vec::new()),
         execution_notes: RwLock::new(Vec::new()),
         state_path: default_state_path(),
         cancel: Cancellation::new(),
@@ -597,6 +602,12 @@ async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
             ticker.tick().await;
             let active = publishing.active_scopes().await;
             *shared.gateway_active.write().await = active;
+            // Apply the unloads the monitor confirmed, so the next request
+            // wakes the backend instead of missing.
+            let unloaded: Vec<String> = shared.gateway_unloaded.lock().await.drain(..).collect();
+            for scope in unloaded {
+                publishing.note_unloaded(&scope).await;
+            }
         }
     });
     tokio::spawn(async move {
@@ -773,6 +784,21 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                 None => {}
             }
             *state.execution_notes.write().await = notes;
+            // A confirmed idle unload has to reach the gateway, or the next
+            // request is forwarded into a backend that is no longer serving.
+            if let Some(pass) = &pass {
+                let unloaded: Vec<String> = pass
+                    .results
+                    .iter()
+                    .filter(|result| {
+                        result.kind == ActionKind::UnloadIdleModel && result.is_confirmed()
+                    })
+                    .map(|result| result.scope.clone())
+                    .collect();
+                if !unloaded.is_empty() {
+                    state.gateway_unloaded.lock().await.extend(unloaded);
+                }
+            }
             publish_and_persist(&state, &next_coordinator, wrote).await;
             coordinator = Some(next_coordinator);
 
