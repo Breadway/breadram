@@ -110,10 +110,10 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
 }
 
-struct SharedState {
+pub(crate) struct SharedState {
     trends: RwLock<TrendHistory>,
     trend_keys: std::collections::hash_map::RandomState,
-    published: RwLock<Published>,
+    pub(crate) published: RwLock<Published>,
     config: RwLock<Config>,
     config_version: AtomicU64,
     config_path: Option<PathBuf>,
@@ -131,7 +131,7 @@ struct SharedState {
     events: broadcast::Sender<EventPayload>,
     interval_ms: u64,
     socket_uid: u32,
-    clock: SystemClock,
+    pub(crate) clock: SystemClock,
     /// Explicitly opted-in background jobs waiting for or holding admission
     /// reservations. The daemon owns the queue and supervises what launches
     /// from it, explicitly or through the opted-in automatic loop.
@@ -210,15 +210,15 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// and a diagnostic bundle all describe the same instant. Nothing a client asks
 /// for can trigger a collection of its own or block the monitor.
 #[derive(Clone)]
-struct Published {
-    status: StatusPayload,
+pub(crate) struct Published {
+    pub(crate) status: StatusPayload,
     snapshot: Option<MemorySnapshot>,
     workloads: Vec<Workload>,
     /// What the inventory could read, which is its own report: a snapshot
     /// capability says nothing about whether procfs could be walked.
     inventory_capabilities: CapabilityReport,
     control_targets: usize,
-    pressure: PressureState,
+    pub(crate) pressure: PressureState,
     plan: Option<Plan>,
     /// What this pass learned from the configured providers: an endpoint that
     /// could not be read, or an answer that could not be understood. Reported
@@ -618,6 +618,10 @@ async fn spawn_gateway(state: Arc<SharedState>) -> Result<(), DaemonError> {
 
 fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
     tokio::spawn(async move {
+        // The optional bread bridge. It publishes pressure and honors commands
+        // only while breadd is present and speaks the supported version, and it
+        // does nothing at all otherwise.
+        let mut bridge = crate::bread::Bridge::new();
         let clock = state.clock;
         let initial_config = state.config.read().await.clone();
         let mut runtime = Some(PolicyRuntime::new(
@@ -823,6 +827,17 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                 {
                     drop(config);
                     auto_launch(&state).await;
+                }
+            }
+            for effect in crate::bread::tick(&state, &mut bridge) {
+                let crate::bread::CommandEffect::Mode(mode) = effect;
+                // In memory only: a bus command must not rewrite the
+                // operator's configuration file. The next pass plans under
+                // the new mode, and a restart returns to the file.
+                let mut config = state.config.write().await;
+                if config.mode != mode {
+                    config.mode = mode;
+                    state.config_version.fetch_add(1, Ordering::Relaxed);
                 }
             }
             let _ = state.events.send(EventPayload {
