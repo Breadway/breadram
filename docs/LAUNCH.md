@@ -4,7 +4,10 @@
 current process with the program inside the user scope
 `breadram-launch-<name>.scope`.
 
-The scope is created with `systemd-run --user --scope --collect`. Forked
+The scope is created with `systemd-run --user --scope --collect` and
+`CollectMode=inactive-or-failed`, so the unit unloads when the last process
+exits and the same name can launch again. `--collect` alone leaves the unit
+loaded. Forked
 children stay in that scope because cgroup membership is inherited. The
 command does not open the breadram socket, so a missing daemon does not block
 the launch.

@@ -83,6 +83,10 @@ pub fn plan_launch(
         "--scope".to_string(),
         "--quiet".to_string(),
         "--collect".to_string(),
+        // --collect alone leaves a finished scope loaded, so the next launch
+        // of the same name fails with "unit was already loaded". Unload it
+        // once the last process exits.
+        "--property=CollectMode=inactive-or-failed".to_string(),
         format!("--unit={unit}"),
         "--".to_string(),
     ];
@@ -138,6 +142,17 @@ mod tests {
         assert_eq!(&plan.argv[split + 1..], ["/usr/bin/editor", "notes"]);
         assert!(plan.argv.iter().any(|arg| arg == "--user"));
         assert!(plan.argv.iter().any(|arg| arg == "--scope"));
+        assert!(plan
+            .argv
+            .iter()
+            .any(|arg| arg == "--property=CollectMode=inactive-or-failed"));
+        // The property is a systemd-run option, so it stays before the separator.
+        let property = plan
+            .argv
+            .iter()
+            .position(|arg| arg.starts_with("--property="))
+            .unwrap();
+        assert!(property < split);
     }
 
     #[test]
