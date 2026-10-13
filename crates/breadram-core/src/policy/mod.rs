@@ -16,11 +16,16 @@
 //!    device memory into CPU RAM.
 
 pub mod activity;
+pub mod budget;
 pub mod history;
 pub mod planner;
 pub mod state;
 
 pub use activity::{ActivityEvidence, ActivitySource, DebouncedActivity, UnknownActivity};
+pub use budget::{
+    effective_budget, stall_verdict, BudgetInputs, BudgetRefusal, EffectiveBudget, StallVerdict,
+    DESKTOP_RESERVE_BYTES, STALL_RISE_POINTS,
+};
 pub use history::{ActionOutcome, ActionRecord, PolicyHistory};
 pub use planner::{
     budget_for, explain_priority, is_action_protected, plan, serves_protected, Plan, PlanChannel,

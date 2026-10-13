@@ -170,7 +170,7 @@ pub fn plan(input: PlannerInput<'_>, channel: PlanChannel) -> Plan {
         }
 
         let marker = explanation.len();
-        for action in generate(workload, config) {
+        for action in generate(workload, config, snapshot.meminfo.total, &mut explanation) {
             if action.expected_host_ram_delta > 0 {
                 explanation.push(format!(
                     "{scope}: {:?} is expected to raise host memory during pressure, refused",
@@ -350,7 +350,12 @@ pub fn budget_for(config: &Config, workload: &Workload) -> Option<u64> {
 /// a destructive operation even by mistake. `ReclaimProtection` is deliberately
 /// not generated here: it is applied by the coordinator alongside a limit rather
 /// than as a standalone relief action.
-fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
+fn generate(
+    workload: &Workload,
+    config: &Config,
+    host_bytes: u64,
+    explanation: &mut Vec<String>,
+) -> Vec<PlannedAction> {
     let allowed = &config.automation.allowed_actions;
     let bytes = usage(workload);
     let mut actions = Vec::new();
@@ -367,18 +372,48 @@ fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
     }
 
     if allowed.contains(&ActionKind::CgroupSoftLimit) {
-        if let Some(budget) = budget_for(config, workload) {
-            if bytes > budget {
-                let over = bytes - budget;
-                actions.push(PlannedAction {
-                    target: workload.id.clone(),
-                    kind: ActionKind::CgroupSoftLimit,
-                    reason: format!(
-                        "it is {over} bytes over its {budget} byte budget, a bounded limit reclaims that"
-                    ),
-                    expected_host_ram_delta: relief(over),
-                    requires_confirmed_idle: false,
-                });
+        if let Some(configured) = budget_for(config, workload) {
+            // The configured number is a wish. The applied number also leaves
+            // the desktop reserve and respects the host size. The ancestor
+            // clamp still happens at apply time, where the live cgroup limit
+            // is known; the planner does not invent one.
+            match crate::policy::effective_budget(crate::policy::BudgetInputs {
+                configured_bytes: configured,
+                host_bytes,
+                ancestor_bytes: None,
+            }) {
+                Ok(effective) if bytes > effective.bytes => {
+                    let over = bytes - effective.bytes;
+                    let clamp = if effective.notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", effective.notes.join("; "))
+                    };
+                    actions.push(PlannedAction {
+                        target: workload.id.clone(),
+                        kind: ActionKind::CgroupSoftLimit,
+                        reason: format!(
+                            "it is {over} bytes over its {} byte effective budget{clamp}, a bounded limit reclaims that",
+                            effective.bytes
+                        ),
+                        expected_host_ram_delta: relief(over),
+                        requires_confirmed_idle: false,
+                    });
+                }
+                Ok(_) => {}
+                Err(crate::policy::BudgetRefusal::NoRoom) => {
+                    explanation.push(format!(
+                        "{}: its budget leaves no room after the {} byte desktop reserve, so no soft limit is planned",
+                        workload.id.scope,
+                        crate::policy::DESKTOP_RESERVE_BYTES
+                    ));
+                }
+                Err(crate::policy::BudgetRefusal::BelowMinimum) => {
+                    explanation.push(format!(
+                        "{}: its configured budget is below the smallest useful soft limit, so no soft limit is planned",
+                        workload.id.scope
+                    ));
+                }
             }
         }
     }
