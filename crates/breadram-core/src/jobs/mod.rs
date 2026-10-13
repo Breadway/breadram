@@ -4,6 +4,8 @@
 //! job. An estimate larger than available capacity blocks rather than weakening
 //! the safety limit with age. Reservations remain until explicit completion.
 
+pub mod executor;
+
 use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};

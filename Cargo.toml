@@ -3,6 +3,7 @@ members = [
     "crates/breadram-core",
     "crates/breadramd",
     "crates/breadram-cli",
+    "examples/cooperative-job",
 ]
 resolver = "2"
 

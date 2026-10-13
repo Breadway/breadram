@@ -428,11 +428,16 @@ fn generate(
     }
 
     if allowed.contains(&ActionKind::ReduceJobConcurrency) && bytes > 0 {
+        // Halving the workers halves the live memory the job holds for work:
+        // the executor writes half the current count, so the plan promises
+        // half the usage rather than an unrelated fraction. The estimate the
+        // job was admitted under stays the reservation; this is the relief a
+        // reduce is expected to free from it.
         actions.push(PlannedAction {
             target: workload.id.clone(),
             kind: ActionKind::ReduceJobConcurrency,
             reason: "it can continue at lower concurrency with less live memory".to_string(),
-            expected_host_ram_delta: relief(bytes / 4),
+            expected_host_ram_delta: relief(bytes / 2),
             requires_confirmed_idle: false,
             ancestor_bytes: None,
         });
