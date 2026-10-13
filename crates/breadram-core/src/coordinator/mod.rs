@@ -517,14 +517,41 @@ impl Coordinator {
 
     /// Restore daemon-owned values that breadram still owns.
     ///
-    /// This is what runs after a restart, on disable, on rule removal, and when a
-    /// target exits. It walks the journal newest first and, for each key it has
-    /// not already handled, restores the original value only while the value in
-    /// place is still the one breadram last wrote. Anything else means another
-    /// manager changed it, and a newer configuration is never overwritten.
+    /// This is what runs after a restart and when automatic mode turns off. It
+    /// walks the journal newest first and, for each key it has not already
+    /// handled, restores the original value only while the value in place is
+    /// still the one breadram last wrote. Anything else means another manager
+    /// changed it, and a newer configuration is never overwritten.
     pub fn recover(&mut self, executor: &dyn Executor, now_ms: u64) -> Vec<RestoreResult> {
+        self.recover_matching(executor, now_ms, |_| true)
+    }
+
+    /// Restore only the values written by the given actions.
+    ///
+    /// This is what puts back a soft limit whose scope stalled worse after the
+    /// limit: every other owned value is left alone. The ownership rule is the
+    /// same as [`Coordinator::recover`]: a value another manager changed is
+    /// skipped, never overwritten.
+    pub fn recover_actions(
+        &mut self,
+        executor: &dyn Executor,
+        now_ms: u64,
+        ids: &[ActionId],
+    ) -> Vec<RestoreResult> {
+        self.recover_matching(executor, now_ms, |id| ids.contains(&id))
+    }
+
+    fn recover_matching(
+        &mut self,
+        executor: &dyn Executor,
+        now_ms: u64,
+        mut wanted: impl FnMut(ActionId) -> bool,
+    ) -> Vec<RestoreResult> {
         let mut results = Vec::new();
         for (id, value) in self.journal.owned_values() {
+            if !wanted(id) {
+                continue;
+            }
             let outcome = match executor.read_value(&value.key) {
                 Ok(None) => RestoreOutcome::SkippedTargetGone,
                 Ok(Some(current)) if current == value.original => RestoreOutcome::SkippedNoChange,
@@ -681,6 +708,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 

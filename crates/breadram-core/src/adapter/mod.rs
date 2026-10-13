@@ -737,6 +737,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 

@@ -73,6 +73,7 @@ fn workload() -> Workload {
         },
         control: ControlLevel::Eligible,
         limit_bytes: None,
+        ancestor_bytes: None,
     }
 }
 
@@ -257,6 +258,7 @@ impl Harness {
             &executor,
             clock.monotonic_ms(),
             &Cancellation::new(),
+            64 * 1024 * 1024 * 1024,
         )
     }
 }

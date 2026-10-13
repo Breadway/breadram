@@ -25,7 +25,7 @@ use crate::coordinator::{
     ActionRequest, ActionResult, ActionState, Cancellation, Coordinator, Executor,
 };
 use crate::inventory::{MemoryAccounting, Workload};
-use crate::policy::{budget_for, Plan};
+use crate::policy::{budget_for, BudgetInputs, Plan};
 use crate::ManagementMode;
 
 /// What one pass over a plan did, or why it wrote nothing.
@@ -98,6 +98,7 @@ pub fn requests_for_plan(
     config: &Config,
     workloads: &[Workload],
     now_ms: u64,
+    host_bytes: u64,
 ) -> (Vec<ActionRequest>, Vec<String>) {
     let mut requests = Vec::new();
     let mut notes = Vec::new();
@@ -120,7 +121,13 @@ pub fn requests_for_plan(
             now_ms,
         )
         .with_expected_host_ram_delta(action.expected_host_ram_delta);
-        if let Some(value) = value_to_apply(action.kind, config, workload) {
+        if let Some(value) = value_to_apply(
+            action.kind,
+            config,
+            workload,
+            host_bytes,
+            action.ancestor_bytes,
+        ) {
             request = request.with_limit_bytes(value);
         }
         requests.push(request);
@@ -130,17 +137,34 @@ pub fn requests_for_plan(
 
 /// The value an action intends to reach, when it has one.
 ///
-/// A bounded soft limit uses the configured budget for the workload, which is
-/// the only number that means anything: a limit invented by the daemon would be
-/// policy nobody asked for. With no budget configured the value is absent, and
-/// the executor refuses the action by name rather than guessing.
-fn value_to_apply(kind: ActionKind, config: &Config, workload: Option<&Workload>) -> Option<u64> {
+/// A bounded soft limit uses the effective budget: the configured number,
+/// shrunk by the host size and the desktop reserve, and by the tightest parent
+/// cap the plan carries. A limit invented by the daemon would be policy nobody
+/// asked for, so a soft limit with no configured budget, or a budget that
+/// leaves no room, is absent and the executor refuses the action by name
+/// rather than guessing. Reclaim protection with no configured budget falls
+/// back to the current usage, which is the only bounded number available.
+fn value_to_apply(
+    kind: ActionKind,
+    config: &Config,
+    workload: Option<&Workload>,
+    host_bytes: u64,
+    ancestor_bytes: Option<u64>,
+) -> Option<u64> {
     let workload = workload?;
     match kind {
-        ActionKind::CgroupSoftLimit | ActionKind::ReclaimProtection => {
+        ActionKind::CgroupSoftLimit => {
+            let configured = budget_for(config, workload)?;
+            crate::policy::effective_budget(BudgetInputs {
+                configured_bytes: configured,
+                host_bytes,
+                ancestor_bytes,
+            })
+            .ok()
+            .map(|budget| budget.bytes)
+        }
+        ActionKind::ReclaimProtection => {
             budget_for(config, workload).or(match workload.accounting {
-                // No budget, so the current usage is the only bounded number
-                // available. It is what protection would be applied around.
                 MemoryAccounting::Cgroup { current_bytes } => current_bytes,
                 MemoryAccounting::RssEstimate { rss_bytes, .. } => Some(rss_bytes),
             })
@@ -164,13 +188,14 @@ pub fn execute_plan(
     executor: &dyn Executor,
     now_ms: u64,
     cancel: &Cancellation,
+    host_bytes: u64,
 ) -> ExecutionPass {
     if mode != ManagementMode::Automatic {
         return ExecutionPass::declined(format!(
             "{mode} mode never writes: the plan is explained, not executed"
         ));
     }
-    let (requests, notes) = requests_for_plan(plan, config, workloads, now_ms);
+    let (requests, notes) = requests_for_plan(plan, config, workloads, now_ms, host_bytes);
     if requests.is_empty() {
         let mut pass = ExecutionPass::declined(if plan.actions.is_empty() {
             "the plan proposed no action".to_string()
@@ -296,6 +321,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 
@@ -319,6 +345,7 @@ mod tests {
             reason: "the workload is over its budget".to_string(),
             expected_host_ram_delta: -(2 * GIB as i64),
             requires_confirmed_idle: false,
+            ancestor_bytes: None,
         }
     }
 
@@ -359,6 +386,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
 
         assert_eq!(pass.confirmed(), 1, "{}", pass.summary());
@@ -398,6 +426,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
 
         assert!(!pass.wrote());
@@ -431,6 +460,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
 
         assert!(!pass.wrote());
@@ -466,6 +496,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
 
         assert_eq!(pass.results[0].state, ActionState::Denied);
@@ -498,6 +529,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
 
         assert_eq!(pass.results[0].state, ActionState::Superseded);
@@ -586,7 +618,8 @@ mod tests {
             failed: std::sync::atomic::AtomicBool::new(false),
         };
 
-        let (requests, _) = requests_for_plan(&plan(actions), &settings, &workloads, NOW_MS);
+        let (requests, _) =
+            requests_for_plan(&plan(actions), &settings, &workloads, NOW_MS, 64 * GIB);
         let results = coordinator.execute(
             &requests,
             &workloads,
@@ -607,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn a_soft_limit_with_no_budget_still_names_no_value_rather_than_inventing_one() {
+    fn a_soft_limit_with_no_budget_names_no_value() {
         let workloads = vec![workload("unit:build.service", 5, 6 * GIB)];
         let settings = config(vec![ActionKind::CgroupSoftLimit], None);
         let (requests, notes) = requests_for_plan(
@@ -615,13 +648,48 @@ mod tests {
             &settings,
             &workloads,
             NOW_MS,
+            64 * GIB,
         );
         assert!(notes.is_empty());
         assert_eq!(requests.len(), 1);
         assert_eq!(
+            requests[0].limit_bytes, None,
+            "a soft limit with no configured budget is not invented from current usage"
+        );
+    }
+
+    #[test]
+    fn a_soft_limit_is_the_effective_budget_not_the_configured_wish() {
+        let workloads = vec![workload("unit:build.service", 5, 6 * GIB)];
+        // The wish is the whole host. The applied number leaves the desktop reserve.
+        let settings = config(vec![ActionKind::CgroupSoftLimit], Some(8 * GIB));
+        let (requests, _) = requests_for_plan(
+            &plan(vec![soft_limit("unit:build.service", 5)]),
+            &settings,
+            &workloads,
+            NOW_MS,
+            8 * GIB,
+        );
+        assert_eq!(
             requests[0].limit_bytes,
-            Some(6 * GIB),
-            "the current usage is the bounded value protection is applied around"
+            Some(8 * GIB - crate::policy::DESKTOP_RESERVE_BYTES)
+        );
+    }
+
+    #[test]
+    fn a_soft_limit_is_clamped_to_the_tighter_parent() {
+        let workloads = vec![workload("unit:build.service", 5, 6 * GIB)];
+        let settings = config(vec![ActionKind::CgroupSoftLimit], Some(4 * GIB));
+        let action = PlannedAction {
+            ancestor_bytes: Some(2 * GIB),
+            ..soft_limit("unit:build.service", 5)
+        };
+        let (requests, _) =
+            requests_for_plan(&plan(vec![action]), &settings, &workloads, NOW_MS, 64 * GIB);
+        assert_eq!(
+            requests[0].limit_bytes,
+            Some(2 * GIB),
+            "the parent cap wins over the configured wish"
         );
     }
 
@@ -639,6 +707,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
         assert!(!pass.wrote());
         assert_eq!(pass.summary(), "the plan proposed no action");
@@ -661,6 +730,7 @@ mod tests {
             &executor,
             NOW_MS,
             &Cancellation::new(),
+            64 * GIB,
         );
         let second = execute_plan(
             &mut coordinator,
@@ -671,6 +741,7 @@ mod tests {
             &executor,
             NOW_MS + 1,
             &Cancellation::new(),
+            64 * GIB,
         );
 
         assert_eq!(first.confirmed(), 1);

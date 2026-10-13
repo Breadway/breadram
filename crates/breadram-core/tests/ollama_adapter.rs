@@ -35,6 +35,7 @@ fn workload() -> Workload {
         },
         control: ControlLevel::Eligible,
         limit_bytes: None,
+        ancestor_bytes: None,
     }
 }
 
@@ -562,6 +563,7 @@ fn the_adapter_reports_its_provider_and_version() {
         },
         control: ControlLevel::ObserveOnly,
         limit_bytes: None,
+        ancestor_bytes: None,
     }));
 
     let observed = adapter

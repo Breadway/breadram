@@ -66,6 +66,12 @@ pub struct PlannedAction {
     pub expected_host_ram_delta: i64,
     /// Whether the action needs proven idleness before it may run.
     pub requires_confirmed_idle: bool,
+    /// The parent cgroup's `memory.max`, when one is set.
+    ///
+    /// `None` means the parent is unlimited or unreadable. This is not the
+    /// workload's own cap: that cap is what a soft limit writes, so using it as
+    /// the ancestor would clamp a budget against itself.
+    pub ancestor_bytes: Option<u64>,
 }
 
 /// The result of one planning pass.
@@ -170,7 +176,7 @@ pub fn plan(input: PlannerInput<'_>, channel: PlanChannel) -> Plan {
         }
 
         let marker = explanation.len();
-        for action in generate(workload, config) {
+        for action in generate(workload, config, snapshot.meminfo.total, &mut explanation) {
             if action.expected_host_ram_delta > 0 {
                 explanation.push(format!(
                     "{scope}: {:?} is expected to raise host memory during pressure, refused",
@@ -350,7 +356,12 @@ pub fn budget_for(config: &Config, workload: &Workload) -> Option<u64> {
 /// a destructive operation even by mistake. `ReclaimProtection` is deliberately
 /// not generated here: it is applied by the coordinator alongside a limit rather
 /// than as a standalone relief action.
-fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
+fn generate(
+    workload: &Workload,
+    config: &Config,
+    host_bytes: u64,
+    explanation: &mut Vec<String>,
+) -> Vec<PlannedAction> {
     let allowed = &config.automation.allowed_actions;
     let bytes = usage(workload);
     let mut actions = Vec::new();
@@ -363,22 +374,55 @@ fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
                 .to_string(),
             expected_host_ram_delta: relief(bytes),
             requires_confirmed_idle: true,
+            ancestor_bytes: None,
         });
     }
 
     if allowed.contains(&ActionKind::CgroupSoftLimit) {
-        if let Some(budget) = budget_for(config, workload) {
-            if bytes > budget {
-                let over = bytes - budget;
-                actions.push(PlannedAction {
-                    target: workload.id.clone(),
-                    kind: ActionKind::CgroupSoftLimit,
-                    reason: format!(
-                        "it is {over} bytes over its {budget} byte budget, a bounded limit reclaims that"
-                    ),
-                    expected_host_ram_delta: relief(over),
-                    requires_confirmed_idle: false,
-                });
+        if let Some(configured) = budget_for(config, workload) {
+            // The configured number is a wish. The planned number also leaves
+            // the desktop reserve, respects the host size, and respects the
+            // tightest parent cap the inventory read. The executor clamps
+            // again at apply time against the live cgroup limit, where a
+            // parent that changed since the inventory is still caught.
+            match crate::policy::effective_budget(crate::policy::BudgetInputs {
+                configured_bytes: configured,
+                host_bytes,
+                ancestor_bytes: workload.ancestor_bytes,
+            }) {
+                Ok(effective) if bytes > effective.bytes => {
+                    let over = bytes - effective.bytes;
+                    let clamp = if effective.notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", effective.notes.join("; "))
+                    };
+                    actions.push(PlannedAction {
+                        target: workload.id.clone(),
+                        kind: ActionKind::CgroupSoftLimit,
+                        reason: format!(
+                            "it is {over} bytes over its {} byte effective budget{clamp}, a bounded limit reclaims that",
+                            effective.bytes
+                        ),
+                        expected_host_ram_delta: relief(over),
+                        requires_confirmed_idle: false,
+                        ancestor_bytes: workload.ancestor_bytes,
+                    });
+                }
+                Ok(_) => {}
+                Err(crate::policy::BudgetRefusal::NoRoom) => {
+                    explanation.push(format!(
+                        "{}: its budget leaves no room after the {} byte desktop reserve, so no soft limit is planned",
+                        workload.id.scope,
+                        crate::policy::DESKTOP_RESERVE_BYTES
+                    ));
+                }
+                Err(crate::policy::BudgetRefusal::BelowMinimum) => {
+                    explanation.push(format!(
+                        "{}: its configured budget is below the smallest useful soft limit, so no soft limit is planned",
+                        workload.id.scope
+                    ));
+                }
             }
         }
     }
@@ -390,6 +434,7 @@ fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
             reason: "it can continue at lower concurrency with less live memory".to_string(),
             expected_host_ram_delta: relief(bytes / 4),
             requires_confirmed_idle: false,
+            ancestor_bytes: None,
         });
     }
 
@@ -400,6 +445,7 @@ fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
             reason: "further background admission can wait".to_string(),
             expected_host_ram_delta: 0,
             requires_confirmed_idle: false,
+            ancestor_bytes: None,
         });
     }
 
@@ -410,6 +456,7 @@ fn generate(workload: &Workload, config: &Config) -> Vec<PlannedAction> {
             reason: "provider offload frees device memory by moving it into host RAM".to_string(),
             expected_host_ram_delta: cost(bytes),
             requires_confirmed_idle: true,
+            ancestor_bytes: None,
         });
     }
 
@@ -518,6 +565,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 
