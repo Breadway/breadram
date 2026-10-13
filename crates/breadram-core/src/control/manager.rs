@@ -308,12 +308,15 @@ impl CommandRunner for ProcessRunner {
 }
 
 /// Parse a systemd byte setting such as `4294967296` or `infinity`.
+///
+/// A cgroup `memory.max` of `max` is also unlimited, not zero: it constrains
+/// nothing, so it parses to no limit rather than failing.
 pub fn parse_bytes(value: &str) -> Option<u64> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
-    if value == "infinity" || value == "[not set]" {
+    if value == "infinity" || value == "[not set]" || value == "max" {
         return None;
     }
     value.parse::<u64>().ok()

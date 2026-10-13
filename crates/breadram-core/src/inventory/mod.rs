@@ -12,6 +12,6 @@ pub use parse::{
     ProcParseError, ProcStat, ProcStatus,
 };
 pub use workload::{
-    collect_inventory, ControlLevel, Inventory, MemoryAccounting, Workload, WorkloadId,
-    CAP_PROC_INVENTORY, CGROUP_V2_ROOT, PROC_ROOT,
+    ancestor_limit, collect_inventory, ControlLevel, Inventory, MemoryAccounting, Workload,
+    WorkloadId, CAP_PROC_INVENTORY, CGROUP_V2_ROOT, PROC_ROOT,
 };

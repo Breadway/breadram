@@ -25,7 +25,7 @@ use crate::coordinator::{
     ActionRequest, ActionResult, ActionState, Cancellation, Coordinator, Executor,
 };
 use crate::inventory::{MemoryAccounting, Workload};
-use crate::policy::{budget_for, stall_verdict, BudgetInputs, Plan, StallVerdict};
+use crate::policy::{budget_for, BudgetInputs, Plan};
 use crate::ManagementMode;
 
 /// What one pass over a plan did, or why it wrote nothing.
@@ -121,7 +121,13 @@ pub fn requests_for_plan(
             now_ms,
         )
         .with_expected_host_ram_delta(action.expected_host_ram_delta);
-        if let Some(value) = value_to_apply(action.kind, config, workload, host_bytes, None) {
+        if let Some(value) = value_to_apply(
+            action.kind,
+            config,
+            workload,
+            host_bytes,
+            action.ancestor_bytes,
+        ) {
             request = request.with_limit_bytes(value);
         }
         requests.push(request);
@@ -132,12 +138,12 @@ pub fn requests_for_plan(
 /// The value an action intends to reach, when it has one.
 ///
 /// A bounded soft limit uses the effective budget: the configured number,
-/// shrunk by the host size and the desktop reserve, and by the ancestor limit
-/// when one is known. A limit invented by the daemon would be policy nobody
-/// asked for, so a budget that leaves no room is absent and the executor
-/// refuses the action by name rather than guessing. With no budget configured
-/// the current usage is the only bounded number available, and it is what
-/// protection would be applied around.
+/// shrunk by the host size and the desktop reserve, and by the tightest parent
+/// cap the plan carries. A limit invented by the daemon would be policy nobody
+/// asked for, so a soft limit with no configured budget, or a budget that
+/// leaves no room, is absent and the executor refuses the action by name
+/// rather than guessing. Reclaim protection with no configured budget falls
+/// back to the current usage, which is the only bounded number available.
 fn value_to_apply(
     kind: ActionKind,
     config: &Config,
@@ -164,20 +170,6 @@ fn value_to_apply(
             })
         }
         _ => None,
-    }
-}
-
-/// Whether a soft limit breadram wrote should be put back.
-///
-/// `before` and `after` are PSI some-avg10 percents from the pass before the
-/// limit and the pass after it. A missing reading is not a rise, so a host
-/// without PSI keeps the limit. A rise of one point or more is a reversal:
-/// the caller restores through the journal, which only puts back a value
-/// breadram still owns.
-pub fn stall_should_reverse(before_percent: Option<u32>, after_percent: Option<u32>) -> bool {
-    match (before_percent, after_percent) {
-        (Some(before), Some(after)) => stall_verdict(before, after) == StallVerdict::Reverse,
-        _ => false,
     }
 }
 
@@ -329,6 +321,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 
@@ -352,6 +345,7 @@ mod tests {
             reason: "the workload is over its budget".to_string(),
             expected_host_ram_delta: -(2 * GIB as i64),
             requires_confirmed_idle: false,
+            ancestor_bytes: None,
         }
     }
 
@@ -683,11 +677,20 @@ mod tests {
     }
 
     #[test]
-    fn a_rising_stall_reverses_and_a_missing_reading_does_not() {
-        assert!(stall_should_reverse(Some(4), Some(6)));
-        assert!(!stall_should_reverse(Some(4), Some(4)));
-        assert!(!stall_should_reverse(None, Some(90)));
-        assert!(!stall_should_reverse(Some(4), None));
+    fn a_soft_limit_is_clamped_to_the_tighter_parent() {
+        let workloads = vec![workload("unit:build.service", 5, 6 * GIB)];
+        let settings = config(vec![ActionKind::CgroupSoftLimit], Some(4 * GIB));
+        let action = PlannedAction {
+            ancestor_bytes: Some(2 * GIB),
+            ..soft_limit("unit:build.service", 5)
+        };
+        let (requests, _) =
+            requests_for_plan(&plan(vec![action]), &settings, &workloads, NOW_MS, 64 * GIB);
+        assert_eq!(
+            requests[0].limit_bytes,
+            Some(2 * GIB),
+            "the parent cap wins over the configured wish"
+        );
     }
 
     #[test]

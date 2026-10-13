@@ -8,9 +8,11 @@
 # into the scope's own swap and slows the loop.
 #
 # MemoryMax here is the harness. breadram's own control stays MemoryHigh,
-# which throttles and does not kill. A stall that rises by a point or more
-# under the tight limit is a Reverse verdict: that intervention would be put
-# back, not kept.
+# which throttles and does not kill. The stall sample is the scope's own
+# cgroup pressure `total` counter: it accumulates inside one run, where the
+# ten-second average cannot move. A tight limit that accumulates clearly more
+# stall than the loose one is a Reverse verdict: that intervention would be
+# put back, not kept.
 set -eu
 if [ -z "${XDG_RUNTIME_DIR:-}" ] || ! command -v systemd-run >/dev/null || ! command -v timeout >/dev/null; then
     echo "skipped: no systemd user session" >&2
@@ -40,7 +42,7 @@ run_one() {
     if [ -n "$cg" ] && [ -r "/sys/fs/cgroup${cg}/memory.current" ]; then
         current=$(cat "/sys/fs/cgroup${cg}/memory.current")
         if [ -r "/sys/fs/cgroup${cg}/memory.pressure" ]; then
-            pressure=$(awk '/^some/ { split($2, a, "="); print a[2] }' "/sys/fs/cgroup${cg}/memory.pressure")
+            pressure=$(awk '/^some/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure")
         fi
     fi
     set +e
@@ -67,9 +69,9 @@ def field(line, key):
 loose, tight = sys.argv[1], sys.argv[2]
 lr, tr = int(field(loose, "rounds") or 0), int(field(tight, "rounds") or 0)
 lc, tc = int(field(loose, "current") or 0), int(field(tight, "current") or 0)
-lp, tp = float(field(loose, "pressure") or 0), float(field(tight, "pressure") or 0)
+lp, tp = int(field(loose, "pressure") or 0), int(field(tight, "pressure") or 0)
 print(
-    f"loose_rounds={lr} tight_rounds={tr} loose_current={lc} tight_current={tc} loose_psi={lp} tight_psi={tp}",
+    f"loose_rounds={lr} tight_rounds={tr} loose_current={lc} tight_current={tc} loose_stall_us={lp} tight_stall_us={tp}",
     file=sys.stderr,
 )
 if lr < 1:
@@ -80,7 +82,10 @@ if tr > lr:
     sys.exit("the tight limit did not cost throughput")
 if tc and lc and tc > lc:
     sys.exit("the tight limit did not hold memory down")
-if tp >= lp + 1.0 or tr == 0:
+# The totals are cumulative stall microseconds sampled 0.4s into each run.
+# Half a CPU-second more under the tight limit is a Reverse: the daemon would
+# put that limit back on the same signal.
+if tp >= lp + 500_000 or tr == 0:
     print("stall verdict: Reverse", file=sys.stderr)
 else:
     print("stall verdict: Keep", file=sys.stderr)

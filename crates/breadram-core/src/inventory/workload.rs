@@ -99,6 +99,12 @@ pub struct Workload {
     /// This is the group's own cap, distinct from host `MemAvailable`. It is
     /// `None` when the group has no cap (`max`) or the file is unreadable.
     pub limit_bytes: Option<u64>,
+    /// The tightest `memory.max` on the parent chain, when one is set.
+    ///
+    /// This is never the workload's own cap: a soft limit writes that cap, so
+    /// clamping a budget against it would clamp the budget against itself. It
+    /// is `None` when every ancestor is unlimited (`max`) or unreadable.
+    pub ancestor_bytes: Option<u64>,
 }
 
 /// The result of one inventory pass.
@@ -253,6 +259,12 @@ pub fn collect_inventory(fs: &dyn FileSource) -> Inventory {
                 .cgroup
                 .as_deref()
                 .and_then(|path| read_cgroup_limit(fs, path));
+            // The tightest parent cap, read from the chain above the group, so
+            // a budget never plans a limit a parent would already forbid.
+            let ancestor_bytes = group
+                .cgroup
+                .as_deref()
+                .and_then(|path| ancestor_limit(fs, path));
             Workload {
                 id: WorkloadId {
                     scope: group.scope,
@@ -263,6 +275,7 @@ pub fn collect_inventory(fs: &dyn FileSource) -> Inventory {
                 accounting,
                 control,
                 limit_bytes,
+                ancestor_bytes,
             }
         })
         .collect();
@@ -294,6 +307,40 @@ fn read_cgroup_limit(fs: &dyn FileSource, cgroup_path: &str) -> Option<u64> {
     fs.read_to_string(&path).ok()?.trim().parse().ok()
 }
 
+/// The tightest `memory.max` on the parent chain, when one is set.
+///
+/// The workload's own `memory.max` is the cap a soft limit writes, so it is
+/// not an ancestor: the walk starts at the next directory up. Every level up
+/// to (but not including) the cgroup root is read, and the smallest set limit
+/// wins, because a child is bounded by its tightest parent. The cgroup root
+/// has no parent that breadram may treat as a limit. `max` means unlimited at
+/// that level and is skipped, as is an unreadable file: a level that cannot be
+/// read constrains nothing, and the walk continues above it.
+pub fn ancestor_limit(fs: &dyn FileSource, cgroup_path: &str) -> Option<u64> {
+    let mut current = Path::new(cgroup_path.trim_matches('/')).to_path_buf();
+    let mut tightest: Option<u64> = None;
+    while let Some(parent) = current.parent() {
+        let Some(text) = parent.to_str().filter(|text| !text.is_empty()) else {
+            break;
+        };
+        let path = Path::new(CGROUP_V2_ROOT).join(text).join("memory.max");
+        if let Some(raw) = fs
+            .read_to_string(&path)
+            .ok()
+            .map(|text| text.trim().to_string())
+        {
+            // `max` is unlimited, not zero: it constrains nothing.
+            if raw != "max" {
+                if let Ok(bytes) = raw.parse::<u64>() {
+                    tightest = Some(tightest.map_or(bytes, |best: u64| best.min(bytes)));
+                }
+            }
+        }
+        current = parent.to_path_buf();
+    }
+    tightest
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::telemetry::fs::test_doubles::MemoryFs;
@@ -309,6 +356,41 @@ mod tests {
 
     fn unit_cgroup(unit: &str) -> String {
         format!("0::/user.slice/user-1000.slice/{unit}\n")
+    }
+
+    #[test]
+    fn the_ancestor_limit_is_the_tightest_parent_cap() {
+        let fs = MemoryFs::new()
+            .with(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app.service/memory.max",
+                "8589934592\n",
+            )
+            .with(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/memory.max",
+                "4294967296\n",
+            )
+            .with(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.max",
+                "max\n",
+            );
+        assert_eq!(
+            ancestor_limit(
+                &fs,
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app.service"
+            ),
+            Some(4_294_967_296),
+            "the tightest parent wins, the unit's own cap is not an ancestor, max is unlimited"
+        );
+        assert_eq!(
+            ancestor_limit(&fs, "/user.slice/user-1000.slice/user@1000.service"),
+            None,
+            "higher levels are unlimited or unreadable here"
+        );
+        assert_eq!(
+            ancestor_limit(&fs, "/"),
+            None,
+            "the cgroup root has no ancestor"
+        );
     }
 
     #[test]

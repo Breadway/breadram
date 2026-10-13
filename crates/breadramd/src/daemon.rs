@@ -16,10 +16,10 @@ use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
 };
 use breadram_core::config::{validate, ActionKind, Config, GatewayTracking, HintState, Priority};
-use breadram_core::control::{discover_targets, ControlExecutor, ProcessRunner};
+use breadram_core::control::{discover_targets, ControlExecutor, ControlTargets, ProcessRunner};
 use breadram_core::coordinator::{
-    ActionJournal, Cancellation, ChainedExecutor, Coordinator, Executor, OwnerToken,
-    PersistedJournal, RestoreOutcome,
+    ActionId, ActionJournal, ActionState, Cancellation, ChainedExecutor, Coordinator, Executor,
+    OwnerToken, PersistedJournal, RestoreOutcome,
 };
 use breadram_core::execution::{execute_plan, ExecutionPass};
 use breadram_core::inventory::{collect_inventory, MemoryAccounting, Workload};
@@ -35,9 +35,9 @@ use breadram_core::jobs::{
     AdmissionQueue, PendingJob, PersistedAdmissions, MAX_PERSISTED_ADMISSIONS,
 };
 use breadram_core::policy::{
-    explain_priority, plan as plan_actions, serves_protected, ActivityEvidence, ActivitySource,
-    DebouncedActivity, Plan, PlanChannel, PlannerInput, PolicyHistory, PressureState, StateMachine,
-    MIN_IDLE_MS,
+    explain_priority, plan as plan_actions, serves_protected, ActionOutcome, ActionRecord,
+    ActivityEvidence, ActivitySource, DebouncedActivity, Plan, PlanChannel, PlannerInput,
+    PolicyHistory, PressureState, StallWatch, StateMachine, MIN_IDLE_MS,
 };
 use breadram_core::serving::{
     GatewayServer, Route as GatewayRoute, ServerConfig as GatewayConfig, TrackingCompleteness,
@@ -45,8 +45,8 @@ use breadram_core::serving::{
 };
 use breadram_core::telemetry::snapshot::MemorySnapshot;
 use breadram_core::telemetry::{
-    collect_cgroup_swap, collect_gtt, collect_host, collect_swap, Clock, GttMemory, RealFs,
-    SwapLayout, SystemClock, WorkloadSwap, CAP_GPU_GTT,
+    collect_cgroup_swap, collect_gtt, collect_host, collect_swap, parse_psi, Clock, FileSource,
+    GttMemory, RealFs, SwapLayout, SystemClock, WorkloadSwap, CAP_GPU_GTT, CGROUP_V2_ROOT,
 };
 use breadram_core::trends::{
     TrendHistory, TrendSample, KIND_HOST, KIND_PRESSURE, KIND_RECOVERY, KIND_WORKLOAD,
@@ -503,6 +503,12 @@ fn refresh_adapters(
 struct PolicyRuntime {
     machine: StateMachine,
     history: PolicyHistory,
+    /// Per-scope stall accumulation, so a soft limit that coincides with a
+    /// stall rise is reversed on the next tick.
+    stall_watch: StallWatch,
+    /// Soft limits this runtime confirmed on the previous pass and has not
+    /// judged yet: (scope, action id).
+    stall_pending: Vec<(String, ActionId)>,
     registry: AdapterRegistry,
     /// Per-scope debounced activity hints. Promotion is immediate and demotion
     /// waits for stable absence, so a focus change cannot oscillate reclaim.
@@ -519,6 +525,8 @@ impl PolicyRuntime {
         Self {
             machine: StateMachine::new(config),
             history: policy_history(config),
+            stall_watch: StallWatch::new(),
+            stall_pending: Vec::new(),
             registry,
             hints: HintState::default(),
             adapter_notes,
@@ -637,9 +645,9 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             owner_token(),
             persisted.to_journal(journal_capacity),
         ));
-        // The stall reading from the previous pass, so a soft limit can be
-        // reversed when the next reading is worse. None until the first pass.
-        let mut previous_stall_percent: Option<u32> = None;
+        // The mode on the previous pass, so leaving automatic mode restores
+        // every owned value. The stall watch lives in the policy runtime and
+        // moves through the worker with it.
         let mut previous_mode = initial_config.mode;
 
         // A restart restores the values breadram still owns, and only those: a
@@ -715,6 +723,11 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             // applied once.
             let rebuild_config = config.clone();
             let cancel = state.cancel.clone();
+            // Whether this pass leaves automatic mode. It is decided here, on
+            // the configuration this pass runs under, so the worker can restore
+            // owned values while it still holds the coordinator.
+            let left_automatic = previous_mode == ManagementMode::Automatic
+                && config.mode != ManagementMode::Automatic;
             // A snapshot of the gateway's leases, so a request in flight counts
             // as active for this pass.
             let gateway_active = state.gateway_active.read().await.clone();
@@ -754,6 +767,10 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                         registry: &current_runtime.registry,
                         probes: &probes,
                         clock: &clock,
+                        history: &mut current_runtime.history,
+                        stall_watch: &mut current_runtime.stall_watch,
+                        stall_pending: &mut current_runtime.stall_pending,
+                        left_automatic,
                     },
                 );
                 (published, current_runtime, next, pass)
@@ -812,58 +829,15 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                     state.gateway_unloaded.lock().await.extend(unloaded);
                 }
             }
+            // Stall reversal and the disable restore already happened inside the
+            // worker, where the coordinator and the history live: a restore
+            // runs through the journal, which leaves a value another manager
+            // changed, and a target that was replaced is refused before the
+            // write, in revalidate. What remains here is the mode tracking for
+            // the next pass.
             publish_and_persist(&state, &next_coordinator, wrote).await;
-            let stall_now = published.snapshot.as_ref().and_then(|snapshot| {
-                snapshot
-                    .psi
-                    .map(|reading| reading.some.avg10.round() as u32)
-            });
-            // A stall that rose after a soft limit is put back, and so is every
-            // owned value when automatic mode turns off. Both go through the
-            // journal, which leaves a value another manager changed. A target
-            // that was replaced is already refused before the write, in
-            // revalidate.
-            let mode_now = state.config.read().await.mode;
-            let stall_rose =
-                breadram_core::execution::stall_should_reverse(previous_stall_percent, stall_now);
-            let left_automatic =
-                previous_mode == ManagementMode::Automatic && mode_now != ManagementMode::Automatic;
-            previous_stall_percent = stall_now;
-            previous_mode = mode_now;
-            let held = next_coordinator;
-            if stall_rose || left_automatic {
-                let reason = if stall_rose {
-                    "a stall reading rose after a soft limit"
-                } else {
-                    "automatic mode turned off"
-                };
-                let restored = tokio::task::spawn_blocking(move || {
-                    let mut coordinator = held;
-                    let fs = RealFs;
-                    let targets = discover_targets(&fs);
-                    let runner = ProcessRunner;
-                    let executor = ControlExecutor::new(&fs, &runner, &targets);
-                    let results = coordinator.recover(&executor, clock.monotonic_ms());
-                    (coordinator, results)
-                })
-                .await;
-                match restored {
-                    Ok((next, _results)) => {
-                        tracing::info!(reason, "restored owned values");
-                        publish_and_persist(&state, &next, true).await;
-                        coordinator = Some(next);
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, reason, "the restore failed");
-                        coordinator = Some(Coordinator::resume(
-                            owner_token(),
-                            ActionJournal::new(journal_capacity),
-                        ));
-                    }
-                }
-            } else {
-                coordinator = Some(held);
-            }
+            previous_mode = state.config.read().await.mode;
+            coordinator = Some(next_coordinator);
 
             let status = published.status.clone();
             {
@@ -995,6 +969,10 @@ fn run_execution(
         registry,
         probes,
         clock,
+        history,
+        stall_watch,
+        stall_pending,
+        left_automatic,
     } = step;
     let Some(plan) = plan else {
         return (coordinator, None);
@@ -1017,7 +995,7 @@ fn run_execution(
     )
     .with_hook_runner(&probes.hooks);
     let executor = ChainedExecutor::new(vec![&control, &provider]);
-    let pass = execute_with(
+    let mut pass = execute_with(
         &mut coordinator,
         config,
         plan,
@@ -1027,6 +1005,69 @@ fn run_execution(
         cancel,
         host_bytes,
     );
+    // Every outcome is recorded, so cooldowns and escalation actually engage:
+    // a confirmed action cools its target down, a failed one counts against
+    // the next plan, and a reversed one is marked ineffective. Refusals that
+    // say nothing about the host (duplicates, replacements, unsupported
+    // targets) are not outcomes and are left out.
+    record_history_outcomes(history, workloads, &pass, now_ms);
+    // Every controllable unit is judged every tick, so a baseline exists
+    // before any limit is written, not only after one. Only a scope limited
+    // on the previous pass can be reversed, and only its own values go back:
+    // the rest of the journal is untouched.
+    let risen = stall_watch.judge(&scope_pressure_totals(&fs, &targets));
+    if !stall_pending.is_empty() && !risen.is_empty() {
+        let reverse: Vec<ActionId> = stall_pending
+            .iter()
+            .filter(|(scope, _)| risen.contains(scope))
+            .map(|(_, id)| *id)
+            .collect();
+        if !reverse.is_empty() {
+            let restored = coordinator.recover_actions(&control, now_ms, &reverse);
+            let put_back = restored
+                .iter()
+                .filter(|result| matches!(result.outcome, RestoreOutcome::Restored))
+                .count();
+            for (scope, _) in stall_pending.iter().filter(|(_, id)| reverse.contains(id)) {
+                if let Some(workload) = workloads.iter().find(|w| w.id.scope == *scope) {
+                    history.record(ActionRecord {
+                        target: workload.id.clone(),
+                        kind: ActionKind::CgroupSoftLimit,
+                        at_ms: now_ms,
+                        outcome: ActionOutcome::Ineffective,
+                    });
+                }
+            }
+            pass.notes.push(format!(
+                "reversed {} soft limit(s) after a stall rise, {put_back} value(s) put back; the planner will escalate past them",
+                reverse.len()
+            ));
+            tracing::info!(
+                "a stall rise reversed {} soft limit(s), {put_back} value(s) restored",
+                reverse.len()
+            );
+        }
+    }
+    // The next pass judges the limits this one confirmed.
+    *stall_pending = pass
+        .results
+        .iter()
+        .filter(|result| {
+            result.kind == ActionKind::CgroupSoftLimit && result.state == ActionState::Confirmed
+        })
+        .map(|result| (result.scope.clone(), result.id))
+        .collect();
+    if left_automatic {
+        let restored = coordinator.recover(&control, now_ms);
+        let put_back = restored
+            .iter()
+            .filter(|result| matches!(result.outcome, RestoreOutcome::Restored))
+            .count();
+        pass.notes.push(format!(
+            "automatic mode turned off, {put_back} owned value(s) put back"
+        ));
+        tracing::info!("automatic mode turned off, {put_back} owned value(s) restored");
+    }
     (coordinator, Some(pass))
 }
 
@@ -1043,6 +1084,72 @@ struct ExecutionStep<'a> {
     registry: &'a AdapterRegistry,
     probes: &'a ProviderProbes,
     clock: &'a SystemClock,
+    /// The bounded action history. Outcomes are recorded here so the next
+    /// plan's cooldown and escalation see this pass.
+    history: &'a mut PolicyHistory,
+    /// Per-scope stall accumulation across ticks.
+    stall_watch: &'a mut StallWatch,
+    /// Soft limits the previous pass confirmed and this one judges.
+    stall_pending: &'a mut Vec<(String, ActionId)>,
+    /// Whether this pass leaves automatic mode, which restores everything
+    /// breadram still owns.
+    left_automatic: bool,
+}
+
+/// Record what one pass did in the bounded action history.
+///
+/// Confirmed actions count as successes, failures and timeouts count as
+/// failures. Duplicates, replacements, busy targets, cancellations, and
+/// unsupported actions say nothing about whether the action works, so they
+/// are not recorded: recording a duplicate as a success would refresh a
+/// cooldown forever, and recording a replaced target as a failure would punish
+/// a workload for being restarted.
+fn record_history_outcomes(
+    history: &mut PolicyHistory,
+    workloads: &[Workload],
+    pass: &ExecutionPass,
+    now_ms: u64,
+) {
+    for result in &pass.results {
+        let outcome = match result.state {
+            ActionState::Confirmed => ActionOutcome::Succeeded,
+            ActionState::Failed | ActionState::TimedOut | ActionState::Denied => {
+                ActionOutcome::Failed
+            }
+            _ => continue,
+        };
+        let Some(workload) = workloads.iter().find(|w| w.id.scope == result.scope) else {
+            continue;
+        };
+        history.record(ActionRecord {
+            target: workload.id.clone(),
+            kind: result.kind,
+            at_ms: now_ms,
+            outcome,
+        });
+    }
+}
+
+/// The current `memory.pressure` `total` for every controllable unit.
+///
+/// A scope whose pressure file cannot be read is left out: without a reading
+/// there is no stall signal, and a missing file must never reverse a limit.
+fn scope_pressure_totals(fs: &RealFs, targets: &ControlTargets) -> Vec<(String, u64)> {
+    let mut totals = Vec::with_capacity(targets.len());
+    for target in targets.iter() {
+        let relative = target.control_group.trim_start_matches('/');
+        let path = std::path::Path::new(CGROUP_V2_ROOT)
+            .join(relative)
+            .join("memory.pressure");
+        let Ok(text) = fs.read_to_string(&path) else {
+            continue;
+        };
+        let Ok(reading) = parse_psi(&text) else {
+            continue;
+        };
+        totals.push((target.scope.clone(), reading.some.total_us));
+    }
+    totals
 }
 
 /// The execute step itself, over any executor.
@@ -3029,6 +3136,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 
@@ -3117,6 +3225,7 @@ mod tests {
                 reason: "the workload is over its budget".to_string(),
                 expected_host_ram_delta: -(2 * GIB as i64),
                 requires_confirmed_idle: false,
+                ancestor_bytes: None,
             }],
             explanation: Vec::new(),
         }
@@ -3242,6 +3351,41 @@ mod tests {
 
         assert_eq!(executor.applies(), 1, "a confirmed action is not repeated");
         assert_eq!(coordinator.journal().len(), 3);
+    }
+
+    #[test]
+    fn history_records_outcomes_but_not_refusals() {
+        use breadram_core::coordinator::{ActionId, ActionResult};
+        let target = workload().id;
+        let result = |state: breadram_core::coordinator::ActionState| ActionResult {
+            id: ActionId::for_target(&target, ActionKind::CgroupSoftLimit),
+            scope: target.scope.clone(),
+            kind: ActionKind::CgroupSoftLimit,
+            state,
+            detail: String::new(),
+            effect: None,
+        };
+        let pass = ExecutionPass {
+            requests: Vec::new(),
+            results: vec![
+                result(breadram_core::coordinator::ActionState::Confirmed),
+                result(breadram_core::coordinator::ActionState::Failed),
+                result(breadram_core::coordinator::ActionState::SkippedDuplicate),
+                result(breadram_core::coordinator::ActionState::Superseded),
+            ],
+            notes: Vec::new(),
+        };
+        let mut history = PolicyHistory::new(16, 60_000, 10);
+        record_history_outcomes(&mut history, &[workload()], &pass, 1_000);
+        assert_eq!(
+            history.len(),
+            2,
+            "only the success and the failure are outcomes"
+        );
+        assert!(
+            history.is_cooling_down(&target, 1_001, 30_000),
+            "a recorded action cools its target down"
+        );
     }
 
     #[test]

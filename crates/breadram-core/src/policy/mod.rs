@@ -23,8 +23,8 @@ pub mod state;
 
 pub use activity::{ActivityEvidence, ActivitySource, DebouncedActivity, UnknownActivity};
 pub use budget::{
-    effective_budget, stall_verdict, BudgetInputs, BudgetRefusal, EffectiveBudget, StallVerdict,
-    DESKTOP_RESERVE_BYTES, STALL_RISE_POINTS,
+    effective_budget, stall_delta_verdict, BudgetInputs, BudgetRefusal, EffectiveBudget,
+    StallVerdict, StallWatch, DESKTOP_RESERVE_BYTES, STALL_SCOPE_DELTA_RISE_US,
 };
 pub use history::{ActionOutcome, ActionRecord, PolicyHistory};
 pub use planner::{

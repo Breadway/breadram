@@ -66,6 +66,12 @@ pub struct PlannedAction {
     pub expected_host_ram_delta: i64,
     /// Whether the action needs proven idleness before it may run.
     pub requires_confirmed_idle: bool,
+    /// The parent cgroup's `memory.max`, when one is set.
+    ///
+    /// `None` means the parent is unlimited or unreadable. This is not the
+    /// workload's own cap: that cap is what a soft limit writes, so using it as
+    /// the ancestor would clamp a budget against itself.
+    pub ancestor_bytes: Option<u64>,
 }
 
 /// The result of one planning pass.
@@ -368,19 +374,21 @@ fn generate(
                 .to_string(),
             expected_host_ram_delta: relief(bytes),
             requires_confirmed_idle: true,
+            ancestor_bytes: None,
         });
     }
 
     if allowed.contains(&ActionKind::CgroupSoftLimit) {
         if let Some(configured) = budget_for(config, workload) {
-            // The configured number is a wish. The applied number also leaves
-            // the desktop reserve and respects the host size. The ancestor
-            // clamp still happens at apply time, where the live cgroup limit
-            // is known; the planner does not invent one.
+            // The configured number is a wish. The planned number also leaves
+            // the desktop reserve, respects the host size, and respects the
+            // tightest parent cap the inventory read. The executor clamps
+            // again at apply time against the live cgroup limit, where a
+            // parent that changed since the inventory is still caught.
             match crate::policy::effective_budget(crate::policy::BudgetInputs {
                 configured_bytes: configured,
                 host_bytes,
-                ancestor_bytes: None,
+                ancestor_bytes: workload.ancestor_bytes,
             }) {
                 Ok(effective) if bytes > effective.bytes => {
                     let over = bytes - effective.bytes;
@@ -398,6 +406,7 @@ fn generate(
                         ),
                         expected_host_ram_delta: relief(over),
                         requires_confirmed_idle: false,
+                        ancestor_bytes: workload.ancestor_bytes,
                     });
                 }
                 Ok(_) => {}
@@ -425,6 +434,7 @@ fn generate(
             reason: "it can continue at lower concurrency with less live memory".to_string(),
             expected_host_ram_delta: relief(bytes / 4),
             requires_confirmed_idle: false,
+            ancestor_bytes: None,
         });
     }
 
@@ -435,6 +445,7 @@ fn generate(
             reason: "further background admission can wait".to_string(),
             expected_host_ram_delta: 0,
             requires_confirmed_idle: false,
+            ancestor_bytes: None,
         });
     }
 
@@ -445,6 +456,7 @@ fn generate(
             reason: "provider offload frees device memory by moving it into host RAM".to_string(),
             expected_host_ram_delta: cost(bytes),
             requires_confirmed_idle: true,
+            ancestor_bytes: None,
         });
     }
 
@@ -553,6 +565,7 @@ mod tests {
             },
             control: ControlLevel::Eligible,
             limit_bytes: None,
+            ancestor_bytes: None,
         }
     }
 

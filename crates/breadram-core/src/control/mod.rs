@@ -221,7 +221,10 @@ pub fn probe_availability(fs: &dyn FileSource, target: &ControlTarget) -> Contro
             ),
         },
     };
-    let effective_max_bytes = memory_max.as_deref().and_then(parse_bytes);
+    // The unit's own cap is what a soft limit writes, so it is not the
+    // ancestor: the effective limit is the tightest parent cap, and the plan
+    // already carries the same number from the inventory.
+    let effective_max_bytes = crate::inventory::ancestor_limit(fs, &target.control_group);
 
     let user_manager = if target.user_manager {
         CapabilityState::Available
@@ -324,6 +327,38 @@ mod tests {
             generation: 1,
             user_manager: true,
         };
+        let parent = "/user.slice/user-1000.slice/user@1000.service/app.slice";
+        let grandparent = "/user.slice/user-1000.slice/user@1000.service";
+        let fs = MemoryFs::new()
+            .with("/sys/fs/cgroup/cgroup.controllers", "cpu memory\n")
+            .with(
+                &format!("/sys/fs/cgroup{APP_CGROUP}/memory.max"),
+                "8589934592\n",
+            )
+            .with(
+                &format!("/sys/fs/cgroup{parent}/memory.max"),
+                "4294967296\n",
+            )
+            .with(&format!("/sys/fs/cgroup{grandparent}/memory.max"), "max\n");
+        let availability = probe_availability(&fs, &target);
+        assert!(availability.can_control());
+        assert_eq!(
+            availability.effective_max_bytes,
+            Some(4_294_967_296),
+            "the tightest parent wins, and the unit's own cap is not an ancestor"
+        );
+        assert_eq!(availability.reason(), None);
+    }
+
+    #[test]
+    fn availability_with_unlimited_parents_has_no_ancestor_limit() {
+        let target = ControlTarget {
+            scope: "unit:app.service".to_string(),
+            unit: UnitName::parse("app.service").expect("valid"),
+            control_group: APP_CGROUP.to_string(),
+            generation: 1,
+            user_manager: true,
+        };
         let fs = MemoryFs::new()
             .with("/sys/fs/cgroup/cgroup.controllers", "cpu memory\n")
             .with(
@@ -332,8 +367,10 @@ mod tests {
             );
         let availability = probe_availability(&fs, &target);
         assert!(availability.can_control());
-        assert_eq!(availability.effective_max_bytes, Some(8_589_934_592));
-        assert_eq!(availability.reason(), None);
+        assert_eq!(
+            availability.effective_max_bytes, None,
+            "an unreadable parent constrains nothing"
+        );
     }
 
     #[test]
