@@ -161,10 +161,28 @@ impl ActionJournal {
     /// previous run is held and owned without being a claim that the effect is in
     /// place: a restart restores that value, so the relief it provided is gone,
     /// and the action must be allowed to run again when the pressure returns.
+    /// A rollback re-arms the same way: the newest entry that says something
+    /// about the effect decides, so a limit that was put back may be proposed
+    /// again once policy allows it. Policy still escalates past an action that
+    /// proved ineffective, so a re-armed id is a retry, not a flap. A recorded
+    /// duplicate is transparent: it observed an effect already in place rather
+    /// than changing anything, so it never re-arms nor confirms on its own.
     pub fn has_confirmed(&self, id: ActionId) -> bool {
-        self.entries.iter().any(|entry| {
-            entry.id == id && entry.kind.is_some() && entry.state == ActionState::Confirmed
-        })
+        for entry in self.entries.iter().rev() {
+            if entry.id != id {
+                continue;
+            }
+            if entry.state == ActionState::SkippedDuplicate {
+                continue;
+            }
+            if entry.state == ActionState::RolledBack {
+                return false;
+            }
+            if entry.kind.is_some() {
+                return entry.state == ActionState::Confirmed;
+            }
+        }
+        false
     }
 
     /// Every owned value, newest first, de-duplicated by key.
@@ -343,6 +361,29 @@ mod tests {
         );
         journal.record(entry(id, None, ActionState::Confirmed));
         assert!(journal.has_confirmed(id));
+    }
+
+    #[test]
+    fn a_rolled_back_action_may_run_again() {
+        let mut journal = ActionJournal::new(4);
+        let id = ActionId::from_scope("a", 1, ActionKind::CgroupSoftLimit);
+        journal.record(entry(id, None, ActionState::Confirmed));
+        assert!(journal.has_confirmed(id));
+        journal.record(entry(id, None, ActionState::SkippedDuplicate));
+        assert!(
+            journal.has_confirmed(id),
+            "a recorded duplicate observes the effect, it does not reset it"
+        );
+        journal.record(entry(id, None, ActionState::RolledBack));
+        assert!(
+            !journal.has_confirmed(id),
+            "a limit that was put back is not still in place"
+        );
+        journal.record(entry(id, None, ActionState::Confirmed));
+        assert!(
+            journal.has_confirmed(id),
+            "a retry that confirms suppresses a repeat again"
+        );
     }
 
     #[test]

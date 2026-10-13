@@ -68,6 +68,7 @@ fn model_workload(scope: &str, bytes: u64) -> Workload {
         },
         control: ControlLevel::Eligible,
         limit_bytes: None,
+        ancestor_bytes: None,
     }
 }
 

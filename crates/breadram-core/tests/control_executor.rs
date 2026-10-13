@@ -89,9 +89,16 @@ fn stat_line(pid: u32, comm: &str, ppid: u32, starttime: u64) -> String {
 }
 
 /// A cgroup tree with the memory controller enabled for the app unit.
+///
+/// The parent slice carries the same 8 GiB cap as the unit, so the ancestor
+/// clamp has a real parent to read: the unit's own file is never the ancestor.
 fn host_fs() -> MemoryFs {
     MemoryFs::new()
         .with("/sys/fs/cgroup/cgroup.controllers", "cpu memory pids\n")
+        .with(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/memory.max",
+            &format!("{MEMORY_MAX}\n"),
+        )
         .with(
             &format!("/sys/fs/cgroup{APP_CGROUP}/memory.max"),
             &format!("{MEMORY_MAX}\n"),
@@ -227,6 +234,7 @@ fn workload() -> Workload {
         },
         control: ControlLevel::Eligible,
         limit_bytes: None,
+        ancestor_bytes: None,
     }
 }
 

@@ -33,6 +33,7 @@ fn workload(scope: &str, generation: u64, name: &str) -> Workload {
         },
         control: ControlLevel::Eligible,
         limit_bytes: None,
+        ancestor_bytes: None,
     }
 }
 
@@ -327,6 +328,51 @@ fn recovery_after_a_restart_restores_values_breadram_still_owns() {
     // A second recovery has nothing left to do.
     let again = restarted.recover(&executor, 10_000);
     assert_eq!(again[0].outcome, RestoreOutcome::SkippedNoChange);
+}
+
+#[test]
+fn a_scoped_recovery_restores_only_the_named_action() {
+    const OTHER: &str = "cgroup:unit:render.service/memory.high";
+    let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB)
+        .script_apply(Ok(AppliedChange {
+            values: vec![owned(KEY, "4294967296", "2147483648")],
+            note: None,
+        }))
+        .script_apply(Ok(AppliedChange {
+            values: vec![owned(OTHER, "max", "1073741824")],
+            note: None,
+        }));
+    let mut coordinator = coordinator();
+    let workloads = vec![
+        workload("unit:app.service", 1, "app"),
+        workload("unit:render.service", 1, "render"),
+    ];
+    let results = coordinator.execute(
+        &[
+            request("unit:app.service", 1),
+            request("unit:render.service", 1),
+        ],
+        &workloads,
+        &executor,
+        2_000,
+        &Cancellation::new(),
+    );
+    assert!(
+        results
+            .iter()
+            .all(|result| result.state == ActionState::Confirmed),
+        "{results:?}"
+    );
+
+    let restored = coordinator.recover_actions(&executor, 9_000, &[results[0].id]);
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].outcome, RestoreOutcome::Restored);
+    assert_eq!(executor.value(KEY).as_deref(), Some("4294967296"));
+    assert_eq!(
+        executor.value(OTHER).as_deref(),
+        Some("1073741824"),
+        "the scope that did not stall is untouched"
+    );
 }
 
 #[test]
