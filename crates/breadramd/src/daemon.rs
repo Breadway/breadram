@@ -637,6 +637,10 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             owner_token(),
             persisted.to_journal(journal_capacity),
         ));
+        // The stall reading from the previous pass, so a soft limit can be
+        // reversed when the next reading is worse. None until the first pass.
+        let mut previous_stall_percent: Option<u32> = None;
+        let mut previous_mode = initial_config.mode;
 
         // A restart restores the values breadram still owns, and only those: a
         // value something else changed is left alone, and a target that is gone
@@ -741,6 +745,11 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                         plan: published.plan.as_ref(),
                         workloads: &published.workloads,
                         now_ms: published.status.observed_at_ms,
+                        host_bytes: published
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.meminfo.total)
+                            .unwrap_or(0),
                         cancel: &cancel,
                         registry: &current_runtime.registry,
                         probes: &probes,
@@ -804,7 +813,57 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                 }
             }
             publish_and_persist(&state, &next_coordinator, wrote).await;
-            coordinator = Some(next_coordinator);
+            let stall_now = published.snapshot.as_ref().and_then(|snapshot| {
+                snapshot
+                    .psi
+                    .map(|reading| reading.some.avg10.round() as u32)
+            });
+            // A stall that rose after a soft limit is put back, and so is every
+            // owned value when automatic mode turns off. Both go through the
+            // journal, which leaves a value another manager changed. A target
+            // that was replaced is already refused before the write, in
+            // revalidate.
+            let mode_now = state.config.read().await.mode;
+            let stall_rose =
+                breadram_core::execution::stall_should_reverse(previous_stall_percent, stall_now);
+            let left_automatic =
+                previous_mode == ManagementMode::Automatic && mode_now != ManagementMode::Automatic;
+            previous_stall_percent = stall_now;
+            previous_mode = mode_now;
+            let held = next_coordinator;
+            if stall_rose || left_automatic {
+                let reason = if stall_rose {
+                    "a stall reading rose after a soft limit"
+                } else {
+                    "automatic mode turned off"
+                };
+                let restored = tokio::task::spawn_blocking(move || {
+                    let mut coordinator = held;
+                    let fs = RealFs;
+                    let targets = discover_targets(&fs);
+                    let runner = ProcessRunner;
+                    let executor = ControlExecutor::new(&fs, &runner, &targets);
+                    let results = coordinator.recover(&executor, clock.monotonic_ms());
+                    (coordinator, results)
+                })
+                .await;
+                match restored {
+                    Ok((next, _results)) => {
+                        tracing::info!(reason, "restored owned values");
+                        publish_and_persist(&state, &next, true).await;
+                        coordinator = Some(next);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, reason, "the restore failed");
+                        coordinator = Some(Coordinator::resume(
+                            owner_token(),
+                            ActionJournal::new(journal_capacity),
+                        ));
+                    }
+                }
+            } else {
+                coordinator = Some(held);
+            }
 
             let status = published.status.clone();
             {
@@ -931,6 +990,7 @@ fn run_execution(
         plan,
         workloads,
         now_ms,
+        host_bytes,
         cancel,
         registry,
         probes,
@@ -965,6 +1025,7 @@ fn run_execution(
         &executor,
         now_ms,
         cancel,
+        host_bytes,
     );
     (coordinator, Some(pass))
 }
@@ -975,6 +1036,8 @@ struct ExecutionStep<'a> {
     plan: Option<&'a Plan>,
     workloads: &'a [Workload],
     now_ms: u64,
+    /// Host RAM from the snapshot. Zero means unknown, which refuses a soft limit.
+    host_bytes: u64,
     cancel: &'a Cancellation,
     /// The configured providers, so a provider action can be carried out.
     registry: &'a AdapterRegistry,
@@ -995,6 +1058,7 @@ fn execute_with(
     executor: &dyn Executor,
     now_ms: u64,
     cancel: &Cancellation,
+    host_bytes: u64,
 ) -> ExecutionPass {
     execute_plan(
         coordinator,
@@ -1005,6 +1069,7 @@ fn execute_with(
         executor,
         now_ms,
         cancel,
+        host_bytes,
     )
 }
 
@@ -3075,6 +3140,7 @@ mod tests {
             &executor,
             1_000,
             &Cancellation::new(),
+            64 * 1024 * 1024 * 1024,
         );
 
         assert_eq!(executor.applies(), 1);
@@ -3118,6 +3184,7 @@ mod tests {
             &executor,
             1_000,
             &Cancellation::new(),
+            64 * 1024 * 1024 * 1024,
         );
 
         assert_eq!(executor.applies(), 0, "monitor mode must not write");
@@ -3140,6 +3207,7 @@ mod tests {
             &executor,
             1_000,
             &Cancellation::new(),
+            64 * 1024 * 1024 * 1024,
         );
 
         assert_eq!(executor.applies(), 0);
@@ -3168,6 +3236,7 @@ mod tests {
                 &executor,
                 1_000,
                 &Cancellation::new(),
+                64 * 1024 * 1024 * 1024,
             );
         }
 
@@ -3279,6 +3348,7 @@ mod tests {
             &executor,
             1_000,
             &Cancellation::new(),
+            64 * 1024 * 1024 * 1024,
         );
         let stored = PersistedJournal::from_journal(coordinator.journal());
         write_state_file(&path, &stored.encode().expect("encodes")).expect("writes");

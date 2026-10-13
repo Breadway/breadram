@@ -257,6 +257,7 @@ impl Harness {
             &executor,
             clock.monotonic_ms(),
             &Cancellation::new(),
+            64 * 1024 * 1024 * 1024,
         )
     }
 }

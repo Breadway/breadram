@@ -49,13 +49,23 @@ hard cap and breadram sets no default `MemoryMax`, so a budget cannot be what
 kills an application. An explicit hard cap, where a caller asks for one, is
 the existing `MemoryMax` path on a supervised job and is not added here.
 
+The number written is the effective budget, not the configured wish.
+`value_to_apply` calls `effective_budget` with the snapshot's host total, so a
+wish that would fill the host is shrunk by the desktop reserve before the
+write. A soft limit with no configured budget is refused rather than invented
+from current usage. The live ancestor clamp still happens at apply time, where
+the cgroup limit is known.
+
 `stall_verdict` compares PSI percent before and after a limit. A rise of one
-point or more is `Reverse`: the previous value goes back through the journal,
-which restores only a value breadram still owns. A flat or falling reading is
-`Keep`. Cooling, a user disable, a replaced target, and a foreign manager are
-already the journal's ownership rules: a changed value is left alone, a gone
-target is skipped, and a crash reloads the journal rather than re-admitting
-work it cannot prove it still owns.
+point or more is `Reverse`. The daemon keeps the previous pass's reading and,
+when the next one rises, calls `recover`, which puts back only a value
+breadram still owns. A missing PSI reading is not a rise. The same restore
+runs when automatic mode turns off, which is the user disable. A target that
+was replaced between planning and writing is refused before the write. A value
+another manager changed is left alone, a gone target is skipped, and a crash
+reloads the journal rather than re-admitting work it cannot prove it still
+owns. Cooling still skips the target for the cooldown window rather than
+restoring it.
 
 Measured on this host with `scripts/measure-budget.sh`, two disposable user
 scopes capped at 80 MiB plus 48 MiB swap so the host cannot be exhausted. The
