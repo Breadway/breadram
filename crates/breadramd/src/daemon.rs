@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use breadram_core::adapter::{
     AdapterExecutor, AdapterRegistry, CircuitConfig, HttpTransport, ProcessHookRunner, Sleeper,
+    UnixSocketRunner,
 };
 use breadram_core::config::{validate, ActionKind, Config, GatewayTracking, HintState, Priority};
 use breadram_core::control::{discover_targets, ControlExecutor, ControlTargets, ProcessRunner};
@@ -450,6 +451,7 @@ struct ProviderProbes {
     sleeper: ThreadSleeper,
     circuit: CircuitConfig,
     hooks: ProcessHookRunner,
+    sockets: UnixSocketRunner,
 }
 
 /// A sleeper that really waits.
@@ -487,6 +489,11 @@ fn refresh_adapters(
     notes.extend(breadram_core::adapter::refresh_hooks(
         registry,
         &probes.hooks,
+        clock.monotonic_ms(),
+    ));
+    notes.extend(breadram_core::adapter::refresh_sockets(
+        registry,
+        &probes.sockets,
         clock.monotonic_ms(),
     ));
     notes
@@ -1001,7 +1008,8 @@ fn run_execution(
         &probes.sleeper,
         clock,
     )
-    .with_hook_runner(&probes.hooks);
+    .with_hook_runner(&probes.hooks)
+    .with_socket_runner(&probes.sockets);
     // Cooperative job controls reach only running supervised jobs, through
     // the directive files those jobs already read. Each executor claims a
     // disjoint set of actions, so a reduce is never sent to a host control

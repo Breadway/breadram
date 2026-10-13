@@ -37,6 +37,7 @@ use crate::policy::activity::ActivityEvidence;
 use crate::policy::MIN_IDLE_MS;
 use crate::telemetry::fs::Clock;
 
+use super::breadsearch::{is_breadsearch_url, socket_path_for, SocketRunner};
 use super::capability::AdapterCapability;
 use super::hook::{is_hook_url, parse_release, parse_status, parse_wake, HookRunner, HookVerb};
 use super::probe::{
@@ -98,6 +99,9 @@ pub struct AdapterExecutor<'a> {
     /// Runs hook programs. `None` outside the daemon, which refuses hook
     /// operations rather than running them with no runner.
     hooks: Option<&'a dyn HookRunner>,
+    /// Reaches daemon sockets. `None` outside the daemon, which refuses
+    /// socket operations rather than running them with no runner.
+    sockets: Option<&'a dyn SocketRunner>,
 }
 
 impl<'a> AdapterExecutor<'a> {
@@ -123,6 +127,7 @@ impl<'a> AdapterExecutor<'a> {
             circuit: CircuitConfig::default(),
             operation_timeout_ms: DEFAULT_OPERATION_TIMEOUT_MS,
             hooks: None,
+            sockets: None,
         }
     }
 
@@ -144,6 +149,15 @@ impl<'a> AdapterExecutor<'a> {
     /// operations are refused rather than run by some default.
     pub fn with_hook_runner(mut self, runner: &'a dyn HookRunner) -> Self {
         self.hooks = Some(runner);
+        self
+    }
+
+    /// Run socket operations through this runner.
+    ///
+    /// The daemon supplies the real socket runner. Without one, socket
+    /// operations are refused rather than run by some default.
+    pub fn with_socket_runner(mut self, runner: &'a dyn SocketRunner) -> Self {
+        self.sockets = Some(runner);
         self
     }
 
@@ -183,6 +197,9 @@ impl<'a> AdapterExecutor<'a> {
             )));
         }
         if is_hook_url(url) {
+            return Ok(());
+        }
+        if is_breadsearch_url(url) {
             return Ok(());
         }
         if !super::is_encrypted_or_loopback(url) {
@@ -258,6 +275,12 @@ impl<'a> AdapterExecutor<'a> {
                         .to_string(),
                 ));
             }
+            if is_breadsearch_url(&operation.request.url) && self.sockets.is_none() {
+                return Err(Refusal::Denied(
+                    "the operation needs a socket runner, which this caller did not provide"
+                        .to_string(),
+                ));
+            }
             return Ok(operation);
         }
         Err(Refusal::Unsupported(reasons.join("; ")))
@@ -285,6 +308,184 @@ impl<'a> AdapterExecutor<'a> {
                     .hook_spec()
                     .map(|spec| (adapter.name().to_string(), spec))
             })
+    }
+
+    /// The socket owner, adapter, and path for a workload, when one exists.
+    #[allow(clippy::type_complexity)]
+    fn socket_owner(
+        &self,
+        workload: &Workload,
+    ) -> Option<(
+        String,
+        crate::adapter::breadsearch::SocketSpec,
+        &dyn super::WorkloadAdapter,
+    )> {
+        self.registry
+            .owners(workload)
+            .into_iter()
+            .find_map(|adapter| {
+                adapter
+                    .socket_spec()
+                    .map(|spec| (adapter.name().to_string(), spec, adapter))
+            })
+    }
+}
+
+/// A socket failure as the executor reports it.
+///
+/// An unreachable socket is a lost connection rather than a refusal: the
+/// daemon may have exited between planning and applying. Anything else is a
+/// failure to carry out, with the reason kept short.
+fn socket_error(error: super::breadsearch::SocketError) -> ExecutorError {
+    use super::breadsearch::SocketError;
+    match error {
+        SocketError::Unreachable(path) => {
+            ExecutorError::Disconnected(format!("no breadmill answers at {path}"))
+        }
+        SocketError::Timeout(ms) => {
+            ExecutorError::Timeout(format!("breadmill did not answer within {ms} ms"))
+        }
+        other => ExecutorError::Failed(format!("the socket round trip failed: {other}")),
+    }
+}
+
+impl<'a> AdapterExecutor<'a> {
+    /// Carry out a socket unload operation.
+    ///
+    /// The unload verb runs with the runner's bounds, and breadmill's answer
+    /// decides the outcome: an explicit busy refusal reports a denial, a
+    /// socket that cannot be reached reports a failure, and only `ok` counts
+    /// as applied. Confirmation still happens separately, through a fresh
+    /// status read.
+    fn apply_socket(
+        &self,
+        request: &crate::coordinator::ActionRequest,
+        operation: &AdapterOperation,
+    ) -> Result<AppliedChange, ExecutorError> {
+        let Some(runner) = self.sockets else {
+            return Err(ExecutorError::Denied(
+                "the operation needs a socket runner, which this caller did not provide"
+                    .to_string(),
+            ));
+        };
+        let Some(workload) = self.workload(&request.target) else {
+            return Err(ExecutorError::Failed(format!(
+                "the target {} is no longer present",
+                request.target.scope
+            )));
+        };
+        let Some((_, spec, _)) = self.socket_owner(workload) else {
+            return Err(ExecutorError::Unsupported(format!(
+                "no configured socket owns {}, so nothing can release its memory",
+                workload.id.scope
+            )));
+        };
+        let Some((socket_path, verb)) = socket_path_for(&operation.request.url) else {
+            return Err(ExecutorError::Failed(format!(
+                "{} is not a socket operation this executor can send",
+                operation.request.url
+            )));
+        };
+        if socket_path != spec.socket_path {
+            return Err(ExecutorError::Denied(format!(
+                "{socket_path} is not the socket this operation was planned against"
+            )));
+        }
+        // URL verbs are short (`unload`); the wire names the full request
+        // kind (`unload_model`). The mapping lives here, at the one place a
+        // socket body is built, so an adapter can never send a verb the
+        // daemon does not understand.
+        let body = match verb {
+            "status" => r#"{"type":"status"}"#.to_string(),
+            "unload" => r#"{"type":"unload_model"}"#.to_string(),
+            "load" => r#"{"type":"load_model"}"#.to_string(),
+            _ => {
+                return Err(ExecutorError::Failed(format!(
+                    "{verb} is not a socket verb this executor sends"
+                )));
+            }
+        };
+        match runner.request(socket_path, &body) {
+            Ok(answer) => {
+                let answer = answer.trim();
+                if answer.contains(r#""type":"ok""#) || answer.contains(r#""type": "ok""#) {
+                    Ok(AppliedChange {
+                        values: Vec::new(),
+                        note: Some(operation_note(request, operation)),
+                    })
+                } else if answer.contains("busy") {
+                    Err(ExecutorError::Denied(format!(
+                        "breadmill declined the unload: {}",
+                        excerpt(answer)
+                    )))
+                } else {
+                    Err(ExecutorError::Denied(format!(
+                        "breadmill did not confirm the unload: {}",
+                        excerpt(answer)
+                    )))
+                }
+            }
+            Err(error) => Err(socket_error(error)),
+        }
+    }
+
+    /// Confirm a socket unload with a fresh status read.
+    ///
+    /// The answer is recorded into the owning adapter before it is judged, so
+    /// the next reading of the target is the one just taken. Only a status
+    /// that parses and reports the model gone confirms the effect.
+    fn confirm_socket(
+        &self,
+        request: &crate::coordinator::ActionRequest,
+        _operation: &AdapterOperation,
+    ) -> Confirmation {
+        let now_ms = self.clock.monotonic_ms();
+        let Some(runner) = self.sockets else {
+            return Confirmation::NotYet {
+                reason: "the operation needs a socket runner, which this caller did not provide"
+                    .to_string(),
+            };
+        };
+        let Some(workload) = self.workload(&request.target) else {
+            return Confirmation::NotYet {
+                reason: format!("the target {} is no longer present", request.target.scope),
+            };
+        };
+        let owners = self.registry.owners(workload);
+        let Some(adapter) = owners
+            .iter()
+            .find(|adapter| adapter.socket_spec().is_some())
+        else {
+            return Confirmation::NotYet {
+                reason: format!(
+                    "no configured socket owns {}, so there is nothing to read back",
+                    workload.id.scope
+                ),
+            };
+        };
+        let (Some(spec), name) = (adapter.socket_spec(), adapter.name().to_string()) else {
+            return Confirmation::NotYet {
+                reason: "the socket owner has no socket to read back".to_string(),
+            };
+        };
+        let result = runner.request(&spec.socket_path, r#"{"type":"status"}"#);
+        let _ = adapter.note_socket_result(result.clone(), now_ms);
+        match result {
+            Ok(body) => match super::breadsearch::parse_status(&body) {
+                Ok(status) if !status.model_ready => Confirmation::Confirmed,
+                Ok(_) => Confirmation::NotYet {
+                    reason: format!(
+                        "breadmill {name} still reports its model loaded, so the effect is not visible yet"
+                    ),
+                },
+                Err(reason) => Confirmation::NotYet {
+                    reason: format!("the effect could not be read back: {reason}"),
+                },
+            },
+            Err(error) => Confirmation::NotYet {
+                reason: format!("the effect could not be read back: {error}"),
+            },
+        }
     }
 
     /// Carry out a hook release operation.
@@ -418,6 +619,9 @@ impl Executor for AdapterExecutor<'_> {
         if is_hook_url(&operation.request.url) {
             return self.apply_hook(request, &operation);
         }
+        if is_breadsearch_url(&operation.request.url) {
+            return self.apply_socket(request, &operation);
+        }
         match self
             .operations
             .send_operation(&operation.request, self.operation_timeout_ms)
@@ -463,6 +667,9 @@ impl Executor for AdapterExecutor<'_> {
         );
         if is_hook_url(&operation.confirmation.request.url) {
             return self.confirm_hook(request, &operation);
+        }
+        if is_breadsearch_url(&operation.confirmation.request.url) {
+            return self.confirm_socket(request, &operation);
         }
         let result = probe.probe(&operation.confirmation.request);
         // The answer is recorded before it is judged, so the next reading of the
@@ -721,6 +928,7 @@ mod tests {
         ScriptedTransport,
     };
     use crate::adapter::{HookError, HookRunner, HookSpec, HookVerb};
+    use crate::adapter::{SocketError, SocketRunner};
     use crate::config::{Config, ProviderEndpoint, ProviderKind};
     use crate::coordinator::ActionRequest;
     use crate::inventory::{ControlLevel, MemoryAccounting};
@@ -1475,6 +1683,229 @@ mod tests {
                 assert!(reason.contains("does not offer wake"), "{reason}")
             }
             other => panic!("expected unsupported, got {other:?}"),
+        }
+    }
+
+    const SOCKET_ENDPOINT: &str = "breadsearch:/run/user/1000/breadmill.sock";
+    const SOCKET_SCOPE: &str = "unit:breadmill.service";
+
+    const SOCKET_IDLE: &str = r#"{"type":"status_info","indexed":41,"pending":0,"model_ready":true,"in_flight":0,"loading":false,"model_bytes":547310275,"version":"0.4.0"}"#;
+    const SOCKET_UNLOADED: &str = r#"{"type":"status_info","indexed":41,"pending":0,"model_ready":false,"in_flight":0,"loading":false,"model_bytes":547310275,"version":"0.4.0"}"#;
+    const SOCKET_OK: &str = r#"{"type":"ok"}"#;
+
+    fn socket_workload() -> Workload {
+        Workload {
+            id: WorkloadId {
+                scope: SOCKET_SCOPE.to_string(),
+                generation: 1,
+            },
+            name: "breadmill.service".to_string(),
+            pids: vec![100],
+            accounting: MemoryAccounting::Cgroup {
+                current_bytes: Some(1024),
+            },
+            control: ControlLevel::Eligible,
+            limit_bytes: None,
+            ancestor_bytes: None,
+        }
+    }
+
+    fn socket_registry(allow_automation: bool) -> AdapterRegistry {
+        let config = Config {
+            providers: vec![ProviderEndpoint {
+                name: "breadmill".to_string(),
+                kind: ProviderKind::Breadsearch,
+                url: SOCKET_ENDPOINT.to_string(),
+                scope: Some(SOCKET_SCOPE.to_string()),
+                credential_ref: None,
+                allow_automation,
+                igpu: false,
+                command: Vec::new(),
+                hook_timeout_ms: None,
+                hook_max_output_bytes: None,
+            }],
+            mode: ManagementMode::Automatic,
+            ..Config::default()
+        };
+        let (registry, notes) = AdapterRegistry::from_config(&config);
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("contributes nothing")),
+            "{notes:?}"
+        );
+        assert_eq!(registry.names(), vec!["breadmill"]);
+        registry
+    }
+
+    /// Canned socket answers in call order, every call recorded.
+    #[derive(Default)]
+    struct FakeSockets {
+        answers: std::sync::Mutex<std::collections::VecDeque<Result<String, SocketError>>>,
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeSockets {
+        fn scripted(answers: Vec<Result<String, SocketError>>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.into()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SocketRunner for FakeSockets {
+        fn request(&self, socket_path: &str, body: &str) -> Result<String, SocketError> {
+            self.calls
+                .lock()
+                .expect("not poisoned")
+                .push((socket_path.to_string(), body.to_string()));
+            self.answers
+                .lock()
+                .expect("not poisoned")
+                .pop_front()
+                .unwrap_or_else(|| panic!("no socket answer scripted for {body}"))
+        }
+    }
+
+    fn socket_request() -> ActionRequest {
+        ActionRequest::new(
+            socket_workload().id.clone(),
+            ActionKind::UnloadIdleModel,
+            "testing",
+            60_000,
+        )
+    }
+
+    fn socket_executor<'a>(
+        registry: &'a AdapterRegistry,
+        workloads: &'a [Workload],
+        probes: &'a ScriptedTransport,
+        operations: &'a ScriptedTransport,
+        clock: &'a FixedClock,
+        sockets: Option<&'a FakeSockets>,
+    ) -> AdapterExecutor<'a> {
+        let base = AdapterExecutor::new(registry, workloads, probes, operations, &NoSleep, clock);
+        match sockets {
+            Some(runner) => base.with_socket_runner(runner),
+            None => base,
+        }
+    }
+
+    #[test]
+    fn an_idle_breadmill_unload_is_applied_and_confirmed() {
+        let registry = socket_registry(true);
+        let sockets = FakeSockets::scripted(vec![
+            Ok(SOCKET_IDLE.to_string()),
+            Ok(SOCKET_OK.to_string()),
+            Ok(SOCKET_UNLOADED.to_string()),
+        ]);
+        registry.refresh_sockets(&sockets, 0);
+        let workloads = [socket_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = socket_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&sockets),
+        );
+        assert_eq!(
+            executor.precondition(&socket_request()),
+            Precondition::Ready
+        );
+        let change = executor.apply(&socket_request()).expect("unload applies");
+        assert!(
+            change
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("cold start")),
+            "the cost stays in the note: {change:?}"
+        );
+        assert_eq!(executor.confirm(&socket_request()), Confirmation::Confirmed);
+        let calls = sockets.calls.lock().expect("not poisoned");
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].1.contains("unload_model"), "{calls:?}");
+        assert!(calls[2].1.contains("status"), "{calls:?}");
+    }
+
+    #[test]
+    fn a_busy_breadmill_denies_the_unload() {
+        let registry = socket_registry(true);
+        let sockets = FakeSockets::scripted(vec![
+            Ok(SOCKET_IDLE.to_string()),
+            Ok(r#"{"type":"error","message":"busy: 2 queries in flight"}"#.to_string()),
+        ]);
+        registry.refresh_sockets(&sockets, 0);
+        let workloads = [socket_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = socket_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&sockets),
+        );
+        match executor.apply(&socket_request()) {
+            Err(ExecutorError::Denied(reason)) => assert!(reason.contains("busy"), "{reason}"),
+            other => panic!("expected a busy denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_socket_unload_is_refused_without_a_runner() {
+        let registry = socket_registry(true);
+        let seeder = FakeSockets::scripted(vec![Ok(SOCKET_IDLE.to_string())]);
+        registry.refresh_sockets(&seeder, 0);
+        let workloads = [socket_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = socket_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            None,
+        );
+        match executor.precondition(&socket_request()) {
+            Precondition::Denied { reason } => {
+                assert!(reason.contains("socket runner"), "{reason}")
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_daemon_is_a_disconnect_not_a_refusal() {
+        let registry = socket_registry(true);
+        let sockets = FakeSockets::scripted(vec![
+            Ok(SOCKET_IDLE.to_string()),
+            Err(SocketError::Unreachable(
+                "/run/user/1000/breadmill.sock".to_string(),
+            )),
+        ]);
+        registry.refresh_sockets(&sockets, 0);
+        let workloads = [socket_workload()];
+        let probes = ScriptedTransport::new();
+        let operations = ScriptedTransport::new();
+        let executor = socket_executor(
+            &registry,
+            &workloads,
+            &probes,
+            &operations,
+            &FixedClock(60_000),
+            Some(&sockets),
+        );
+        match executor.apply(&socket_request()) {
+            Err(ExecutorError::Disconnected(reason)) => {
+                assert!(reason.contains("no breadmill answers"), "{reason}")
+            }
+            other => panic!("expected a disconnect, got {other:?}"),
         }
     }
 

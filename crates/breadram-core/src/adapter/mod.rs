@@ -24,6 +24,7 @@
 //!   endpoint answering `404` or `405` for a model administration surface is
 //!   recorded as unsupported rather than guessed at.
 
+pub mod breadsearch;
 pub mod capability;
 pub mod executor;
 pub mod hook;
@@ -33,6 +34,10 @@ pub mod mock;
 pub mod ollama;
 pub mod probe;
 
+pub use breadsearch::{
+    is_breadsearch_url, socket_path_for, BreadsearchAdapter, SocketError, SocketRunner, SocketSpec,
+    UnixSocketRunner,
+};
 pub use capability::{AdapterCapabilities, AdapterCapability, CAPABILITY_PROBE_VERSION};
 pub use executor::{AdapterExecutor, DEFAULT_OPERATION_TIMEOUT_MS, MAX_ERROR_EXCERPT_CHARS};
 pub use hook::{
@@ -374,9 +379,38 @@ pub trait WorkloadAdapter: Send + Sync {
     }
 
     /// Run this adapter's hook program once and record what came back.
+    /// The default does nothing, so adapters without a hook cost nothing.
+    /// The socket this adapter reads and writes, when it speaks a daemon
+    /// socket rather than HTTP or a hook program. Only [`BreadsearchAdapter`]
+    /// returns one; the default keeps every other adapter compiling unchanged
+    /// and lets the executor find the socket owner without downcasting.
+    fn socket_spec(&self) -> Option<SocketSpec> {
+        None
+    }
+
+    /// Record a socket answer outside the refresh path.
     ///
-    /// The default does nothing, so adapters without a hook cost nothing on a
-    /// refresh pass.
+    /// The default ignores it, which is right for every adapter that never
+    /// touches a socket.
+    fn note_socket_result(
+        &self,
+        _result: Result<String, crate::adapter::breadsearch::SocketError>,
+        _at_ms: u64,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Read this adapter's daemon socket once and record what came back.
+    ///
+    /// The default does nothing, so adapters without a socket cost nothing on
+    /// a refresh pass.
+    fn refresh_socket(
+        &self,
+        _runner: &dyn crate::adapter::breadsearch::SocketRunner,
+        _at_ms: u64,
+    ) -> Vec<String> {
+        Vec::new()
+    }
     fn refresh_hook(&self, _runner: &dyn HookRunner, _at_ms: u64) -> Vec<String> {
         Vec::new()
     }
@@ -520,6 +554,44 @@ impl AdapterRegistry {
                         ));
                     }
                 }
+                ProviderKind::Breadsearch => {
+                    match socket_path_for_endpoint(&provider.url) {
+                        Some(socket_path) => {
+                            let mut observation = vec![
+                                AdapterCapability::Inventory,
+                                AdapterCapability::Activity,
+                            ];
+                            if provider.allow_automation {
+                                observation.push(AdapterCapability::UnloadModel);
+                            }
+                            let capabilities =
+                                AdapterCapabilities::configured(&observation);
+                            registry.register(Box::new(
+                                BreadsearchAdapter::new(
+                                    provider.name.clone(),
+                                    socket_path,
+                                    scope.to_string(),
+                                )
+                                .with_capabilities(capabilities),
+                            ));
+                            if provider.allow_automation {
+                                notes.push(format!(
+                                    "provider {} may unload the breadmill model when automation allows it; the unload is confirmed by a fresh status read, and the next search reloads the model on demand",
+                                    provider.name
+                                ));
+                            } else {
+                                notes.push(format!(
+                                    "provider {} is observation only: automation is off, so no unload is offered",
+                                    provider.name
+                                ));
+                            }
+                        }
+                        None => notes.push(format!(
+                            "provider {} is a breadsearch endpoint without a breadsearch:<socket path> url, so it contributes nothing",
+                            provider.name
+                        )),
+                    }
+                }
                 other => notes.push(format!(
                     "provider {} speaks {other:?}, which this build has no adapter for yet",
                     provider.name
@@ -645,6 +717,21 @@ impl AdapterRegistry {
             .collect()
     }
 
+    /// Read every socket daemon once and record what came back.
+    ///
+    /// Notes come back in registration order. Adapters without a socket do
+    /// nothing here.
+    pub fn refresh_sockets(
+        &self,
+        runner: &dyn crate::adapter::breadsearch::SocketRunner,
+        at_ms: u64,
+    ) -> Vec<String> {
+        self.adapters
+            .iter()
+            .flat_map(|adapter| adapter.refresh_socket(runner, at_ms))
+            .collect()
+    }
+
     /// An activity source the policy core can consume.
     ///
     /// This is the whole bridge. Policy sees [`ActivitySource`] and never learns
@@ -655,6 +742,19 @@ impl AdapterRegistry {
             workloads,
         }
     }
+}
+
+/// The socket path a breadsearch endpoint URL names.
+///
+/// Endpoint URLs look like `breadsearch:/run/user/1000/breadmill.sock`. The
+/// path must be absolute: a relative socket path is a configuration mistake,
+/// not something to resolve against a daemon working directory.
+fn socket_path_for_endpoint(url: &str) -> Option<String> {
+    let path = url.strip_prefix("breadsearch:")?;
+    if !path.starts_with('/') || path.contains('\0') {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// Read every configured endpoint once and record what came back.
@@ -698,6 +798,20 @@ pub fn refresh_hooks(
     at_ms: u64,
 ) -> Vec<String> {
     registry.refresh_hooks(runner, at_ms)
+}
+
+/// Read every socket daemon once and record what came back.
+///
+/// Only adapters that speak a daemon socket do anything here; every other
+/// adapter is skipped by its own default. A read that failed is recorded as a
+/// failed reading rather than leaving the previous success in place, and the
+/// returned notes name the daemon that could not be read.
+pub fn refresh_sockets(
+    registry: &AdapterRegistry,
+    runner: &dyn crate::adapter::breadsearch::SocketRunner,
+    at_ms: u64,
+) -> Vec<String> {
+    registry.refresh_sockets(runner, at_ms)
 }
 
 /// The bridge from the adapter registry to the policy core.
