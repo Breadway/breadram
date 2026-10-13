@@ -72,11 +72,16 @@ restart = [json.loads(l) for l in open(sys.argv[2]) if l.strip()]
 run = [r for r in rows if not r["paused"] and r["workers"] == 2]
 # The first samples are still the initial run; later unpaused samples are the resume.
 paused = [r for r in rows if r["paused"]]
+# The first paused sample straddles the transition: up to half a second of
+# work finished before the workers joined counts into it. Steady state is
+# what the pause sustains, so that sample is reported but not averaged.
+transition, paused = paused[:1], paused[1:]
 def avg(xs, key):
     xs = [x[key] for x in xs]
     return sum(xs) / len(xs) if xs else 0
 print(
     f"samples={len(rows)} run2={len(run)} paused={len(paused)} "
+    f"transition_delta={avg(transition,'delta'):.1f} "
     f"avg_delta_run={avg(run,'delta'):.1f} avg_delta_pause={avg(paused,'delta'):.1f} "
     f"rss_run_kib={avg(run,'rss_kib'):.0f} rss_pause_kib={avg(paused,'rss_kib'):.0f} "
     f"restart_paused={sum(1 for r in restart if r['paused'])}",

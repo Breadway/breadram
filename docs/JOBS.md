@@ -82,11 +82,24 @@ A supervised job is started with `BREADRAM_WORKERS_FILE` pointing at
   then run n workers again
 
 breadram writes `run 1` at launch and deletes the file when the job finishes,
-so a reused id cannot inherit a stale instruction. A pause the daemon writes
-is at most 30 seconds (`MAX_PAUSE`). The deadline is in the file, so the job
-resumes when it passes even if the daemon has exited and the file still says
-`pause`. A missing or garbled file means keep one worker going: it is not a
-stop and it is not a pause.
+so a reused id cannot inherit a stale instruction. Under pressure the daemon
+reduces a running job through the `ReduceJobConcurrency` action, which halves
+the file's count toward a floor of one; the plan promises half the usage as
+relief, matching what the executor writes. A job already at `reduce 1` that
+is still over budget is paused instead, for the cap duration and reported as
+the escalation it is: bounded, self-resuming, and never a freeze. A reduce
+inside an open pause is refused as busy, and a second pause inside an open
+deadline is refused the same way: the first deadline stands. A pause the
+daemon writes is at most 30 seconds (`MAX_PAUSE`); anything longer is clamped
+and reported. The deadline
+is in the file, so the job resumes when it passes even if the daemon has
+exited and the file still says `pause`. Every pass also resumes an expired
+pause by writing `run`, so the file stops saying pause once the deadline is
+past. A missing or garbled file means keep one worker going: it is not a
+stop and it is not a pause. Estimates stay one chain: the caller estimate, or
+the configured default when none is given, becomes the admission reservation,
+which becomes the scope's `MemoryMax`; a reduce is expected to free half the
+job's usage from it.
 
 This is the only concurrency control. An arbitrary program that never reads
 the file is not claimed to support a changed worker count, and breadram does
@@ -101,12 +114,16 @@ second pause inside an open deadline, and starts a fresh process against an
 already-expired pause with no writer left to clear it.
 
 Measured on this host (debug build, two workers, 8 s, then a 2.5 s pause):
-average delta 13.1 units per half second while running two workers, 3.2 while
-paused; RSS about 16201 KiB running and 2864 KiB paused. The restart process
-reported `paused: false` for every sample. The residual pause delta is the
-last rounds already in flight when the workers were joined, not work accepted
-during the pause. A job that exits during a pause is a normal exit; the daemon
-removes the file in `finish_job`, same as any other finish.
+average delta 13.1 units per half second while running two workers, 0.0 while
+paused at steady state; RSS about 17742 KiB running and 2916 KiB paused, and
+16196 KiB with 2860 KiB paused on a second run. The restart process reported
+`paused: false` for every sample. The first paused sample still carries up to
+half a second of rounds finished before the workers joined (16.0 on both
+runs); it is reported separately and left out of the paused average, because
+it mixes run work with pause work rather than measuring either. A job that
+exits during a pause is a normal exit; the daemon removes the file in
+`finish_job`, same as any other finish, which the daemon suite covers with a
+paused directive on disk at finish time.
 
 ## Automatic admission
 

@@ -31,6 +31,7 @@ use breadram_core::ipc::{
     RunningJobView, ServerMessage, StatusPayload, WorkloadSummary, WorkloadsPayload,
     MAX_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+use breadram_core::jobs::executor::{JobExecutor, JobTargets, JOB_SCOPE_PREFIX};
 use breadram_core::jobs::{
     AdmissionQueue, PendingJob, PersistedAdmissions, MAX_PERSISTED_ADMISSIONS,
 };
@@ -77,9 +78,6 @@ const OBSERVATION_ONLY_NOTE: &str =
 const DEFAULT_WAKE_LOAD_PATH: &str = "/models/load";
 /// The default router listing path a gateway wake verifies against.
 const DEFAULT_WAKE_HEALTH_PATH: &str = "/models";
-
-/// The scope unit name prefix for supervised jobs.
-const JOB_SCOPE_PREFIX: &str = "breadram-job-";
 
 /// Why the daemon could not start or stopped unexpectedly.
 #[derive(Debug, thiserror::Error)]
@@ -714,6 +712,12 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
             // A snapshot of the gateway's leases, so a request in flight counts
             // as active for this pass.
             let gateway_active = state.gateway_active.read().await.clone();
+            // The supervised jobs running on this pass, so a reduce action can
+            // reach their directive files, and the directory those files live
+            // in, when the daemon has a state directory at all.
+            let running_jobs: Vec<String> =
+                state.job_running.lock().await.keys().cloned().collect();
+            let directive_dir = concurrency_dir(state.state_path.as_deref());
             let collected = tokio::task::spawn_blocking(move || {
                 let mut current_runtime = current_runtime;
                 if current_runtime.config_version != current {
@@ -745,6 +749,8 @@ fn spawn_monitor(state: Arc<SharedState>, interval: Duration) {
                         registry: &current_runtime.registry,
                         probes: &probes,
                         clock: &clock,
+                        job_directives: directive_dir,
+                        job_targets: JobTargets::for_running(running_jobs),
                     },
                 );
                 (published, current_runtime, next, pass)
@@ -935,6 +941,8 @@ fn run_execution(
         registry,
         probes,
         clock,
+        job_directives,
+        job_targets,
     } = step;
     let Some(plan) = plan else {
         return (coordinator, None);
@@ -956,8 +964,17 @@ fn run_execution(
         clock,
     )
     .with_hook_runner(&probes.hooks);
-    let executor = ChainedExecutor::new(vec![&control, &provider]);
-    let pass = execute_with(
+    // Cooperative job controls reach only running supervised jobs, through
+    // the directive files those jobs already read. Each executor claims a
+    // disjoint set of actions, so a reduce is never sent to a host control
+    // or a provider. Without a state directory there is nowhere to write,
+    // so the executor gets no targets and declines everything honestly.
+    let jobs = match job_directives.clone() {
+        Some(dir) => JobExecutor::new(dir, job_targets.clone()),
+        None => JobExecutor::new(PathBuf::from(""), JobTargets::new()),
+    };
+    let executor = ChainedExecutor::new(vec![&control, &provider, &jobs]);
+    let mut pass = execute_with(
         &mut coordinator,
         config,
         plan,
@@ -966,6 +983,26 @@ fn run_execution(
         now_ms,
         cancel,
     );
+    // An expired pause is resumed by writing run, so the file stops saying
+    // pause even though the job would resume on its own by the deadline. The
+    // resume count comes from the pause itself.
+    if let Some(dir) = job_directives.as_ref() {
+        let now_wall = breadram_core::concurrency::unix_ms();
+        for scope in job_targets.scopes() {
+            let Some(job_id) = job_targets.get(scope) else {
+                continue;
+            };
+            match breadram_core::concurrency::resume_if_expired(dir, job_id, now_wall) {
+                Ok(Some(resumed)) => pass.notes.push(format!(
+                    "resumed {job_id} with {resumed:?} after its pause expired"
+                )),
+                Ok(None) => {}
+                Err(error) => pass
+                    .notes
+                    .push(format!("could not check the pause for {job_id}: {error}")),
+            }
+        }
+    }
     (coordinator, Some(pass))
 }
 
@@ -980,6 +1017,11 @@ struct ExecutionStep<'a> {
     registry: &'a AdapterRegistry,
     probes: &'a ProviderProbes,
     clock: &'a SystemClock,
+    /// Where running jobs read their directives, when the daemon has a state
+    /// directory. Without one there is nothing to write or resume.
+    job_directives: Option<PathBuf>,
+    /// The supervised jobs running on this pass, keyed by workload scope.
+    job_targets: JobTargets,
 }
 
 /// The execute step itself, over any executor.
@@ -2898,6 +2940,89 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const SCOPE: &str = "unit:build.service";
+
+    /// A job that exits while its pause deadline is still open is a normal
+    /// finish: the directive goes through `finish_job` like any other exit,
+    /// so no reused id can inherit the pause.
+    #[test]
+    fn a_job_that_exits_during_a_pause_leaves_no_directive() {
+        use breadram_core::concurrency::{
+            directive_path, read_directive, unix_ms, write_directive, WorkerDirective,
+        };
+        use breadram_core::jobs::PendingJob;
+        let dir = TempDir::new("finish-pause");
+        let state_path = dir.path().join("journal.json");
+        let conc = concurrency_dir(Some(&state_path)).expect("a concurrency dir");
+        write_directive(
+            &conc,
+            "job-9",
+            WorkerDirective::Pause {
+                workers: 2,
+                resume_unix_ms: unix_ms() + 60_000,
+            },
+        )
+        .unwrap();
+        assert!(directive_path(&conc, "job-9").exists());
+        let mut queue = AdmissionQueue::new(8);
+        queue
+            .submit(
+                PendingJob {
+                    id: "job-9".to_string(),
+                    reservation_bytes: GIB,
+                },
+                true,
+            )
+            .unwrap();
+        queue.admit(Some(8 * GIB), true).unwrap();
+        let (events, _receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let state = Arc::new(SharedState {
+            trends: RwLock::new(TrendHistory::new(0, 0)),
+            trend_keys: std::collections::hash_map::RandomState::new(),
+            published: RwLock::new(unavailable(ManagementMode::Automatic, 0)),
+            config: RwLock::new(Config::default()),
+            config_version: AtomicU64::new(0),
+            config_path: None,
+            socket: dir.path().join("breadram.sock"),
+            journal: RwLock::new(ActionJournal::new(16)),
+            jobs: Mutex::new(queue),
+            jobs_refused: RwLock::new(Vec::new()),
+            job_specs: Mutex::new(HashMap::new()),
+            job_running: Mutex::new(HashMap::new()),
+            job_finished: Mutex::new(VecDeque::new()),
+            gateway_active: RwLock::new(Vec::new()),
+            gateway_unloaded: Mutex::new(Vec::new()),
+            execution_notes: RwLock::new(Vec::new()),
+            state_path: Some(state_path),
+            cancel: Cancellation::new(),
+            events,
+            interval_ms: 3_000,
+            socket_uid: 0,
+            clock: SystemClock::new(),
+        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(finish_job(
+                &state,
+                "job-9",
+                Some(0),
+                "exited cleanly".to_string(),
+                None,
+            ));
+        assert!(
+            read_directive(&conc, "job-9").is_none(),
+            "the open pause left with the job"
+        );
+        assert!(
+            state
+                .job_finished
+                .blocking_lock()
+                .iter()
+                .any(|finished| finished.id == "job-9" && finished.exit_code == Some(0)),
+            "the exit is remembered like any other finish"
+        );
+    }
 
     /// An executor that records what it was asked to do and writes nothing.
     struct FakeExecutor {
