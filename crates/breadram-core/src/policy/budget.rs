@@ -125,6 +125,17 @@ struct ScopeStall {
     total_us: u64,
     /// Stall microseconds accumulated during the last tick.
     delta_us: u64,
+    at_ms: u64,
+    rate_basis_points: Option<u64>,
+}
+
+/// How long a newly applied limit is observed for worsening stalls.
+pub const STALL_OBSERVATION_MS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Intervention {
+    baseline_basis_points: u64,
+    started_ms: u64,
 }
 
 /// Per-scope stall accumulation across monitor ticks.
@@ -138,6 +149,7 @@ struct ScopeStall {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StallWatch {
     scopes: HashMap<String, ScopeStall>,
+    interventions: HashMap<String, Intervention>,
 }
 
 impl StallWatch {
@@ -158,7 +170,7 @@ impl StallWatch {
     /// [`STALL_SCOPE_DELTA_RISE_US`]. A scope seen for the first time only
     /// sets its baseline and is never returned. Stored readings are replaced
     /// by this tick's, and scopes not in `current` are forgotten.
-    pub fn judge(&mut self, current: &[(String, u64)]) -> Vec<String> {
+    pub fn judge(&mut self, current: &[(String, u64)], now_ms: u64) -> Vec<String> {
         let mut risen = Vec::new();
         let mut next = HashMap::with_capacity(current.len());
         for (scope, total_us) in current {
@@ -168,8 +180,24 @@ impl StallWatch {
                     .map(|known| known.total_us)
                     .unwrap_or(*total_us),
             );
-            if let Some(known) = self.scopes.get(scope) {
-                if stall_delta_verdict(known.delta_us, delta_us) == StallVerdict::Reverse {
+            let known = self.scopes.get(scope);
+            if known.is_some_and(|known| *total_us < known.total_us) {
+                self.interventions.remove(scope);
+            }
+            let rate = known.and_then(|known| {
+                let elapsed_ms = now_ms.checked_sub(known.at_ms)?;
+                if elapsed_ms == 0 || *total_us < known.total_us {
+                    return None;
+                }
+                Some(
+                    ((u128::from(delta_us) * 10_000) / (u128::from(elapsed_ms) * 1_000)).min(10_000)
+                        as u64,
+                )
+            });
+            if let (Some(rate), Some(intervention)) = (rate, self.interventions.get(scope)) {
+                if now_ms.saturating_sub(intervention.started_ms) <= STALL_OBSERVATION_MS
+                    && rate.saturating_sub(intervention.baseline_basis_points) >= 100
+                {
                     risen.push(scope.clone());
                 }
             }
@@ -178,11 +206,50 @@ impl StallWatch {
                 ScopeStall {
                     total_us: *total_us,
                     delta_us,
+                    at_ms: now_ms,
+                    rate_basis_points: rate,
                 },
             );
         }
         self.scopes = next;
+        self.interventions.retain(|scope, intervention| {
+            self.scopes.contains_key(scope)
+                && now_ms.saturating_sub(intervention.started_ms) <= STALL_OBSERVATION_MS
+        });
         risen
+    }
+
+    /// Freeze the latest pre-write stall rate for one confirmed limit.
+    /// Without two valid samples there is no trustworthy baseline.
+    pub fn arm(&mut self, scope: &str, now_ms: u64) -> bool {
+        let Some(baseline) = self.scopes.get(scope).and_then(|s| s.rate_basis_points) else {
+            return false;
+        };
+        self.interventions.insert(
+            scope.to_string(),
+            Intervention {
+                baseline_basis_points: baseline,
+                started_ms: now_ms,
+            },
+        );
+        true
+    }
+
+    /// Whether two valid pre-write samples establish a stall-rate baseline.
+    pub fn has_baseline(&self, scope: &str) -> bool {
+        self.scopes
+            .get(scope)
+            .is_some_and(|s| s.rate_basis_points.is_some())
+    }
+
+    /// Whether this limit still has a live observation window.
+    pub fn watching(&self, scope: &str) -> bool {
+        self.interventions.contains_key(scope)
+    }
+
+    /// Stop watching a resolved or superseded intervention.
+    pub fn disarm(&mut self, scope: &str) {
+        self.interventions.remove(scope);
     }
 }
 
@@ -260,20 +327,68 @@ mod tests {
         assert!(watch.is_empty());
         // The first tick only sets the baseline.
         assert!(watch
-            .judge(&[("unit:a.service".to_string(), 1_000_000)])
+            .judge(&[("unit:a.service".to_string(), 1_000_000)], 0)
             .is_empty());
         // A flat second tick keeps the limit.
         assert!(watch
-            .judge(&[("unit:a.service".to_string(), 1_100_000)])
+            .judge(&[("unit:a.service".to_string(), 1_100_000)], 1_000)
             .is_empty());
         // A tick that accumulates half a CPU-second more reverses.
-        let risen = watch.judge(&[(
-            "unit:a.service".to_string(),
-            1_100_000 + 100_000 + STALL_SCOPE_DELTA_RISE_US,
-        )]);
+        assert!(watch.arm("unit:a.service", 1_000));
+        let risen = watch.judge(
+            &[(
+                "unit:a.service".to_string(),
+                1_100_000 + 100_000 + STALL_SCOPE_DELTA_RISE_US,
+            )],
+            2_000,
+        );
         assert_eq!(risen, vec!["unit:a.service".to_string()]);
         // A scope that stops being reported is forgotten.
-        assert!(watch.judge(&[]).is_empty());
+        assert!(watch.judge(&[], 3_000).is_empty());
         assert!(watch.is_empty());
+    }
+
+    #[test]
+    fn equal_stall_rates_reverse_at_short_and_long_ticks() {
+        for tick_ms in [250, 500, 2_000, 3_000] {
+            let mut watch = StallWatch::new();
+            let scope = "unit:test.scope".to_string();
+            watch.judge(&[(scope.clone(), 0)], 0);
+            watch.judge(&[(scope.clone(), 0)], tick_ms);
+            assert!(watch.arm(&scope, tick_ms));
+            // Two percent of any interval exceeds the one-point threshold.
+            let risen = watch.judge(&[(scope.clone(), tick_ms * 20)], tick_ms * 2);
+            assert_eq!(risen, vec![scope]);
+        }
+    }
+
+    #[test]
+    fn intervention_uses_frozen_baseline_until_window_expires() {
+        let scope = "unit:test.scope".to_string();
+        let mut watch = StallWatch::new();
+        watch.judge(&[(scope.clone(), 0)], 0);
+        watch.judge(&[(scope.clone(), 0)], 500);
+        assert!(watch.arm(&scope, 500));
+        assert!(watch.judge(&[(scope.clone(), 1_000)], 1_000).is_empty());
+        // A later tick, not only the immediately following one, can reverse.
+        assert_eq!(
+            watch.judge(&[(scope.clone(), 11_000)], 1_500),
+            vec![scope.clone()]
+        );
+        watch.judge(&[(scope.clone(), 11_000)], 11_000);
+        assert!(!watch.watching(&scope));
+    }
+
+    #[test]
+    fn missing_reset_and_zero_duration_readings_never_reverse() {
+        let scope = "unit:test.scope".to_string();
+        let mut watch = StallWatch::new();
+        watch.judge(&[(scope.clone(), 10_000)], 0);
+        watch.judge(&[(scope.clone(), 10_000)], 500);
+        assert!(watch.arm(&scope, 500));
+        assert!(watch.judge(&[(scope.clone(), 999_000)], 500).is_empty());
+        assert!(watch.judge(&[(scope.clone(), 0)], 1_000).is_empty());
+        assert!(watch.judge(&[], 1_500).is_empty());
+        assert!(!watch.watching(&scope));
     }
 }

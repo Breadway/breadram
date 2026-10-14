@@ -1020,10 +1020,16 @@ fn run_execution(
         None => JobExecutor::new(PathBuf::from(""), JobTargets::new()),
     };
     let executor = ChainedExecutor::new(vec![&control, &provider, &jobs]);
+    // Sample before this pass writes, preserving a genuine pre-write baseline.
+    let risen = stall_watch.judge(&scope_pressure_totals(&fs, &targets), now_ms);
+    let mut staged_plan = plan.clone();
+    staged_plan.actions.retain(|action| {
+        action.kind != ActionKind::CgroupSoftLimit || stall_watch.has_baseline(&action.target.scope)
+    });
     let mut pass = execute_with(
         &mut coordinator,
         config,
-        plan,
+        &staged_plan,
         workloads,
         &executor,
         now_ms,
@@ -1060,11 +1066,16 @@ fn run_execution(
     // before any limit is written, not only after one. Only a scope limited
     // on the previous pass can be reversed, and only its own values go back:
     // the rest of the journal is untouched.
-    let risen = stall_watch.judge(&scope_pressure_totals(&fs, &targets));
     if !stall_pending.is_empty() && !risen.is_empty() {
         let reverse: Vec<ActionId> = stall_pending
             .iter()
-            .filter(|(scope, _)| risen.contains(scope))
+            .filter(|(scope, id)| {
+                risen.contains(scope)
+                    && workloads.iter().any(|w| {
+                        w.id.scope == *scope
+                            && ActionId::for_target(&w.id, ActionKind::CgroupSoftLimit) == *id
+                    })
+            })
             .map(|(_, id)| *id)
             .collect();
         if !reverse.is_empty() {
@@ -1073,7 +1084,13 @@ fn run_execution(
                 .iter()
                 .filter(|result| matches!(result.outcome, RestoreOutcome::Restored))
                 .count();
-            for (scope, _) in stall_pending.iter().filter(|(_, id)| reverse.contains(id)) {
+            pass.reversed += put_back;
+            for (scope, _) in stall_pending.iter().filter(|(_, id)| {
+                restored
+                    .iter()
+                    .any(|r| r.id == *id && matches!(r.outcome, RestoreOutcome::Restored))
+            }) {
+                stall_watch.disarm(scope);
                 if let Some(workload) = workloads.iter().find(|w| w.id.scope == *scope) {
                     history.record(ActionRecord {
                         target: workload.id.clone(),
@@ -1093,15 +1110,22 @@ fn run_execution(
             );
         }
     }
-    // The next pass judges the limits this one confirmed.
-    *stall_pending = pass
-        .results
-        .iter()
-        .filter(|result| {
-            result.kind == ActionKind::CgroupSoftLimit && result.state == ActionState::Confirmed
-        })
-        .map(|result| (result.scope.clone(), result.id))
-        .collect();
+    // Retain observations through the bounded window, including duplicate ticks.
+    stall_pending.retain(|(scope, id)| {
+        stall_watch.watching(scope)
+            && workloads.iter().any(|w| {
+                w.id.scope == *scope
+                    && ActionId::for_target(&w.id, ActionKind::CgroupSoftLimit) == *id
+            })
+    });
+    for result in &pass.results {
+        if result.kind == ActionKind::CgroupSoftLimit
+            && result.state == ActionState::Confirmed
+            && stall_watch.arm(&result.scope, now_ms)
+        {
+            stall_pending.push((result.scope.clone(), result.id));
+        }
+    }
     if left_automatic {
         let restored = coordinator.recover(&control, now_ms);
         let put_back = restored
@@ -3532,6 +3556,7 @@ mod tests {
                 result(breadram_core::coordinator::ActionState::Superseded),
             ],
             notes: Vec::new(),
+            reversed: 0,
         };
         let mut history = PolicyHistory::new(16, 60_000, 10);
         record_history_outcomes(&mut history, &[workload()], &pass, 1_000);
