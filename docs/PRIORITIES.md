@@ -105,6 +105,8 @@ A second run gave 224 rounds at 54,517,760 and 0 stall microseconds loose,
 6 rounds at 20,697,088 and 165,876 stall microseconds tight. The tight limit
 held the scope to about 20 MiB and cut throughput from over 200 rounds to
 under 10. The stall signal moves where the ten-second average showed 0.00 on
-both runs, and the verdict on these runs is Keep: the accumulation stays below
-the half CPU-second the daemon reverses on. A scope that accumulates past it
-is Reverse and only its limit is put back.
+both runs. These numbers predate the rate rule above and were not replayed
+through it, so they are a record of the cost of a tight limit, not a verdict.
+The daemon judges a limit by the rate rule: a rise of `STALL_RISE_BASIS_POINTS`
+over the scope's frozen pre-write rate inside the observation window puts back
+only that limit.
