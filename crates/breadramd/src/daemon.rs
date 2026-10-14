@@ -508,11 +508,11 @@ fn refresh_adapters(
 struct PolicyRuntime {
     machine: StateMachine,
     history: PolicyHistory,
-    /// Per-scope stall accumulation, so a soft limit that coincides with a
-    /// stall rise is reversed on the next tick.
+    /// Per-scope stall rates, so a soft limit followed by a stall rise inside
+    /// the observation window is reversed.
     stall_watch: StallWatch,
-    /// Soft limits this runtime confirmed on the previous pass and has not
-    /// judged yet: (scope, action id).
+    /// Soft limits this runtime confirmed and is still observing, until the
+    /// window ends or they are reversed: (scope, action id).
     stall_pending: Vec<(String, ActionId)>,
     registry: AdapterRegistry,
     /// Per-scope debounced activity hints. Promotion is immediate and demotion
@@ -1020,16 +1020,33 @@ fn run_execution(
         None => JobExecutor::new(PathBuf::from(""), JobTargets::new()),
     };
     let executor = ChainedExecutor::new(vec![&control, &provider, &jobs]);
+    // Sample before this pass writes, preserving a genuine pre-write baseline.
+    let totals = scope_pressure_totals(&fs, &targets);
+    let risen = stall_watch.judge(&totals, now_ms);
+    // A soft limit on a scope whose stall rate is readable waits for its
+    // second reading, so the baseline it is judged against is genuinely
+    // pre-write. A scope with no readable pressure file has no signal to wait
+    // for and is never reversed, so its limit is not held back, and a scope
+    // that is not controllable still gets its journalled refusal.
+    let (staged_plan, deferred) = defer_unbaselined_limits(plan, stall_watch, &totals);
     let mut pass = execute_with(
         &mut coordinator,
         config,
-        plan,
+        &staged_plan,
         workloads,
         &executor,
         now_ms,
         cancel,
         host_bytes,
     );
+    if deferred > 0 {
+        // The pass says what it held back, not that nothing was proposed.
+        pass.notes
+            .retain(|note| note != "the plan proposed no action");
+        pass.notes.push(format!(
+            "{deferred} soft limit(s) deferred one tick until a stall baseline exists"
+        ));
+    }
     // An expired pause is resumed by writing run, so the file stops saying
     // pause even though the job would resume on its own by the deadline. The
     // resume count comes from the pause itself.
@@ -1058,22 +1075,89 @@ fn run_execution(
     record_history_outcomes(history, workloads, &pass, now_ms);
     // Every controllable unit is judged every tick, so a baseline exists
     // before any limit is written, not only after one. Only a scope limited
-    // on the previous pass can be reversed, and only its own values go back:
-    // the rest of the journal is untouched.
-    let risen = stall_watch.judge(&scope_pressure_totals(&fs, &targets));
+    // inside the observation window can be reversed, and only its own values
+    // go back: the rest of the journal is untouched.
+    settle_stall_observations(
+        &mut coordinator,
+        &control,
+        StallBooks {
+            watch: stall_watch,
+            pending: stall_pending,
+            history,
+        },
+        workloads,
+        &risen,
+        &mut pass,
+        now_ms,
+    );
+    if left_automatic {
+        let restored = coordinator.recover(&control, now_ms);
+        let put_back = restored
+            .iter()
+            .filter(|result| matches!(result.outcome, RestoreOutcome::Restored))
+            .count();
+        pass.notes.push(format!(
+            "automatic mode turned off, {put_back} owned value(s) put back"
+        ));
+        tracing::info!("automatic mode turned off, {put_back} owned value(s) restored");
+    }
+    (coordinator, Some(pass))
+}
+
+/// The stall bookkeeping that follows one execution pass.
+struct StallBooks<'a> {
+    watch: &'a mut StallWatch,
+    pending: &'a mut Vec<(String, ActionId)>,
+    history: &'a mut PolicyHistory,
+}
+
+/// Reverse the limits whose stall rate rose, then keep observing the rest.
+///
+/// Only a limit still inside its observation window and still on the same
+/// workload generation can be reversed, and only its own values go back: a
+/// value another manager changed is skipped by the journal's ownership rule.
+/// A reversal is recorded `Ineffective` so the planner escalates past it, and
+/// counts as a write on the pass so the journal is republished. Limits this
+/// pass confirmed are then armed, replacing any older observation of the same
+/// scope.
+fn settle_stall_observations(
+    coordinator: &mut Coordinator,
+    executor: &dyn Executor,
+    books: StallBooks<'_>,
+    workloads: &[Workload],
+    risen: &[String],
+    pass: &mut ExecutionPass,
+    now_ms: u64,
+) {
+    let StallBooks {
+        watch: stall_watch,
+        pending: stall_pending,
+        history,
+    } = books;
+    let same_target = |scope: &str, id: &ActionId| {
+        workloads.iter().any(|w| {
+            w.id.scope == scope && ActionId::for_target(&w.id, ActionKind::CgroupSoftLimit) == *id
+        })
+    };
     if !stall_pending.is_empty() && !risen.is_empty() {
         let reverse: Vec<ActionId> = stall_pending
             .iter()
-            .filter(|(scope, _)| risen.contains(scope))
+            .filter(|(scope, id)| risen.contains(scope) && same_target(scope, id))
             .map(|(_, id)| *id)
             .collect();
         if !reverse.is_empty() {
-            let restored = coordinator.recover_actions(&control, now_ms, &reverse);
+            let restored = coordinator.recover_actions(executor, now_ms, &reverse);
             let put_back = restored
                 .iter()
                 .filter(|result| matches!(result.outcome, RestoreOutcome::Restored))
                 .count();
-            for (scope, _) in stall_pending.iter().filter(|(_, id)| reverse.contains(id)) {
+            pass.reversed += put_back;
+            for (scope, _) in stall_pending.iter().filter(|(_, id)| {
+                restored
+                    .iter()
+                    .any(|r| r.id == *id && matches!(r.outcome, RestoreOutcome::Restored))
+            }) {
+                stall_watch.disarm(scope);
                 if let Some(workload) = workloads.iter().find(|w| w.id.scope == *scope) {
                     history.record(ActionRecord {
                         target: workload.id.clone(),
@@ -1093,27 +1177,17 @@ fn run_execution(
             );
         }
     }
-    // The next pass judges the limits this one confirmed.
-    *stall_pending = pass
-        .results
-        .iter()
-        .filter(|result| {
-            result.kind == ActionKind::CgroupSoftLimit && result.state == ActionState::Confirmed
-        })
-        .map(|result| (result.scope.clone(), result.id))
-        .collect();
-    if left_automatic {
-        let restored = coordinator.recover(&control, now_ms);
-        let put_back = restored
-            .iter()
-            .filter(|result| matches!(result.outcome, RestoreOutcome::Restored))
-            .count();
-        pass.notes.push(format!(
-            "automatic mode turned off, {put_back} owned value(s) put back"
-        ));
-        tracing::info!("automatic mode turned off, {put_back} owned value(s) restored");
+    // Retain observations through the bounded window, including duplicate ticks.
+    stall_pending.retain(|(scope, id)| stall_watch.watching(scope) && same_target(scope, id));
+    for result in &pass.results {
+        if result.kind == ActionKind::CgroupSoftLimit
+            && result.state == ActionState::Confirmed
+            && stall_watch.arm(&result.scope, now_ms)
+        {
+            stall_pending.retain(|(scope, _)| *scope != result.scope);
+            stall_pending.push((result.scope.clone(), result.id));
+        }
     }
-    (coordinator, Some(pass))
 }
 
 /// Everything one execution pass needs beyond the coordinator itself.
@@ -1132,9 +1206,9 @@ struct ExecutionStep<'a> {
     /// The bounded action history. Outcomes are recorded here so the next
     /// plan's cooldown and escalation see this pass.
     history: &'a mut PolicyHistory,
-    /// Per-scope stall accumulation across ticks.
+    /// Per-scope stall rates across ticks.
     stall_watch: &'a mut StallWatch,
-    /// Soft limits the previous pass confirmed and this one judges.
+    /// Soft limits under observation, which this pass judges.
     stall_pending: &'a mut Vec<(String, ActionId)>,
     /// Whether this pass leaves automatic mode, which restores everything
     /// breadram still owns.
@@ -1178,6 +1252,30 @@ fn record_history_outcomes(
             outcome,
         });
     }
+}
+
+/// Hold back soft limits whose stall baseline does not exist yet.
+///
+/// A limit on a scope with a readable pressure file waits until two readings
+/// give it a pre-write rate. A scope with no reading has no signal to wait
+/// for, so it is never held back, and every other action passes untouched.
+/// Returns the staged plan and how many limits were held back.
+fn defer_unbaselined_limits(
+    plan: &Plan,
+    stall_watch: &StallWatch,
+    totals: &[(String, u64)],
+) -> (Plan, usize) {
+    let mut staged = plan.clone();
+    let planned = staged.actions.len();
+    staged.actions.retain(|action| {
+        action.kind != ActionKind::CgroupSoftLimit
+            || stall_watch.has_baseline(&action.target.scope)
+            || !totals
+                .iter()
+                .any(|(scope, _)| *scope == action.target.scope)
+    });
+    let deferred = planned - staged.actions.len();
+    (staged, deferred)
 }
 
 /// The current `memory.pressure` `total` for every controllable unit.
@@ -3393,6 +3491,262 @@ mod tests {
         Coordinator::new(OwnerToken("test".to_string()), 32)
     }
 
+    /// An executor whose live value follows its writes, so a restore is real.
+    struct LiveValueExecutor {
+        inner: FakeExecutor,
+        live: std::sync::Mutex<String>,
+    }
+
+    impl LiveValueExecutor {
+        fn new() -> Self {
+            Self {
+                inner: FakeExecutor::new(),
+                live: std::sync::Mutex::new("max".to_string()),
+            }
+        }
+
+        fn set_live(&self, value: &str) {
+            *self.live.lock().unwrap() = value.to_string();
+        }
+    }
+
+    impl Executor for LiveValueExecutor {
+        fn supports(&self, kind: ActionKind) -> bool {
+            self.inner.supports(kind)
+        }
+
+        fn precondition(&self, request: &ActionRequest) -> Precondition {
+            self.inner.precondition(request)
+        }
+
+        fn apply(&self, request: &ActionRequest) -> Result<AppliedChange, ExecutorError> {
+            let change = self.inner.apply(request)?;
+            self.set_live(&(2 * GIB).to_string());
+            Ok(change)
+        }
+
+        fn confirm(&self, request: &ActionRequest) -> Confirmation {
+            self.inner.confirm(request)
+        }
+
+        fn observe(&self, target: &WorkloadId) -> MemoryObservation {
+            self.inner.observe(target)
+        }
+
+        fn read_value(&self, _key: &str) -> Result<Option<String>, ExecutorError> {
+            Ok(Some(self.live.lock().unwrap().clone()))
+        }
+
+        fn write_value(&self, _key: &str, value: &str) -> Result<(), ExecutorError> {
+            self.set_live(value);
+            Ok(())
+        }
+    }
+
+    /// A watch with a stall baseline, a limit applied through the coordinator,
+    /// and the pass that confirmed it armed.
+    struct Armed {
+        executor: LiveValueExecutor,
+        coordinator: Coordinator,
+        watch: StallWatch,
+        pending: Vec<(String, ActionId)>,
+        history: PolicyHistory,
+    }
+
+    fn armed() -> Armed {
+        let executor = LiveValueExecutor::new();
+        let mut coordinator = coordinator();
+        let mut watch = StallWatch::new();
+        let mut pending = Vec::new();
+        let mut history = PolicyHistory::new(16, 60_000, 10);
+        watch.judge(&[(SCOPE.to_string(), 0)], 0);
+        watch.judge(&[(SCOPE.to_string(), 0)], 1_000);
+        let mut pass = execute_with(
+            &mut coordinator,
+            &config(vec![ActionKind::CgroupSoftLimit]),
+            &plan(),
+            &[workload()],
+            &executor,
+            1_000,
+            &Cancellation::new(),
+            64 * GIB,
+        );
+        assert_eq!(pass.confirmed(), 1, "{}", pass.summary());
+        settle_stall_observations(
+            &mut coordinator,
+            &executor,
+            StallBooks {
+                watch: &mut watch,
+                pending: &mut pending,
+                history: &mut history,
+            },
+            &[workload()],
+            &[],
+            &mut pass,
+            1_000,
+        );
+        assert_eq!(pending.len(), 1, "the confirmed limit is observed");
+        assert!(watch.watching(SCOPE));
+        Armed {
+            executor,
+            coordinator,
+            watch,
+            pending,
+            history,
+        }
+    }
+
+    fn settle(armed: &mut Armed, workloads: &[Workload], risen: &[String]) -> ExecutionPass {
+        let mut pass = ExecutionPass::declined("nothing planned");
+        settle_stall_observations(
+            &mut armed.coordinator,
+            &armed.executor,
+            StallBooks {
+                watch: &mut armed.watch,
+                pending: &mut armed.pending,
+                history: &mut armed.history,
+            },
+            workloads,
+            risen,
+            &mut pass,
+            2_000,
+        );
+        pass
+    }
+
+    #[test]
+    fn a_risen_scope_is_put_back_recorded_ineffective_and_published() {
+        let mut armed = armed();
+        let pass = settle(&mut armed, &[workload()], &[SCOPE.to_string()]);
+
+        assert_eq!(pass.reversed, 1);
+        assert!(pass.wrote(), "a reversal-only pass must be republished");
+        assert_eq!(*armed.executor.live.lock().unwrap(), "max");
+        assert!(armed
+            .coordinator
+            .journal()
+            .history()
+            .any(|entry| entry.state == breadram_core::coordinator::ActionState::RolledBack));
+        assert!(armed
+            .history
+            .records()
+            .iter()
+            .any(|record| record.outcome == ActionOutcome::Ineffective));
+        assert!(armed.pending.is_empty());
+        assert!(!armed.watch.watching(SCOPE));
+    }
+
+    #[test]
+    fn a_scope_that_did_not_rise_stays_observed_and_untouched() {
+        let mut armed = armed();
+        let pass = settle(&mut armed, &[workload()], &[]);
+
+        assert_eq!(pass.reversed, 0);
+        assert_eq!(*armed.executor.live.lock().unwrap(), (2 * GIB).to_string());
+        assert_eq!(armed.pending.len(), 1, "the window is still open");
+        assert!(armed.watch.watching(SCOPE));
+    }
+
+    #[test]
+    fn a_value_another_manager_changed_is_not_overwritten_by_a_reversal() {
+        let mut armed = armed();
+        armed.executor.set_live("1073741824");
+        let pass = settle(&mut armed, &[workload()], &[SCOPE.to_string()]);
+
+        assert_eq!(pass.reversed, 0);
+        assert_eq!(*armed.executor.live.lock().unwrap(), "1073741824");
+        assert!(armed
+            .history
+            .records()
+            .iter()
+            .all(|record| record.outcome != ActionOutcome::Ineffective));
+    }
+
+    #[test]
+    fn a_replaced_target_is_neither_reversed_nor_kept_under_observation() {
+        let mut armed = armed();
+        let mut replaced = workload();
+        replaced.id.generation = 99;
+        let pass = settle(&mut armed, &[replaced], &[SCOPE.to_string()]);
+
+        assert_eq!(pass.reversed, 0);
+        assert_eq!(*armed.executor.live.lock().unwrap(), (2 * GIB).to_string());
+        assert!(armed.pending.is_empty(), "the stale observation is dropped");
+    }
+
+    #[test]
+    fn a_new_confirmation_replaces_the_older_observation_of_the_same_scope() {
+        let mut armed = armed();
+        let mut pass = ExecutionPass::declined("again");
+        pass.results = armed
+            .coordinator
+            .journal()
+            .history()
+            .filter(|entry| entry.kind == Some(ActionKind::CgroupSoftLimit))
+            .map(|entry| breadram_core::coordinator::ActionResult {
+                id: entry.id,
+                scope: entry.scope.clone(),
+                kind: ActionKind::CgroupSoftLimit,
+                state: breadram_core::coordinator::ActionState::Confirmed,
+                detail: String::new(),
+                effect: None,
+            })
+            .collect();
+        settle_stall_observations(
+            &mut armed.coordinator,
+            &armed.executor,
+            StallBooks {
+                watch: &mut armed.watch,
+                pending: &mut armed.pending,
+                history: &mut armed.history,
+            },
+            &[workload()],
+            &[],
+            &mut pass,
+            3_000,
+        );
+        assert_eq!(armed.pending.len(), 1, "no duplicate observation is queued");
+    }
+
+    #[test]
+    fn a_limit_waits_for_its_baseline_only_when_a_stall_signal_exists() {
+        let mut watch = StallWatch::new();
+        let readable = vec![(SCOPE.to_string(), 0)];
+
+        // First reading: the scope is readable but has no rate yet.
+        watch.judge(&readable, 1_000);
+        let (staged, deferred) = defer_unbaselined_limits(&plan(), &watch, &readable);
+        assert_eq!(deferred, 1);
+        assert!(staged.actions.is_empty());
+
+        // Second reading: the baseline exists and the limit goes through.
+        watch.judge(&readable, 2_000);
+        let (staged, deferred) = defer_unbaselined_limits(&plan(), &watch, &readable);
+        assert_eq!(deferred, 0);
+        assert_eq!(staged.actions.len(), 1);
+    }
+
+    #[test]
+    fn a_scope_with_no_pressure_reading_is_never_held_back() {
+        // No reading will ever arrive, so waiting would starve the limit. It
+        // is also never reversed, so applying it keeps the earlier behavior.
+        let watch = StallWatch::new();
+        let (staged, deferred) = defer_unbaselined_limits(&plan(), &watch, &[]);
+        assert_eq!(deferred, 0);
+        assert_eq!(staged.actions.len(), 1);
+    }
+
+    #[test]
+    fn deferral_leaves_other_actions_alone() {
+        let mut plan = plan();
+        plan.actions[0].kind = ActionKind::UnloadIdleModel;
+        let watch = StallWatch::new();
+        let readable = vec![(SCOPE.to_string(), 0)];
+        let (staged, deferred) = defer_unbaselined_limits(&plan, &watch, &readable);
+        assert_eq!(deferred, 0);
+        assert_eq!(staged.actions.len(), 1);
+    }
+
     #[test]
     fn an_automatic_pass_writes_and_journals_the_measured_effect() {
         let executor = FakeExecutor::new();
@@ -3532,6 +3886,7 @@ mod tests {
                 result(breadram_core::coordinator::ActionState::Superseded),
             ],
             notes: Vec::new(),
+            reversed: 0,
         };
         let mut history = PolicyHistory::new(16, 60_000, 10);
         record_history_outcomes(&mut history, &[workload()], &pass, 1_000);

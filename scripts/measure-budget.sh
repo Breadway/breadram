@@ -10,9 +10,10 @@
 # MemoryMax here is the harness. breadram's own control stays MemoryHigh,
 # which throttles and does not kill. The stall sample is the scope's own
 # cgroup pressure `total` counter: it accumulates inside one run, where the
-# ten-second average cannot move. A tight limit that accumulates clearly more
-# stall than the loose one is a Reverse verdict: that intervention would be
-# put back, not kept.
+# ten-second average cannot move. The script reports each scope's stall as a
+# share of the sample window. It does not judge reversal: the daemon does that
+# against a frozen pre-write rate inside an observation window, which a single
+# one-shot sample cannot reproduce.
 set -eu
 if [ -z "${XDG_RUNTIME_DIR:-}" ] || ! command -v systemd-run >/dev/null || ! command -v timeout >/dev/null; then
     echo "skipped: no systemd user session" >&2
@@ -82,12 +83,11 @@ if tr > lr:
     sys.exit("the tight limit did not cost throughput")
 if tc and lc and tc > lc:
     sys.exit("the tight limit did not hold memory down")
-# The totals are cumulative stall microseconds sampled 0.4s into each run.
-# Half a CPU-second more under the tight limit is a Reverse: the daemon would
-# put that limit back on the same signal.
-if tp >= lp + 500_000 or tr == 0:
-    print("stall verdict: Reverse", file=sys.stderr)
-else:
-    print("stall verdict: Keep", file=sys.stderr)
+# The totals are cumulative stall microseconds sampled 0.4s into each run, so
+# the share of that window is total / 400,000 us. Informational only.
+print(
+    f"stall share of the 0.4s sample: loose={lp / 400_000:.1%} tight={tp / 400_000:.1%}",
+    file=sys.stderr,
+)
 PY
 echo ok

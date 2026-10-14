@@ -38,6 +38,9 @@ pub struct ExecutionPass {
     /// Why nothing ran, or what was refused before running. Never empty when the
     /// pass wrote nothing.
     pub notes: Vec<String>,
+    /// How many limits this pass put back after a stall rise. A restore is a
+    /// write to the host and to the journal even when no action ran.
+    pub reversed: usize,
 }
 
 impl ExecutionPass {
@@ -47,6 +50,7 @@ impl ExecutionPass {
             requests: Vec::new(),
             results: Vec::new(),
             notes: vec![reason.into()],
+            reversed: 0,
         }
     }
 
@@ -66,11 +70,17 @@ impl ExecutionPass {
     /// Whether anything was written. A refusal is not a write, but it is still
     /// recorded.
     pub fn wrote(&self) -> bool {
-        !self.results.is_empty()
+        !self.results.is_empty() || self.reversed > 0
     }
 
     /// One line describing the pass, for a report or a log.
     pub fn summary(&self) -> String {
+        if self.results.is_empty() && self.reversed > 0 {
+            return format!(
+                "{} soft limit(s) put back after a stall rise",
+                self.reversed
+            );
+        }
         if self.results.is_empty() {
             return self
                 .notes
@@ -78,12 +88,19 @@ impl ExecutionPass {
                 .cloned()
                 .unwrap_or_else(|| "nothing to do".to_string());
         }
-        format!(
+        let mut line = format!(
             "{} action(s) attempted, {} confirmed, {} not confirmed",
             self.results.len(),
             self.confirmed(),
             self.not_confirmed()
-        )
+        );
+        if self.reversed > 0 {
+            line.push_str(&format!(
+                ", {} soft limit(s) put back after a stall rise",
+                self.reversed
+            ));
+        }
+        line
     }
 }
 
@@ -214,6 +231,7 @@ pub fn execute_plan(
         requests,
         results,
         notes,
+        reversed: 0,
     }
 }
 
@@ -238,6 +256,18 @@ mod tests {
     };
     use crate::inventory::{ControlLevel, WorkloadId};
     use crate::policy::PlannedAction;
+
+    #[test]
+    fn a_pass_that_only_put_a_limit_back_still_counts_as_a_write() {
+        let mut pass = ExecutionPass::declined("nothing planned");
+        assert!(!pass.wrote());
+        pass.reversed = 1;
+        assert!(pass.wrote());
+        assert_eq!(
+            pass.summary(),
+            "1 soft limit(s) put back after a stall rise"
+        );
+    }
 
     const GIB: u64 = 1024 * 1024 * 1024;
     /// A fixed instant, so an assertion about a recorded timestamp is exact.
