@@ -1,0 +1,1 @@
+{"scenario": "jobs", "samples": 16, "run_samples": 11, "paused_samples": 4, "avg_delta_run": 5.1, "avg_delta_paused": 0.0, "transition_delta": 8.0, "rss_run_kib": 17658, "rss_paused_kib": 2832, "second_pause_refused": null, "restart_paused_samples": 0, "restart_total_samples": 4}
