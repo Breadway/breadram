@@ -15,15 +15,17 @@ use crate::control::MIN_REQUESTED_BYTES;
 /// reserve plus the minimum useful limit cannot take a soft limit at all.
 pub const DESKTOP_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// How much extra stall, in microseconds accumulated within one monitor tick,
-/// reverses a soft limit.
+/// How much the stall rate must rise over its pre-write baseline to reverse a
+/// soft limit, in basis points of wall time (100 is one percentage point).
 ///
 /// The signal is the scope's own cgroup `memory.pressure` `total` counter: a
-/// cumulative figure, so any thrashing shows up in the same tick rather than
-/// after a ten-second average has moved. Half a CPU-second of extra stall in
-/// one tick (the default tick is three seconds) is thrashing, not noise: a
-/// limit that coincides with that is put back rather than kept.
-pub const STALL_SCOPE_DELTA_RISE_US: u64 = 500_000;
+/// cumulative figure, so any thrashing shows up in the next tick rather than
+/// after a ten-second average has moved. The rate is the counter's growth
+/// divided by the wall time between two readings, so the rule means the same
+/// thing at a 250 ms tick and a 3 s tick. The rate is capped at 10,000 (the
+/// scope stalled the whole interval), so a baseline of 9,901 or more can never
+/// be exceeded by a full point and is never reversed.
+pub const STALL_RISE_BASIS_POINTS: u64 = 100;
 
 /// Why an effective budget could not be produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,59 +95,41 @@ pub fn effective_budget(inputs: BudgetInputs) -> Result<EffectiveBudget, BudgetR
     Ok(EffectiveBudget { bytes, notes })
 }
 
-/// What to do with a soft limit after watching stalls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StallVerdict {
-    /// Stalls did not rise. Keep the limit.
-    Keep,
-    /// Stalls rose. Put the previous value back.
-    Reverse,
-}
-
-/// Compare stall accumulation across the tick after a limit.
-///
-/// `before_us` and `after_us` are the stall microseconds accumulated during
-/// the tick before the limit and the tick after it (deltas of the scope's
-/// pressure `total` counter, not the counters themselves). A rise of
-/// [`STALL_SCOPE_DELTA_RISE_US`] or more reverses. A drop or a flat reading
-/// keeps the limit. This does not claim the limit caused the rise: it only
-/// refuses to keep an intervention whose stall accumulation got worse.
-pub fn stall_delta_verdict(before_us: u64, after_us: u64) -> StallVerdict {
-    if after_us.saturating_sub(before_us) >= STALL_SCOPE_DELTA_RISE_US {
-        StallVerdict::Reverse
-    } else {
-        StallVerdict::Keep
-    }
-}
-
 /// One watched scope's stall accumulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ScopeStall {
-    /// The pressure `total` counter at the last tick.
+    /// The pressure `total` counter at the last reading.
     total_us: u64,
-    /// Stall microseconds accumulated during the last tick.
-    delta_us: u64,
+    /// When that reading was taken, in monotonic milliseconds.
     at_ms: u64,
+    /// The stall rate over the interval ending at that reading, in basis
+    /// points of wall time. `None` for a first sighting, a counter that went
+    /// backwards, or a zero-length interval.
     rate_basis_points: Option<u64>,
 }
 
 /// How long a newly applied limit is observed for worsening stalls.
 pub const STALL_OBSERVATION_MS: u64 = 10_000;
 
+/// A confirmed limit under observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Intervention {
+    /// The stall rate just before the write, frozen when the limit is armed.
     baseline_basis_points: u64,
     started_ms: u64,
 }
 
-/// Per-scope stall accumulation across monitor ticks.
+/// Per-scope stall rates across monitor ticks.
 ///
 /// Host PSI `avg10` cannot move by a point inside one short tick, so a
-/// reversal rule written against it never fires. This watches each limited
-/// scope's own cgroup `memory.pressure` `total` counter instead, which
-/// accumulates immediately when that scope thrashes. The caller feeds one
-/// reading per watched scope per tick; scopes absent from a reading are
-/// dropped, so the watch stays bounded by the pending set.
+/// reversal rule written against it never fires. This watches each
+/// controllable scope's own cgroup `memory.pressure` `total` counter instead,
+/// which accumulates immediately when that scope thrashes. Every reading is
+/// turned into a rate, so a baseline exists before any limit is written. A
+/// confirmed limit is then armed with that frozen baseline and observed for
+/// [`STALL_OBSERVATION_MS`]: any later reading in the window whose rate is
+/// [`STALL_RISE_BASIS_POINTS`] or more above the baseline reports the scope.
+/// Scopes absent from a reading are dropped, and their observation with them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StallWatch {
     scopes: HashMap<String, ScopeStall>,
@@ -163,24 +147,20 @@ impl StallWatch {
         self.scopes.is_empty()
     }
 
-    /// Judge one tick's pressure totals against the previous tick.
+    /// Judge one tick's pressure totals against the previous reading.
     ///
-    /// `current` holds one `(scope, total_us)` per scope limited on the
-    /// previous pass. Returns the scopes whose accumulation rose by at least
-    /// [`STALL_SCOPE_DELTA_RISE_US`]. A scope seen for the first time only
-    /// sets its baseline and is never returned. Stored readings are replaced
-    /// by this tick's, and scopes not in `current` are forgotten.
+    /// `current` holds one `(scope, total_us)` per controllable scope read at
+    /// `now_ms`. Returns the armed scopes whose rate rose past the frozen
+    /// baseline inside the observation window. A scope seen for the first
+    /// time, a counter that went backwards, and a zero-length interval only
+    /// store a reading and are never returned. Stored readings are replaced by
+    /// this tick's, and scopes not in `current` are forgotten.
     pub fn judge(&mut self, current: &[(String, u64)], now_ms: u64) -> Vec<String> {
         let mut risen = Vec::new();
         let mut next = HashMap::with_capacity(current.len());
         for (scope, total_us) in current {
-            let delta_us = total_us.saturating_sub(
-                self.scopes
-                    .get(scope)
-                    .map(|known| known.total_us)
-                    .unwrap_or(*total_us),
-            );
             let known = self.scopes.get(scope);
+            let delta_us = total_us.saturating_sub(known.map(|k| k.total_us).unwrap_or(*total_us));
             if known.is_some_and(|known| *total_us < known.total_us) {
                 self.interventions.remove(scope);
             }
@@ -196,7 +176,8 @@ impl StallWatch {
             });
             if let (Some(rate), Some(intervention)) = (rate, self.interventions.get(scope)) {
                 if now_ms.saturating_sub(intervention.started_ms) <= STALL_OBSERVATION_MS
-                    && rate.saturating_sub(intervention.baseline_basis_points) >= 100
+                    && rate.saturating_sub(intervention.baseline_basis_points)
+                        >= STALL_RISE_BASIS_POINTS
                 {
                     risen.push(scope.clone());
                 }
@@ -205,7 +186,6 @@ impl StallWatch {
                 scope.clone(),
                 ScopeStall {
                     total_us: *total_us,
-                    delta_us,
                     at_ms: now_ms,
                     rate_basis_points: rate,
                 },
@@ -307,41 +287,71 @@ mod tests {
         );
     }
 
+    /// A watch armed at t=1000 with a 1% baseline (10,000 us over 1 s).
+    fn armed_at_one_percent(scope: &str) -> StallWatch {
+        let mut watch = StallWatch::new();
+        watch.judge(&[(scope.to_string(), 0)], 0);
+        watch.judge(&[(scope.to_string(), 10_000)], 1_000);
+        assert!(watch.arm(scope, 1_000));
+        watch
+    }
+
     #[test]
-    fn a_rising_stall_reverses_and_a_flat_one_keeps() {
+    fn a_rise_of_exactly_one_point_reverses_and_one_basis_point_less_keeps() {
+        let scope = "unit:a.service";
+        // 1 s later: baseline 100 bp. 200 bp is +100 bp exactly: reverse.
+        let mut watch = armed_at_one_percent(scope);
         assert_eq!(
-            stall_delta_verdict(100_000, 100_000 + STALL_SCOPE_DELTA_RISE_US),
-            StallVerdict::Reverse
+            watch.judge(&[(scope.to_string(), 10_000 + 20_000)], 2_000),
+            vec![scope.to_string()]
         );
-        assert_eq!(
-            stall_delta_verdict(100_000, 100_000 + STALL_SCOPE_DELTA_RISE_US - 1),
-            StallVerdict::Keep
-        );
-        assert_eq!(stall_delta_verdict(100_000, 100_000), StallVerdict::Keep);
-        assert_eq!(stall_delta_verdict(900_000, 100_000), StallVerdict::Keep);
+        // 199 bp is +99 bp: keep.
+        let mut watch = armed_at_one_percent(scope);
+        assert!(watch
+            .judge(&[(scope.to_string(), 10_000 + 19_900)], 2_000)
+            .is_empty());
+        // A drop or a flat reading keeps.
+        let mut watch = armed_at_one_percent(scope);
+        assert!(watch
+            .judge(&[(scope.to_string(), 10_000 + 10_000)], 2_000)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_rate_is_capped_so_a_saturated_baseline_never_reverses() {
+        let scope = "unit:a.service";
+        let mut watch = StallWatch::new();
+        watch.judge(&[(scope.to_string(), 0)], 0);
+        // More stall than wall time (several threads stalled at once) is
+        // capped at 10,000 bp.
+        watch.judge(&[(scope.to_string(), 5_000_000)], 1_000);
+        assert!(watch.arm(scope, 1_000));
+        assert!(watch
+            .judge(&[(scope.to_string(), 50_000_000)], 2_000)
+            .is_empty());
     }
 
     #[test]
     fn the_watch_needs_two_ticks_and_forgets_dropped_scopes() {
         let mut watch = StallWatch::new();
         assert!(watch.is_empty());
-        // The first tick only sets the baseline.
+        // The first reading has no rate, so there is no baseline yet.
         assert!(watch
             .judge(&[("unit:a.service".to_string(), 1_000_000)], 0)
             .is_empty());
-        // A flat second tick keeps the limit.
+        assert!(!watch.has_baseline("unit:a.service"));
+        // The second reading makes one.
         assert!(watch
-            .judge(&[("unit:a.service".to_string(), 1_100_000)], 1_000)
+            .judge(&[("unit:a.service".to_string(), 1_000_000)], 1_000)
             .is_empty());
-        // A tick that accumulates half a CPU-second more reverses.
+        assert!(watch.has_baseline("unit:a.service"));
+        // A flat reading after arming keeps the limit.
         assert!(watch.arm("unit:a.service", 1_000));
-        let risen = watch.judge(
-            &[(
-                "unit:a.service".to_string(),
-                1_100_000 + 100_000 + STALL_SCOPE_DELTA_RISE_US,
-            )],
-            2_000,
-        );
+        assert!(watch
+            .judge(&[("unit:a.service".to_string(), 1_000_000)], 2_000)
+            .is_empty());
+        // A reading with half a CPU-second more stall in one second reverses.
+        let risen = watch.judge(&[("unit:a.service".to_string(), 1_500_000)], 3_000);
         assert_eq!(risen, vec!["unit:a.service".to_string()]);
         // A scope that stops being reported is forgotten.
         assert!(watch.judge(&[], 3_000).is_empty());

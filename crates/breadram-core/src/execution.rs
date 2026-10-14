@@ -88,12 +88,19 @@ impl ExecutionPass {
                 .cloned()
                 .unwrap_or_else(|| "nothing to do".to_string());
         }
-        format!(
+        let mut line = format!(
             "{} action(s) attempted, {} confirmed, {} not confirmed",
             self.results.len(),
             self.confirmed(),
             self.not_confirmed()
-        )
+        );
+        if self.reversed > 0 {
+            line.push_str(&format!(
+                ", {} soft limit(s) put back after a stall rise",
+                self.reversed
+            ));
+        }
+        line
     }
 }
 

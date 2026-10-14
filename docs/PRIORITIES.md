@@ -64,10 +64,16 @@ A stall is judged per scope, not per host. Host PSI `avg10` cannot move by a
 point inside one short monitor tick, so a rule written against it never fires.
 `StallWatch` instead follows each controllable unit's own cgroup
 `memory.pressure` `total` counter, which accumulates in the same tick the
-scope thrashes. Every pass judges every unit, so a baseline exists before any
-limit is written. When a scope limited on the previous pass accumulates half a
-CPU-second more stall than the tick before (`STALL_SCOPE_DELTA_RISE_US`), the
-daemon puts back only that action's values through `recover_actions` and
+scope thrashes. Every reading becomes a stall rate (basis points of wall time),
+so the rule means the same at a 250 ms tick and a 3 s tick. Every pass judges
+every unit, and a soft limit waits one tick for a scope whose pressure file is
+readable until a second reading gives a baseline, so the baseline is genuinely
+pre-write. A scope with no readable pressure file has no signal to wait for and
+is not held back. Once a limit is confirmed it is observed for ten seconds
+(`STALL_OBSERVATION_MS`) against its frozen pre-write rate, not only on the
+next tick. When the rate rises one point or more above that baseline
+(`STALL_RISE_BASIS_POINTS`), the daemon puts back only that action's values
+through `recover_actions` and
 records the action `Ineffective`, which starts its cooldown and escalates the
 planner past it. Every other owned value is untouched. A scope with no pressure
 reading is never reversed: a missing signal keeps the limit. The same journal
