@@ -124,8 +124,25 @@ from the breadsearch checkout at `bc4b2d9` with `--features breadmill/full`
 quiet model, RSS falling from 872,140 KiB to 49,348 KiB (822,792 KiB freed),
 demand reload completing in 3 s with hits returned, and a 45 s window of
 continuous queries during which no second unload was journalled and the model
-stayed ready. Efficacy and serving protection are both demonstrated live, each
-attributed to the daemon journal rather than claimed from process state.
+stayed ready. The idle unload and its efficacy are attributed to the daemon
+journal. The 45 s window is **not** evidence of serving protection: see the
+contention results below, where a mill queried every 3 s was unloaded once
+within a 90 s window (RAM-82). The single-mill window was probably too short to
+show it; that has not been established.
+
+### Provider contention (failing gate)
+
+`bench-contention.sh` runs two isolated breadmills under one daemon: mill-a is
+queried every 3 s for 90 s, mill-b stays quiet, with bounded hog pressure. The
+check counts confirmed unloads per scope from the daemon journal rather than
+end-state readiness, because a query reloads an unloaded model on demand and
+hides an unload. In 3 of 3 runs (`release/contention-{1,2,3}.jsonl`) the quiet
+mill was unloaded by policy as intended, **and the busy mill was also unloaded
+once**, so the gate fails. The cause is that the adapter derives idleness only
+from polled `in_flight`/`pending`/`loading`, which a millisecond query almost
+never overlaps, and breadmill exposes no last-query signal (RAM-82). This is
+recorded as a failure, not a pass. An earlier run that reported
+`contention_resolved: true` used the old end-state check and is superseded.
 
 ### Release-build repetitions
 

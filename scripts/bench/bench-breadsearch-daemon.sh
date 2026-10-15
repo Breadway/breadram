@@ -48,7 +48,9 @@ mkdir -p "$bcfg/breadsearch"
 printf '[index]\nroots = []\n' >"$bcfg/breadsearch/config.toml"
 
 cleanup() {
-    systemctl --user stop "$bm_unit" "$hog_unit" >/dev/null 2>&1 || true
+    for unit in "$bm_unit" "$hog_unit"; do
+        systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    done
     if [ -f "$rst/daemon.pid" ]; then
         kill "$(cat "$rst/daemon.pid")" 2>/dev/null || true
     fi

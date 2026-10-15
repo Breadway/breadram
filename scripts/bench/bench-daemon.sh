@@ -86,7 +86,9 @@ run_scenario() {
     dir=$(mktemp -d)
     hog_unit="breadram-bench-hog-${label}-$$.scope"
     cleanup() {
-        systemctl --user stop "$unit" "$hog_unit" >/dev/null 2>&1 || true
+        for stopping in "$unit" "$hog_unit"; do
+            systemctl --user stop "$stopping" >/dev/null 2>&1 || true
+        done
         stop_daemon "$dir"
         rm -f "${out:-}" "${out:-}.err"
         rm -rf "$dir"
