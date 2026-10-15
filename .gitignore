@@ -33,3 +33,5 @@ logs/
 # Local agent tooling
 .freebuff/
 graphify-out/
+__pycache__/
+*.pyc
