@@ -107,8 +107,25 @@ and is not a physical-memory savings claim. Device usage is `null`: CPU-only
 configuration does not turn an unmeasured device counter into zero.
 
 This is real model/API recovery, **not** a daemon-driven management or actively
-serving protection test. It does not establish several-provider contention,
-load-dependent recovery thresholds or the vLLM contract. Those remain gates.
+serving protection test. Those follow below. Several-provider contention,
+load-dependent recovery thresholds and the vLLM contract remain gates.
+
+### Daemon-driven breadsearch lifecycle
+
+`bench-breadsearch-daemon.sh` runs a disposable breadmill (empty index roots,
+isolated runtime/state/config/cache, bounded 2 GiB service) under a private
+breadramd in automatic mode whose only permitted action is `unload_idle_model`.
+Set `BREADMILL_BIN` to a verbs build; the installed binary predates the unload
+verbs and the preflight refuses it fast. The verbs build used here was compiled
+from the breadsearch checkout at `bc4b2d9` with `--features breadmill/full`
+(the ROAD-15 workaround; CPU stays the runtime backend).
+
+`release/breadsearch-daemon.jsonl` records a daemon-confirmed unload of the
+quiet model, RSS falling from 872,140 KiB to 49,348 KiB (822,792 KiB freed),
+demand reload completing in 3 s with hits returned, and a 45 s window of
+continuous queries during which no second unload was journalled and the model
+stayed ready. Efficacy and serving protection are both demonstrated live, each
+attributed to the daemon journal rather than claimed from process state.
 
 ### Release-build repetitions
 
