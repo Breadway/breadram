@@ -14,6 +14,7 @@ sh scripts/bench/bench-daemon.sh
 sh scripts/bench/test-lib.sh
 sh scripts/bench/bench-foreground.sh
 sh scripts/bench/bench-llamacpp.sh
+sh scripts/bench/bench-standalone.sh
 ```
 
 The generic and daemon workers allocate 96 MiB. Each scope is bounded by
@@ -71,6 +72,21 @@ testing is still outstanding. RAM-78 tracks the separate sample-timestamp
 jitter follow-up discovered during review.
 
 ## Open gates
+
+### Standalone observation smoke test
+
+`bench-standalone.sh` uses Bubblewrap with private PID/network namespaces and
+an isolated home, `/run`, `/etc`, and `/sys`. Only the two release application
+binaries are copied into `/app`; `/usr` is read-only for the dynamic loader and
+shell. No host ecosystem processes, settings, sockets or systemd manager are
+reachable. The daemon starts with a minimal monitor-mode config and the CLI
+successfully reads status, workload inventory and capabilities. Raw output is
+three consecutive JSON payloads in `release/standalone.json`.
+
+This verifies observation without breadd, breadsearch or a model provider
+running. Meminfo, PSI and swap activity remain available; cgroup-v2 control is
+honestly unavailable because `/sys` is empty. It does not prove management
+efficacy in a clean standalone systemd installation; that gate stays open.
 
 ### Private llama.cpp API recovery
 
