@@ -666,6 +666,29 @@ fn validate_endpoint(provider: &ProviderEndpoint) -> Result<(), ConfigError> {
         return Ok(());
     }
 
+    // A breadsearch endpoint names a local daemon socket, like unix: does, so
+    // automation is permitted wherever the path is absolute. The registry only
+    // attaches a breadsearch url to a breadsearch provider, so anything else
+    // on either side is a configuration mistake, never a fallback.
+    if let Some(rest) = provider.url.strip_prefix("breadsearch:") {
+        if provider.kind != ProviderKind::Breadsearch {
+            return Err(unsafe_endpoint(
+                "a breadsearch endpoint url is only valid on a breadsearch provider",
+            ));
+        }
+        if !rest.starts_with('/') || rest.contains('\0') {
+            return Err(unsafe_endpoint(
+                "a breadsearch endpoint url must be breadsearch:<absolute socket path>",
+            ));
+        }
+        return Ok(());
+    }
+    if provider.kind == ProviderKind::Breadsearch {
+        return Err(unsafe_endpoint(
+            "a breadsearch provider url must be breadsearch:<absolute socket path>",
+        ));
+    }
+
     let (scheme, rest) = provider
         .url
         .split_once("://")
@@ -1198,6 +1221,37 @@ budget_bytes = 2147483648
         let text = "[[providers]]\nname = \"o\"\nkind = \"ollama\"\n\
                     url = \"unix:/run/ollama/ollama.sock\"\nallow_automation = false\n";
         assert!(Config::from_toml(text).is_ok());
+    }
+
+    #[test]
+    fn a_breadsearch_endpoint_needs_an_absolute_socket_path_on_its_own_kind() {
+        let good = "[[providers]]\nname = \"mill\"\nkind = \"breadsearch\"\n\
+                    url = \"breadsearch:/run/user/1000/breadmill.sock\"\n\
+                    scope = \"unit:mill.service\"\nallow_automation = true\n";
+        assert!(Config::from_toml(good).is_ok());
+
+        for bad in [
+            // A relative path could resolve anywhere, so it is rejected.
+            "[[providers]]\nname = \"mill\"\nkind = \"breadsearch\"\n\
+             url = \"breadsearch:relative.sock\"\n",
+            // An http url on a breadsearch provider would be probed as a
+            // socket path, so it is rejected instead of silently contributing
+            // nothing.
+            "[[providers]]\nname = \"mill\"\nkind = \"breadsearch\"\n\
+             url = \"http://127.0.0.1:8080\"\n",
+            // A breadsearch url on any other kind would be fetched as that
+            // kind's protocol, so it is rejected too.
+            "[[providers]]\nname = \"o\"\nkind = \"ollama\"\n\
+             url = \"breadsearch:/run/user/1000/breadmill.sock\"\n",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_toml(bad),
+                    Err(ConfigError::UnsafeEndpoint { .. })
+                ),
+                "rejected: {bad}"
+            );
+        }
     }
 
     #[test]
