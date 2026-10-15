@@ -10,15 +10,16 @@
 # Usage: sample_scope <control-group-path>
 sample_scope() {
     cg=$1
-    current=0
-    peak=0
-    pressure=0
-    full=0
-    pgfault=0
-    pgmajfault=0
+    valid=1
+    current=
+    peak=
+    pressure=
+    full=
+    pgfault=
+    pgmajfault=
     if [ -n "$cg" ] && [ -r "/sys/fs/cgroup${cg}/memory.current" ]; then
-        current=$(cat "/sys/fs/cgroup${cg}/memory.current" 2>/dev/null || echo 0)
-        peak=$(cat "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null || echo 0)
+        current=$(cat "/sys/fs/cgroup${cg}/memory.current" 2>/dev/null || true)
+        peak=$(cat "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null || true)
         if [ -r "/sys/fs/cgroup${cg}/memory.pressure" ]; then
             pressure=$(awk '/^some/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure" 2>/dev/null || echo 0)
             full=$(awk '/^full/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure" 2>/dev/null || echo 0)
@@ -28,6 +29,13 @@ sample_scope() {
             pgmajfault=$(awk '/^pgmajfault / { print $2 }' "/sys/fs/cgroup${cg}/memory.stat" 2>/dev/null || echo 0)
         fi
     fi
+    for metric in current peak pressure full pgfault pgmajfault; do
+        # Missing or malformed counters are not measurements of zero.
+        eval 'value=${'"$metric"':-}'
+        case "$value" in ''|*[!0-9]*) valid=0 ;; esac
+    done
+    [ -n "$cg" ] && [ -r "/sys/fs/cgroup${cg}/memory.stat" ] || valid=0
+    echo "valid=$valid"
     echo "current=${current:-0}"
     echo "peak=${peak:-0}"
     echo "pressure=${pressure:-0}"

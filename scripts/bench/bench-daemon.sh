@@ -19,8 +19,8 @@ if [ ! -x "$root/../../target/debug/breadramd" ] || [ ! -x "$root/../../target/d
     echo "skipped: build breadramd and breadram first (cargo build -p breadramd -p breadram-cli)" >&2
     exit 0
 fi
-daemon="$root/../../target/debug/breadramd"
-cli="$root/../../target/debug/breadram"
+daemon=${BREADRAM_BENCH_DAEMON:-$root/../../target/debug/breadramd}
+cli=${BREADRAM_BENCH_CLI:-$root/../../target/debug/breadram}
 
 start_daemon() {
     # $1 = state dir (created by caller), $2 = budget bytes or empty
@@ -114,6 +114,7 @@ run_scenario() {
         hogpid=$!
         sleep 3
     fi
+    started_ns=$(date +%s%N)
     timeout 26 systemd-run --user --scope --quiet --collect \
         --unit="$unit" \
         -p MemoryMax=160M \
@@ -136,19 +137,20 @@ run_scenario() {
         set -e
     fi
     eval "$(daemon_rss_cpu "$dir" | sed 's/^/d1_/')"
+    ended_ns=$(date +%s%N)
     eval "$(summarize_rounds "$out")"
-    journal=$("$cli" --socket "$socket" actions --json 2>/dev/null || echo '{}')
+    journal=$("$cli" --socket "$socket" actions --json)
     rm -f "$out" "$out.err"
     cleanup
     trap - EXIT INT TERM
     python3 - "$label" "$budget" "$status" "$rounds" "$p50_ms" "$p95_ms" \
-        "$d0_rss_kb" "$d1_rss_kb" "$d0_jiffies" "$d1_jiffies" "$journal" <<'PY'
-import json, sys
-(label, budget, status, rounds, p50, p95, r0, r1, j0, j1, journal) = sys.argv[1:]
-try:
-    journal = json.loads(journal)
-except ValueError:
-    journal = {}
+        "$d0_rss_kb" "$d1_rss_kb" "$d0_jiffies" "$d1_jiffies" "$journal" \
+        "$started_ns" "$ended_ns" <<'PY'
+import json, os, sys
+(label, budget, status, rounds, p50, p95, r0, r1, j0, j1, journal, start, end) = sys.argv[1:]
+journal = json.loads(journal)
+wall_s = (int(end) - int(start)) / 1e9
+cpu_s = (int(j1) - int(j0)) / os.sysconf("SC_CLK_TCK")
 history = (journal.get("history") if isinstance(journal, dict) else []) or []
 states = {}
 for entry in history:
@@ -164,6 +166,11 @@ result = {
     "daemon_rss_start_kb": int(r0),
     "daemon_rss_end_kb": int(r1),
     "daemon_jiffies": int(j1 or 0) - int(j0 or 0),
+    "measured_wall_s": round(wall_s, 6),
+    "daemon_cpu_s": round(cpu_s, 6),
+    "daemon_cpu_percent_one_core": round(cpu_s / wall_s * 100, 3),
+    "journal_events_per_minute": round(len(history) / wall_s * 60, 3),
+    "confirmed_actions_per_minute": round(states.get("confirmed", 0) / wall_s * 60, 3),
     "journal_states": states,
     "journal_len": len(history),
     "reversal_observed": "rolled_back" in states,
@@ -195,6 +202,8 @@ print(
 )
 if b["journal_len"] != 0:
     sys.exit("the idle daemon journalled actions with nothing to manage")
+if b["exit"] or e["exit"]:
+    sys.exit("a worker failed or timed out")
 if e["rounds"] < 1:
     sys.exit("the budgeted worker produced no rounds")
 if "rolled_back" not in e["journal_states"]:

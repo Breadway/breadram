@@ -2,11 +2,11 @@
 # Scenario A: generic memory worker, unmanaged versus MemoryHigh-managed.
 #
 # Two disposable scopes, each capped at 160 MiB plus 96 MiB swap. The worker
-# touches 96 MiB for 3 seconds. Reports throughput, per-round latency,
+# touches 96 MiB for 6 seconds. Reports throughput, per-round latency,
 # memory held and peaked, scope stall accumulation, host stall deltas, and
 # swap activity deltas. MemoryHigh here is the harness bound; breadram's own
-# control stays MemoryHigh too, so the numbers transfer to daemon-managed
-# runs.
+# control stays MemoryHigh too, but these manually applied limits are not
+# evidence of daemon policy efficacy.
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$root/lib.sh"
@@ -17,6 +17,12 @@ run_one() {
     high=$2
     unit="breadram-bench-${label}-$$.scope"
     out=$(mktemp)
+    cleanup() {
+        systemctl --user stop "$unit" >/dev/null 2>&1 || true
+        rm -f "$out" "$out.err"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
     eval "$(host_pressure | sed 's/^/before_/')"
     eval "$(swap_io | sed 's/^/sw_before_/')"
     # The worker runs 6 s; the late sample at 5 s catches the scope alive
@@ -35,6 +41,14 @@ run_one() {
     sleep 4.5
     cg=$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null || true)
     eval "$(sample_scope "$cg" | sed 's/^/late_/')"
+    if [ "$mid_valid" != 1 ] || [ "$late_valid" != 1 ]; then
+        echo "invalid measurement: required scope counters disappeared for $unit" >&2
+        exit 1
+    fi
+    if [ "$late_pressure" -lt "$mid_pressure" ]; then
+        echo "invalid measurement: scope stall counter reset for $unit" >&2
+        exit 1
+    fi
     set +e
     wait "$pid"
     status=$?
@@ -42,7 +56,8 @@ run_one() {
     eval "$(host_pressure | sed 's/^/after_/')"
     eval "$(swap_io | sed 's/^/sw_after_/')"
     eval "$(summarize_rounds "$out")"
-    rm -f "$out" "$out.err"
+    cleanup
+    trap - EXIT INT TERM
     # 124 is timeout's code. A killed scope still reports the sample.
     python3 - "$label" "$high" "$status" "$rounds" "$p50_ms" "$p95_ms" \
         "$mid_current" "$late_peak" "$mid_pressure" "$late_pressure" "$late_pgfault" "$late_pgmajfault" \
@@ -92,6 +107,8 @@ print(
 )
 if loose["rounds"] < 1:
     sys.exit("the loose scope produced no rounds")
+if loose["exit"] or tight["exit"]:
+    sys.exit("a scope failed or timed out; results are not an acceptance pass")
 if tight["rounds"] > loose["rounds"]:
     sys.exit("the tight limit did not cost throughput")
 if tight["peak_bytes"] and loose["peak_bytes"] and tight["peak_bytes"] > loose["peak_bytes"]:
