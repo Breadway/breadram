@@ -71,6 +71,30 @@ jitter follow-up discovered during review.
 
 ## Open gates
 
+### Release-build repetitions
+
+Three consecutive release-build daemon runs (`release/daemon-{1,2,3}.jsonl`)
+all recorded one confirmed intervention and one rollback. No-action CPU was
+2.098%, 2.101%, and 2.211% of one core; final RSS was 7,008, 7,084, and 6,912
+KiB. The intervention runs used 2.206%, 2.480%, and 2.473% of one core. Each
+subject ran for 18 seconds. These tests use a two-second tick and artificially
+low pressure thresholds, not the installed default configuration.
+
+The first repetition overlapped the explicitly labelled concurrent foreground
+probe. After the repetitions completed, `release/foreground-isolated.jsonl`
+recorded 400 samples per condition: baseline p95 0.301 ms, pressured p95
+0.282 ms, no 20 ms deadline misses in either. This small background workload
+did not measurably hurt this probe; it does not demonstrate that management
+improves desktop latency.
+
+Provisional regression ceilings for this exact synthetic setup: no-action
+release CPU below 3% of one core and final RSS below 10 MiB, zero interventions
+in the no-action case, and an observed rollback in each harmful-limit run.
+These ceilings leave approximately 35% CPU and 45% RSS headroom above the
+largest observed no-action values. They are host-specific regression checks,
+not universal release acceptance. Independent foreground and provider gates
+need repeated paired unmanaged/managed baselines before thresholds are set.
+
 `bench-foreground.sh` measures a separate synthetic foreground workload:
 scheduled-arrival-to-completion time for a 64 KiB SHA256 job at 20 ms intervals.
 It keeps overdue arrivals rather than silently dropping them, and reports
