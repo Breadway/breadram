@@ -5,9 +5,9 @@ round with its wall time in milliseconds, plus a final summary line. Used
 only inside disposable systemd scopes with a hard MemoryMax, so a runaway
 cannot hurt the host.
 
-The per-round timings are the foreground latency signal: a throttled run
-shows the same rounds taking longer, and percentiles come from the lines,
-not from a second measurement pass.
+The per-round timings are worker latency, not independent foreground latency.
+A throttled run shows the same rounds taking longer, and percentiles come
+from the lines, not from a second measurement pass.
 """
 
 import json

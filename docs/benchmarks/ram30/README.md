@@ -11,6 +11,8 @@ cargo build --locked -p breadramd -p breadram-cli -p cooperative-job
 sh scripts/bench/bench-generic.sh
 sh scripts/bench/bench-jobs.sh
 sh scripts/bench/bench-daemon.sh
+sh scripts/bench/test-lib.sh
+sh scripts/bench/bench-foreground.sh
 ```
 
 The generic and daemon workers allocate 96 MiB. Each scope is bounded by
@@ -68,6 +70,15 @@ testing is still outstanding. RAM-78 tracks the separate sample-timestamp
 jitter follow-up discovered during review.
 
 ## Open gates
+
+`bench-foreground.sh` measures a separate synthetic foreground workload:
+scheduled-arrival-to-completion time for a 64 KiB SHA256 job at 20 ms intervals.
+It keeps overdue arrivals rather than silently dropping them, and reports
+p50/p95/p99, maximum latency and deadline misses. It compares an unloaded
+period with a manually throttled background memory worker, not daemon-managed
+policy. Do not interpret this as actual desktop frame time or an efficacy pass.
+`release/foreground-concurrent.jsonl` was collected while release daemon
+repetitions ran concurrently, so it is explicitly not a clean baseline.
 
 - Establish repeated release-build overhead and latency baselines.
 - Provider recovery, actively serving and competing model servers, independent
