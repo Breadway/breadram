@@ -64,10 +64,16 @@ A stall is judged per scope, not per host. Host PSI `avg10` cannot move by a
 point inside one short monitor tick, so a rule written against it never fires.
 `StallWatch` instead follows each controllable unit's own cgroup
 `memory.pressure` `total` counter, which accumulates in the same tick the
-scope thrashes. Every pass judges every unit, so a baseline exists before any
-limit is written. When a scope limited on the previous pass accumulates half a
-CPU-second more stall than the tick before (`STALL_SCOPE_DELTA_RISE_US`), the
-daemon puts back only that action's values through `recover_actions` and
+scope thrashes. Every reading becomes a stall rate (basis points of wall time),
+so the rule means the same at a 250 ms tick and a 3 s tick. Every pass judges
+every unit, and a soft limit waits one tick for a scope whose pressure file is
+readable until a second reading gives a baseline, so the baseline is genuinely
+pre-write. A scope with no readable pressure file has no signal to wait for and
+is not held back. Once a limit is confirmed it is observed for ten seconds
+(`STALL_OBSERVATION_MS`) against its frozen pre-write rate, not only on the
+next tick. When the rate rises one point or more above that baseline
+(`STALL_RISE_BASIS_POINTS`), the daemon puts back only that action's values
+through `recover_actions` and
 records the action `Ineffective`, which starts its cooldown and escalates the
 planner past it. Every other owned value is untouched. A scope with no pressure
 reading is never reversed: a missing signal keeps the limit. The same journal
@@ -99,6 +105,8 @@ A second run gave 224 rounds at 54,517,760 and 0 stall microseconds loose,
 6 rounds at 20,697,088 and 165,876 stall microseconds tight. The tight limit
 held the scope to about 20 MiB and cut throughput from over 200 rounds to
 under 10. The stall signal moves where the ten-second average showed 0.00 on
-both runs, and the verdict on these runs is Keep: the accumulation stays below
-the half CPU-second the daemon reverses on. A scope that accumulates past it
-is Reverse and only its limit is put back.
+both runs. These numbers predate the rate rule above and were not replayed
+through it, so they are a record of the cost of a tight limit, not a verdict.
+The daemon judges a limit by the rate rule: a rise of `STALL_RISE_BASIS_POINTS`
+over the scope's frozen pre-write rate inside the observation window puts back
+only that limit.
