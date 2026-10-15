@@ -13,6 +13,7 @@ sh scripts/bench/bench-jobs.sh
 sh scripts/bench/bench-daemon.sh
 sh scripts/bench/test-lib.sh
 sh scripts/bench/bench-foreground.sh
+sh scripts/bench/bench-llamacpp.sh
 ```
 
 The generic and daemon workers allocate 96 MiB. Each scope is bounded by
@@ -70,6 +71,28 @@ testing is still outstanding. RAM-78 tracks the separate sample-timestamp
 jitter follow-up discovered during review.
 
 ## Open gates
+
+### Private llama.cpp API recovery
+
+`bench-llamacpp.sh` starts its own loopback router in a disposable systemd
+service, capped at 1,536 MiB RAM and 256 MiB swap with a 120-second lifetime.
+It uses a local 149,080,928-byte LFM2.5-230M Q4_0 model, CPU-only, two threads,
+1,024-token context and one slot. Set `BREADRAM_BENCH_MODEL` to override the
+local GGUF. It never sends requests to the installed router.
+
+`release/llamacpp-recovery.jsonl` records initial inference at 0.592 seconds,
+warm inference at 0.082 seconds, confirmed API unload at 0.104 seconds, and
+demand-reload inference at 0.504 seconds. Each completion produced 10 tokens.
+The warm request reused cached prompt tokens; cold/reload did not. Cgroup
+charge fell from 314,253,312 to 161,456,128 bytes, a 152,797,184-byte reduction.
+This includes charged file cache, not just anonymous resident memory. Summed
+process RSS fell by 415,625,216 bytes, but can double-count shared mappings
+and is not a physical-memory savings claim. Device usage is `null`: CPU-only
+configuration does not turn an unmeasured device counter into zero.
+
+This is real model/API recovery, **not** a daemon-driven management or actively
+serving protection test. It does not establish several-provider contention,
+load-dependent recovery thresholds or the vLLM contract. Those remain gates.
 
 ### Release-build repetitions
 
