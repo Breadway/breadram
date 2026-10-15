@@ -34,8 +34,8 @@ independent interactive foreground latency measurement.
 Major faults are read from `memory.stat`, not `memory.events`. Host swap I/O
 deltas come from `/proc/vmstat` and include unrelated host activity: they are
 not attributable exclusively to a benchmark scope. Missing late scope
-samples currently fall back to zero, which is a harness limitation to fix
-before release gating.
+  samples now invalidate the generic run rather than passing as zeros. Scope
+  cleanup explicitly stops the named disposable unit on exit or interruption.
 
 The cooperative example averaged 5.1 units per half-second while running,
 0.0 while steadily paused. RSS fell from 17,658 KiB to 2,832 KiB. The first
@@ -51,10 +51,25 @@ run with a 16 MiB configured budget recorded one confirmed intervention and
 not percent utilization; normalize by CLK_TCK and measured wall time before
 setting overhead thresholds.
 
+## After RAM-76
+
+RAM-76 merged as `6585f6c8780fafb803bc20c00fd6469c59d87cff`, independently
+approved on head `2ec367a` (PR 44 comment 4917), with successful merge CI.
+The post-merge debug-build run is preserved in `post-ram76/daemon.jsonl`.
+It records one confirmed limit followed by one rollback; the gate exits 0.
+The no-action case used 0.90 CPU seconds over 18.083 wall seconds, approximately
+4.98% of one core, with 14,904 KiB final RSS. These are short debug-build
+measurements, not evidence of an acceptable release overhead threshold.
+
+The harness now normalizes CPU jiffies by `SC_CLK_TCK` and measured wall time,
+reports confirmed actions separately from journal events, and fails on CLI
+errors, malformed JSON, missing generic samples, and failed workers. Provider
+testing is still outstanding. RAM-78 tracks the separate sample-timestamp
+jitter follow-up discovered during review.
+
 ## Open gates
 
-- RAM-76: fixed absolute stall-delta threshold depends on monitor interval;
-  only the immediately following tick is eligible for reversal.
+- Establish repeated release-build overhead and latency baselines.
 - Provider recovery, actively serving and competing model servers, independent
   foreground latency, separate device-memory sampling, repeated-run noise
   analysis, and a genuinely standalone installation remain unmeasured here.
