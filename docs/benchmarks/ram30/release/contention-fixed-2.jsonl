@@ -1,0 +1,1 @@
+{"scenario": "provider_contention", "daemon_policy_driven": true, "busy_mill_still_ready": true, "quiet_mill_still_ready": false, "busy_mill_unloads": 0, "quiet_mill_unloads": 1, "confirmed_unloads_by_scope": {"unit:breadram-bench-mb-2348187.service": 1}, "busy_mill_protected": true, "contention_resolved": true}

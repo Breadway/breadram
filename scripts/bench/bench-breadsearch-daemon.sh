@@ -15,8 +15,8 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo=$root/../..
-daemon=$repo/target/release/breadramd
-cli=$repo/target/release/breadram
+daemon=${BREADRAM_BENCH_DAEMON:-$repo/target/release/breadramd}
+cli=${BREADRAM_BENCH_CLI:-$repo/target/release/breadram}
 # The installed breadmill predates the unload verbs: its status carries no
 # version, so the adapter honestly offers no unload. Override with a binary
 # built from the unload-verbs branch (for example the breadsearch checkout
