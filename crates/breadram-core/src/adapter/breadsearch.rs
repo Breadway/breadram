@@ -177,6 +177,34 @@ pub struct BreadmillStatus {
     /// The daemon version that answered. Absent on older daemons.
     #[serde(default)]
     pub version: Option<String>,
+    /// Total queries the daemon has served since it started.
+    ///
+    /// A query holds `in_flight` for milliseconds, so a poll every few
+    /// seconds almost never sees one. This counter does not depend on timing:
+    /// any change between two readings proves queries ran in between. Absent
+    /// on daemons that predate it, which gives no signal either way.
+    #[serde(default)]
+    pub queries_served: Option<u64>,
+}
+
+/// Whether this reading, set against the previous one, shows work.
+///
+/// Queries in flight, files awaiting indexing, and a running background load
+/// are all work: a load compiles the backend and would resurrect an unloaded
+/// model the moment it finishes. A moved query counter is work that finished
+/// between two polls. A counter that went backwards means the daemon restarted
+/// in between, which is also activity, never idleness.
+fn shows_work(previous: Option<&BreadmillStatus>, status: &BreadmillStatus) -> bool {
+    if status.in_flight > 0 || status.pending > 0 || status.loading {
+        return true;
+    }
+    match (
+        previous.and_then(|previous| previous.queries_served),
+        status.queries_served,
+    ) {
+        (Some(before), Some(now)) => before != now,
+        _ => false,
+    }
 }
 
 /// Parse a status answer: a `status_info` response or, for tolerance, a bare
@@ -323,12 +351,7 @@ impl BreadsearchAdapter {
         match runner.request(&self.socket_path, r#"{"type":"status"}"#) {
             Ok(body) => match parse_status(&body) {
                 Ok(status) => {
-                    // Queries in flight, files awaiting indexing, and a
-                    // running background load are all work: a load compiles
-                    // the backend and would resurrect an unloaded model the
-                    // moment it finishes.
-                    let busy = status.in_flight > 0 || status.pending > 0 || status.loading;
-                    if busy {
+                    if shows_work(observation.status.as_ref(), &status) {
                         observation.idle_since_ms = None;
                     } else if observation.idle_since_ms.is_none() {
                         observation.idle_since_ms = Some(at_ms);
@@ -382,8 +405,7 @@ impl BreadsearchAdapter {
             Ok(body) => match parse_status(&body) {
                 Ok(status) => {
                     let mut observation = self.state();
-                    let busy = status.in_flight > 0 || status.pending > 0 || status.loading;
-                    if busy {
+                    if shows_work(observation.status.as_ref(), &status) {
                         observation.idle_since_ms = None;
                     } else if observation.idle_since_ms.is_none() {
                         observation.idle_since_ms = Some(at_ms);
@@ -619,6 +641,13 @@ mod tests {
         r#"{"type":"status_info","indexed":41,"pending":0,"model_ready":true}"#;
     const UNLOADED_STATUS: &str = r#"{"type":"status_info","indexed":41,"pending":0,"model_ready":false,"in_flight":0,"loading":false,"model_bytes":547310275,"version":"0.4.0"}"#;
 
+    /// A quiet status carrying a query counter, for the polling-gap tests.
+    fn served(count: u64) -> String {
+        format!(
+            r#"{{"type":"status_info","indexed":41,"pending":0,"model_ready":true,"in_flight":0,"loading":false,"model_bytes":547310275,"version":"0.4.0","queries_served":{count}}}"#
+        )
+    }
+
     fn adapter() -> BreadsearchAdapter {
         BreadsearchAdapter::new("breadmill", SOCKET, SCOPE).with_capabilities(
             AdapterCapabilities::configured(&[
@@ -674,6 +703,82 @@ mod tests {
         assert!(socket_path_for("http://localhost:11434").is_none());
         assert!(is_breadsearch_url("breadsearch:/x.sock:status"));
         assert!(!is_breadsearch_url("hook:trainer/status"));
+    }
+
+    #[test]
+    fn queries_finishing_between_polls_keep_the_daemon_active() {
+        // Every poll sees in_flight 0, as a millisecond query always leaves
+        // it, yet the counter moves each time: the daemon is in use.
+        let adapter = adapter();
+        // The first reading has nothing to compare against and starts the
+        // idle clock. The two readings after it each show the counter moved.
+        for (at_ms, count) in [(60_000, 10), (63_000, 11), (66_000, 13)] {
+            let sockets = ScriptedSockets::answer(&served(count));
+            assert!(adapter.refresh(&sockets, at_ms).is_empty());
+        }
+        assert_eq!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Unknown,
+            "a moving counter must never read as confirmed idle"
+        );
+        // Unknown evidence is what keeps the policy from planning an unload.
+        assert!(!adapter
+            .activity(&workload())
+            .is_confirmed_idle(120_000, 30_000));
+    }
+
+    #[test]
+    fn a_flat_counter_lets_idleness_accrue_from_the_first_flat_reading() {
+        let adapter = adapter();
+        let first = ScriptedSockets::answer(&served(10));
+        adapter.refresh(&first, 60_000);
+        // The first reading has nothing to compare against, so it counts as
+        // quiet and the idle clock starts there.
+        assert_eq!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Idle { since_ms: 60_000 }
+        );
+        let flat = ScriptedSockets::answer(&served(10));
+        adapter.refresh(&flat, 63_000);
+        assert_eq!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Idle { since_ms: 60_000 }
+        );
+        let moved = ScriptedSockets::answer(&served(11));
+        adapter.refresh(&moved, 66_000);
+        assert_eq!(adapter.activity(&workload()), ActivityEvidence::Unknown);
+        let flat_again = ScriptedSockets::answer(&served(11));
+        adapter.refresh(&flat_again, 69_000);
+        assert_eq!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Idle { since_ms: 69_000 },
+            "idleness restarts from the first flat reading after activity"
+        );
+    }
+
+    #[test]
+    fn a_counter_that_goes_backwards_is_activity_not_idleness() {
+        // A restarted daemon begins again at zero.
+        let adapter = adapter();
+        adapter.refresh(&ScriptedSockets::answer(&served(500)), 60_000);
+        adapter.refresh(&ScriptedSockets::answer(&served(0)), 63_000);
+        assert_ne!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Idle { since_ms: 60_000 }
+        );
+    }
+
+    #[test]
+    fn a_daemon_without_the_counter_behaves_as_before() {
+        // No counter on either reading gives no signal: only in-flight work,
+        // pending files and loads count, exactly as they did.
+        let adapter = adapter();
+        adapter.refresh(&ScriptedSockets::answer(IDLE_STATUS), 60_000);
+        adapter.refresh(&ScriptedSockets::answer(IDLE_STATUS), 63_000);
+        assert_eq!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Idle { since_ms: 60_000 }
+        );
     }
 
     #[test]
