@@ -757,15 +757,31 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmation_read_compares_against_the_previous_reading() {
+        // The executor feeds every confirmation read through
+        // note_socket_result. It must compare against the stored reading, so a
+        // counter that moved is not swallowed by landing between two polls.
+        let adapter = adapter();
+        adapter.refresh(&ScriptedSockets::answer(&served(10)), 60_000);
+        let notes = adapter.note_socket_result(Ok(served(11)), 62_000);
+        assert!(notes.is_empty());
+        assert_eq!(adapter.activity(&workload()), ActivityEvidence::Unknown);
+        // The next poll is flat against the confirmation read, so idleness
+        // restarts there.
+        adapter.refresh(&ScriptedSockets::answer(&served(11)), 63_000);
+        assert_eq!(
+            adapter.activity(&workload()),
+            ActivityEvidence::Idle { since_ms: 63_000 }
+        );
+    }
+
+    #[test]
     fn a_counter_that_goes_backwards_is_activity_not_idleness() {
         // A restarted daemon begins again at zero.
         let adapter = adapter();
         adapter.refresh(&ScriptedSockets::answer(&served(500)), 60_000);
         adapter.refresh(&ScriptedSockets::answer(&served(0)), 63_000);
-        assert_ne!(
-            adapter.activity(&workload()),
-            ActivityEvidence::Idle { since_ms: 60_000 }
-        );
+        assert_eq!(adapter.activity(&workload()), ActivityEvidence::Unknown);
     }
 
     #[test]
