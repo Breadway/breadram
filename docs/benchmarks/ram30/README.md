@@ -88,7 +88,18 @@ phase, leaving the provider intact. This removes duplicate suppression from
 the experiment without weakening the product guard. It requires 40 successful
 queries over at least 120 seconds and counts query errors as failures.
 Breadsearch PR 12 has now merged as `cce8e22`; integrated RAM-82 verification
-is being rerun using a binary built from that commit.
+passed using a binary built from that commit: zero busy-mill unloads, one
+quiet-mill unload, exit 0, and no leftover units. The independent review of
+breadram head `f92dfeb` is PR 50 comment 5257; its merge `75bccaf` has green
+CI. The main-built provider result is in `integrated-ram82/contention.jsonl`.
+RAM-82 is verified done, independently of the still-open RAM-30 matrix.
+
+The fresh-journal single-mill control reproduces the failure: legacy breadmill,
+140 seconds, one unwanted unload, 39 successful queries and one failed query,
+exit 1. The counter-capable build completes 40 successful queries over 131
+seconds, zero failures and zero unloads, exit 0. See
+`long-window/{legacy,counter}-fresh-journal.jsonl`. This removes the duplicate
+suppression confound without asserting that RAM-84 has been fixed.
 
 The runner now records binary SHA256 values and whether the query counter is
 actually present, so an old or replaced provider binary cannot be mistaken
@@ -129,6 +140,16 @@ This verifies observation without breadd, breadsearch or a model provider
 running. Meminfo, PSI and swap activity remain available; cgroup-v2 control is
 honestly unavailable because `/sys` is empty. It does not prove management
 efficacy in a clean standalone systemd installation; that gate stays open.
+
+A second attempt used a bounded 512 MiB rootless Podman container from
+`docker.io/library/archlinux:base`, no network and no host runtime mounts.
+Systemd and its user manager started after container-only runtime/dbus setup,
+but a 64 MiB bounded user scope could not move its process into the delegated
+cgroup (`Permission denied`, `Input/output error`). Image/config identity and
+diagnostics are saved in `standalone-systemd/`. The container was stopped and
+removed. This is an environment limitation, not a management pass. No
+privileged mode or host security changes were used. A properly delegated clean
+systemd VM remains required for that gate.
 
 ### Private llama.cpp API recovery
 

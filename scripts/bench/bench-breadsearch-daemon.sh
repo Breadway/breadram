@@ -163,9 +163,21 @@ done
 reload_s=$(( $(date +%s) - reload_start ))
 [ "$reloaded" = 1 ] || { echo "demand reload never completed" >&2; exit 1; }
 
+# A confirmed action remains deduplicated for this workload identity. Reusing
+# that journal would hide every later unload even if activity detection broke.
+# Restart only our private daemon with fresh state before testing protection.
+kill "$(cat "$rst/daemon.pid")"
+wait "$(cat "$rst/daemon.pid")" || true
+rm -f "$ramsock"
+mkdir -p "$rst/serving-state"
+XDG_STATE_HOME=$rst/serving-state "$daemon" --config "$ramcfg" --socket "$ramsock" >"$rst/serving-daemon.log" 2>&1 &
+echo $! >"$rst/daemon.pid"
+for _ in $(seq 1 50); do [ -S "$ramsock" ] && break; sleep 0.1; done
+[ -S "$ramsock" ] || { cat "$rst/serving-daemon.log" >&2; exit 1; }
+
 # Phase B deliberately exceeds several idle periods. Record actual successful
 # requests: an error hidden by `|| true` is not serving evidence.
-unloads_before=$daemon_unloaded
+unloads_before=0
 serving_start=$(date +%s)
 successful_queries=0
 failed_queries=0
@@ -195,6 +207,7 @@ counter_available, daemon_sha256, mill_sha256 = sys.argv[10:]
 result = {
     "scenario": "breadsearch_daemon_driven",
     "daemon_policy_driven": True,
+    "fresh_serving_journal": True,
     "query_counter_available": counter_available == "true",
     "daemon_sha256": daemon_sha256,
     "breadmill_sha256": mill_sha256,
