@@ -159,8 +159,17 @@ but a 64 MiB bounded user scope could not move its process into the delegated
 cgroup (`Permission denied`, `Input/output error`). Image/config identity and
 diagnostics are saved in `standalone-systemd/`. The container was stopped and
 removed. This is an environment limitation, not a management pass. No
-privileged mode or host security changes were used. A properly delegated clean
-systemd VM remains required for that gate.
+privileged mode or host security changes were used.
+
+A later service-unit attempt in the same image avoided moving an existing
+`podman exec` process into a scope. The user manager launched `bench-worker`
+itself with `MemoryMax=128M`, and a private daemon applied
+`cgroup_soft_limit`, confirmed it, then rolled `MemoryHigh` back
+(`standalone-systemd/actions.json`). The container stayed unprivileged, with
+no network and a 512 MiB cap (`standalone-systemd/service-config.txt`), and
+was stopped and removed. This is one bounded management cycle without host
+bread services. It is not a full provider matrix, a release threshold, or a
+substitute for a delegated VM when scope-move delegation is required.
 
 ### Private llama.cpp API recovery
 
@@ -252,11 +261,13 @@ policy. Do not interpret this as actual desktop frame time or an efficacy pass.
 repetitions ran concurrently, so it is explicitly not a clean baseline.
 
 - Establish repeated release-build overhead and latency baselines.
-- Provider recovery, actively serving and competing model servers, independent
-  foreground latency, separate device-memory sampling, repeated-run noise
-  analysis, and a genuinely standalone installation remain unmeasured here.
-- RAM-14/RAM-19 remain prerequisites for the complete supported-provider
-  matrix. Unsupported vLLM is a limitation, never a simulated pass.
+- Provider recovery, actively serving and competing breadsearch, independent
+  foreground latency, separate device-memory sampling, and one standalone
+  management cycle are now recorded above. Repeated-run noise analysis and a
+  statistically established production latency threshold are still open.
+- Automatic llama.cpp unload remains unavailable: loaded residency is not
+  idle evidence (RAM-79). Record that as a limitation, not a managed-efficacy
+  pass. vLLM is deferred by the operator and is not a simulated pass.
 - Release thresholds have not been established from these preliminary runs.
 
 RAM-30 must remain incomplete until those gates are verified. The successful
