@@ -36,6 +36,7 @@ pub struct FakeExecutor {
     pub values: Mutex<HashMap<String, String>>,
     pub writes: Mutex<Vec<(String, String)>>,
     pub apply_calls: Mutex<usize>,
+    pub effect_absent: Mutex<bool>,
 }
 
 impl FakeExecutor {
@@ -103,6 +104,12 @@ pub fn owned(key: &str, original: &str, last_applied: &str) -> OwnedValue {
 }
 
 impl Executor for FakeExecutor {
+    fn confirmed_effect_absent(
+        &self,
+        _request: &breadram_core::coordinator::ActionRequest,
+    ) -> bool {
+        *lock(&self.effect_absent)
+    }
     fn supports(&self, kind: ActionKind) -> bool {
         lock(&self.supported).contains(&kind)
     }

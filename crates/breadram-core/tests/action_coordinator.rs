@@ -102,6 +102,59 @@ fn a_duplicate_request_is_idempotent() {
 }
 
 #[test]
+fn a_reloaded_provider_retries_only_through_the_normal_guards() {
+    let executor = FakeExecutor::with(&[ActionKind::UnloadIdleModel], 4 * GIB, 2 * GIB);
+    let mut coordinator = coordinator();
+    let mut req = request("unit:app.service", 1);
+    req.kind = ActionKind::UnloadIdleModel;
+    assert_eq!(
+        run(&mut coordinator, &executor, &[req.clone()])[0].state,
+        ActionState::Confirmed
+    );
+    assert_eq!(
+        run(&mut coordinator, &executor, &[req.clone()])[0].state,
+        ActionState::SkippedDuplicate
+    );
+    *lock(&executor.effect_absent) = true;
+    executor.set_precondition(Precondition::Busy {
+        reason: "query in flight".into(),
+    });
+    assert_eq!(
+        run(&mut coordinator, &executor, &[req.clone()])[0].state,
+        ActionState::Busy
+    );
+    assert_eq!(executor.apply_count(), 1);
+    executor.set_precondition(Precondition::Ready);
+    assert_eq!(
+        run(&mut coordinator, &executor, &[req.clone()])[0].state,
+        ActionState::Confirmed
+    );
+    *lock(&executor.effect_absent) = false;
+    assert_eq!(
+        run(&mut coordinator, &executor, &[req])[0].state,
+        ActionState::SkippedDuplicate
+    );
+    assert_eq!(executor.apply_count(), 2);
+}
+
+#[test]
+fn evidence_of_absence_never_rearms_a_cgroup_limit() {
+    let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB);
+    *lock(&executor.effect_absent) = true;
+    let mut coordinator = coordinator();
+    let results = run(
+        &mut coordinator,
+        &executor,
+        &[
+            request("unit:app.service", 1),
+            request("unit:app.service", 1),
+        ],
+    );
+    assert_eq!(results[1].state, ActionState::SkippedDuplicate);
+    assert_eq!(executor.apply_count(), 1);
+}
+
+#[test]
 fn a_failure_does_not_block_a_retry() {
     let executor = FakeExecutor::with(&[ActionKind::CgroupSoftLimit], 4 * GIB, 2 * GIB)
         .script_apply(Err(ExecutorError::Failed("transient".to_string())));
