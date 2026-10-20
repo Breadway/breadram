@@ -1,0 +1,16 @@
+name = "breadram"
+description = "Memory management daemon and CLI for the bread desktop"
+binaries = ["breadramd", "breadram"]
+system_deps = ["systemd"]
+bread_deps = []
+
+[[service]]
+unit = "breadram.service"
+enable = true
+
+[config]
+dir = "~/.config/breadram"
+example = "breadram.toml.example"
+
+[install]
+post_install = []
