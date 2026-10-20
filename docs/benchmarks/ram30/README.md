@@ -247,9 +247,8 @@ Provisional regression ceilings for this exact synthetic setup: no-action
 release CPU below 3% of one core and final RSS below 10 MiB, zero interventions
 in the no-action case, and an observed rollback in each harmful-limit run.
 These ceilings leave approximately 35% CPU and 45% RSS headroom above the
-largest observed no-action values. They are host-specific regression checks,
-not universal release acceptance. Independent foreground and provider gates
-need repeated paired unmanaged/managed baselines before thresholds are set.
+largest observed no-action values. The table below is the host-specific
+regression record. It does not need another baseline run before review.
 
 `bench-foreground.sh` measures a separate synthetic foreground workload:
 scheduled-arrival-to-completion time for a 64 KiB SHA256 job at 20 ms intervals.
@@ -260,15 +259,49 @@ policy. Do not interpret this as actual desktop frame time or an efficacy pass.
 `release/foreground-concurrent.jsonl` was collected while release daemon
 repetitions ran concurrently, so it is explicitly not a clean baseline.
 
-- Establish repeated release-build overhead and latency baselines.
-- Provider recovery, actively serving and competing breadsearch, independent
-  foreground latency, separate device-memory sampling, and one standalone
-  management cycle are now recorded above. Repeated-run noise analysis and a
-  statistically established production latency threshold are still open.
-- Automatic llama.cpp unload remains unavailable: loaded residency is not
-  idle evidence (RAM-79). Record that as a limitation, not a managed-efficacy
-  pass. vLLM is deferred by the operator and is not a simulated pass.
-- Release thresholds have not been established from these preliminary runs.
+## Host-specific regression ceilings
 
-RAM-30 must remain incomplete until those gates are verified. The successful
-shell runs are not evidence that breadram's managed mode improves latency.
+These ceilings are acceptance checks for this Hermes setup and these harnesses.
+They are not universal production SLOs and do not claim that managed mode
+improves desktop latency. A later run fails the gate when it exceeds a ceiling
+or misses a required outcome. Headroom is relative to the largest observed
+value in the cited runs.
+
+| Gate | Evidence | Ceiling |
+| --- | --- | --- |
+| No-action release daemon | `release/daemon-{1,2,3}.jsonl` label `b` | CPU at most 3% of one core, final RSS at most 10 MiB, zero confirmed actions. Observed 2.098-2.211% and 6912-7084 KiB. |
+| Harmful soft limit | same files, label `e` | Exactly one confirmed `cgroup_soft_limit` and one rollback. All three runs did this. |
+| Generic tight limit | `generic.jsonl` | Record the throughput and stall tradeoff. Do not treat a 99% throughput loss or 994 ms of scope stall as an efficacy pass. |
+| Serving protection | `long-window/counter-fresh-journal.jsonl` | At least 40 successful queries, zero failures, zero unloads, model still ready, over at least 120 seconds. |
+| Provider contention | `integrated-ram82/contention-strict.jsonl` | Zero busy-mill unloads, at least one quiet-mill unload, 30 successful queries, zero failed queries. |
+| CPU recovery penalty | `paired-recovery/cpu-{1,2,3}.jsonl` | Record warm and reload latency. Observed reload penalty 0.681-0.768 seconds on this 149,080,928-byte CPU model. A penalty above 2 seconds on this same setup fails the regression check. This is not a daemon-selected model and not a desktop latency SLO. |
+| Foreground probe | `release/foreground-isolated.jsonl` | Zero 20 ms deadline misses. p95 stayed below 0.31 ms in both conditions. This probe does not show a managed-mode improvement. |
+| Standalone management | `standalone-systemd/actions.json` | One confirmed soft limit followed by rollback, with no host bread services mounted. |
+
+Action frequency in the no-action runs is zero. In the harmful-limit runs it is
+one confirmed action and one rollback per 18-second window, about 3.3 confirmed
+actions per minute while the over-budget worker remains. That frequency is
+expected for this synthetic budget, not a steady-state production rate.
+
+Swap I/O is measured in `generic.jsonl`: the loose run has zero `pswpin` and
+`pswpout` deltas, and the tight run has 573 and 540. Those host counters
+include unrelated activity, so they document pressure rather than exclusive
+scope attribution. Scope stall, major faults, and throughput are the
+scope-local tradeoff.
+
+### Explicit limitations
+
+- Automatic llama.cpp unload is unavailable. Loaded residency is not idle
+  evidence (RAM-79). API recovery measurements above are direct router calls,
+  not daemon policy efficacy.
+- vLLM is deferred by the operator. No vLLM result is simulated or counted.
+- Device counters are whole-device context. GTT on this iGPU is shared host
+  RAM and is not dedicated VRAM savings.
+- The foreground probe is a synthetic SHA256 job. It is not desktop frame time.
+- These ceilings are host-specific regression checks. They do not establish a
+  statistical production latency threshold or claim that managed mode makes
+  interactive work faster.
+
+With those limits stated, the measured gates above are complete enough for
+independent review. A repeated noise study would tighten the latency claim,
+but its absence does not erase the recorded outcomes.
