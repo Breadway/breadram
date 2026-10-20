@@ -1021,8 +1021,11 @@ fn run_execution(
     };
     let executor = ChainedExecutor::new(vec![&control, &provider, &jobs]);
     // Sample before this pass writes, preserving a genuine pre-write baseline.
-    let totals = scope_pressure_totals(&fs, &targets);
-    let risen = stall_watch.judge(&totals, now_ms);
+    let (totals, pressure_at_ms) = pressure_sample(
+        || scope_pressure_totals(&fs, &targets),
+        || clock.monotonic_ms(),
+    );
+    let risen = stall_watch.judge(&totals, pressure_at_ms);
     // A soft limit on a scope whose stall rate is readable waits for its
     // second reading, so the baseline it is judged against is genuinely
     // pre-write. A scope with no readable pressure file has no signal to wait
@@ -1088,7 +1091,7 @@ fn run_execution(
         workloads,
         &risen,
         &mut pass,
-        now_ms,
+        pressure_at_ms,
     );
     if left_automatic {
         let restored = coordinator.recover(&control, now_ms);
@@ -1298,6 +1301,18 @@ fn scope_pressure_totals(fs: &RealFs, targets: &ControlTargets) -> Vec<(String, 
         totals.push((target.scope.clone(), reading.some.total_us));
     }
     totals
+}
+
+/// Timestamp the pressure batch after reading it, not at the earlier host
+/// snapshot. Collection latency varies between passes and must be included in
+/// the elapsed time used to calculate stall rates. One batch timestamp still
+/// has bounded within-batch skew; it does not claim per-file precision.
+fn pressure_sample(
+    read: impl FnOnce() -> Vec<(String, u64)>,
+    now: impl FnOnce() -> u64,
+) -> (Vec<(String, u64)>, u64) {
+    let totals = read();
+    (totals, now())
 }
 
 /// The execute step itself, over any executor.
@@ -3179,6 +3194,39 @@ fn owner_uid(path: &Path) -> std::io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_rate_uses_counter_read_spacing_not_snapshot_spacing() {
+        use std::cell::Cell;
+
+        let elapsed = Cell::new(0_u64);
+        let scope = "unit:test.scope".to_string();
+        let mut watch = StallWatch::new();
+        let sample = |read_at, total| {
+            pressure_sample(
+                || {
+                    // Simulate collection consuming time after the snapshot.
+                    elapsed.set(read_at);
+                    vec![(scope.clone(), total)]
+                },
+                || elapsed.get(),
+            )
+        };
+        let (totals, at) = sample(0, 0);
+        watch.judge(&totals, at);
+        let (totals, at) = sample(250, 25_000);
+        watch.judge(&totals, at);
+        assert!(watch.arm(&scope, at));
+
+        // Snapshot spacing would be 250 ms, but collection ends 100 ms later.
+        // Actual pressure remains 10%: 35,000 us over 350 ms. Dividing by the
+        // old snapshot spacing would fabricate a rise to 14% and reverse.
+        let (totals, at) = sample(600, 60_000);
+        assert_eq!(at, 600, "the clock is read after the counters");
+        assert!(watch.judge(&totals, at).is_empty());
+        let (totals, at) = sample(850, 90_000);
+        assert_eq!(watch.judge(&totals, at), vec![scope]);
+    }
     use breadram_core::config::{ActionKind, Automation, Budget};
 
     /// A directory that removes itself when the test ends.
