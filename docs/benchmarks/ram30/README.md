@@ -101,6 +101,17 @@ seconds, zero failures and zero unloads, exit 0. See
 `long-window/{legacy,counter}-fresh-journal.jsonl`. This removes the duplicate
 suppression confound without asserting that RAM-84 has been fixed.
 
+### Reload lifecycle candidate (RAM-84)
+
+With `BREADRAM_BENCH_RELOAD_CYCLE=1`, the contention runner instead waits for
+an idle unload, triggers demand reload, stops sending queries, and requires a
+second confirmed unload after at least 30 seconds of idle. It keeps the same
+provider process, daemon and journal throughout. The RAM-84 candidate
+`37289b0` produced two confirmed unloads, demand reload in 1.05 seconds and
+33.02 seconds before the second idle unload (`reload-cycle/candidate.jsonl`).
+This is pre-review candidate evidence, not an integrated fix claim. The
+default contention workload and its protection assertions are unchanged.
+
 The runner now records binary SHA256 values and whether the query counter is
 actually present, so an old or replaced provider binary cannot be mistaken
 for the fixed build. The first extended run predates those provenance fields.

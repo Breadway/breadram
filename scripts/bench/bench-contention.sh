@@ -138,6 +138,11 @@ timeout 300 systemd-run --user --scope --quiet --collect --unit="$hog_unit" \
     -- python3 "$root/workload.py" 96 280 >/dev/null 2>&1 &
 hogjob=$!
 
+if [ "${BREADRAM_BENCH_RELOAD_CYCLE:-0}" = 1 ]; then
+    python3 "$root/reload-idle-cycle.py" "$sock_a" "$cli" "$ramsock" "unit:$mill_a_unit"
+    exit $?
+fi
+
 # Keep mill-a serving from the start, before any 30 s idle can accrue.
 # mill-b stays quiet the whole window.
 successful_queries=0
