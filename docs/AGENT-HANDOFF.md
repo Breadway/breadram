@@ -77,12 +77,14 @@ What is not there yet, named rather than implied:
   that declares complete tracking is what makes a resident but unused model
   releasable. Nothing infers it.
 - The Ollama adapter is the only one that can act on a single-model server. The
-  llama.cpp adapter (RAM-13) observes servers and, when automation is enabled,
-  can unload one loaded router model, confirmed by the exact model id and its
-  status in the same listing; verified on build 11146 with Qwen3 8B with
-  inference after relief and separately measured host vs device effects
-  (`docs/LLAMACPP.md` records the evidence). Single-model immediate manual
-  sleep is not documented. The
+  llama.cpp adapter (RAM-13) observes servers and implements the documented
+  router unload API, but daemon policy cannot automatically unload a loaded
+  model because residency does not prove idleness. The low-level operation is
+  confirmed by the exact model id and its status in the same listing when it
+  is exercised directly; verified on build 11146 with Qwen3 8B with inference
+  after relief and separately measured host vs device effects
+  (`docs/LLAMACPP.md` records the evidence and the missing idle gate).
+  Single-model immediate manual sleep is not documented. The
   generic hook adapter (RAM-15) also exists and runs under the safeguards in
   `docs/HOOKS.md`. vLLM (RAM-14),
   breadsearch (RAM-18), and the workload mapping for containers and services

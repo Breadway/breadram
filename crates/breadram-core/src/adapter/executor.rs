@@ -594,6 +594,18 @@ impl<'a> AdapterExecutor<'a> {
 }
 
 impl Executor for AdapterExecutor<'_> {
+    fn confirmed_effect_absent(&self, request: &crate::coordinator::ActionRequest) -> bool {
+        // resolve requires a fresh capable owner offering a loaded model and
+        // confirmed idleness. No speculative reload, transport call or write.
+        request.kind == ActionKind::UnloadIdleModel
+            && self.resolve(request).is_ok_and(|operation| {
+                // This proof currently exists only for breadmill's explicit
+                // fresh model_ready status. Other provider protocols retain
+                // default deduplication until their lifecycle is verified.
+                is_breadsearch_url(&operation.request.url)
+            })
+    }
+
     fn supports(&self, kind: ActionKind) -> bool {
         Self::handles(kind) && !self.registry.is_empty()
     }
@@ -1789,6 +1801,63 @@ mod tests {
         match sockets {
             Some(runner) => base.with_socket_runner(runner),
             None => base,
+        }
+    }
+
+    #[test]
+    fn only_a_fresh_idle_loaded_model_proves_an_unload_effect_absent() {
+        for (status, expected) in [
+            (SOCKET_IDLE, true),
+            (SOCKET_UNLOADED, false),
+            (
+                r#"{"type":"status_info","model_ready":true,"in_flight":1,"version":"0.4.0"}"#,
+                false,
+            ),
+        ] {
+            let registry = socket_registry(true);
+            let sockets = FakeSockets::scripted(vec![Ok(status.to_string())]);
+            registry.refresh_sockets(&sockets, 0);
+            let workloads = [socket_workload()];
+            let probes = ScriptedTransport::new();
+            let operations = ScriptedTransport::new();
+            let executor = socket_executor(
+                &registry,
+                &workloads,
+                &probes,
+                &operations,
+                &FixedClock(60_000),
+                Some(&sockets),
+            );
+            assert_eq!(
+                executor.confirmed_effect_absent(&socket_request()),
+                expected,
+                "{status}"
+            );
+            if expected {
+                let too_soon = socket_executor(
+                    &registry,
+                    &workloads,
+                    &probes,
+                    &operations,
+                    &FixedClock(1_000),
+                    Some(&sockets),
+                );
+                assert!(
+                    !too_soon.confirmed_effect_absent(&socket_request()),
+                    "idle grace is not waived"
+                );
+                let mut replaced = socket_request();
+                replaced.target.generation += 1;
+                assert!(
+                    !executor.confirmed_effect_absent(&replaced),
+                    "target identity is not waived"
+                );
+            }
+            assert_eq!(
+                sockets.calls.lock().unwrap().len(),
+                1,
+                "effect check does no I/O"
+            );
         }
     }
 
