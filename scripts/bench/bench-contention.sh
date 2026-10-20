@@ -140,8 +140,15 @@ hogjob=$!
 
 # Keep mill-a serving from the start, before any 30 s idle can accrue.
 # mill-b stays quiet the whole window.
+successful_queries=0
+failed_queries=0
 for _ in $(seq 1 30); do
-    rpc "$sock_a" query "hello world" >/dev/null 2>&1 || true
+    if rpc "$sock_a" query "hello world" >"$base/query.json" 2>"$base/query.err" &&
+        python3 -c 'import json,sys; sys.exit(json.load(sys.stdin).get("type") != "hits")' <"$base/query.json"; then
+        successful_queries=$((successful_queries + 1))
+    else
+        failed_queries=$((failed_queries + 1))
+    fi
     sleep 3
 done
 kill "$hogjob" 2>/dev/null || true
@@ -150,15 +157,17 @@ wait "$hogjob" 2>/dev/null || true
 ready_a_end=$(rpc "$sock_a" status 2>/dev/null | grep -c '"model_ready": *true' || true)
 ready_b_end=$(rpc "$sock_b" status 2>/dev/null | grep -c '"model_ready": *true' || true)
 journal=$("$cli" --socket "$ramsock" actions --json)
-python3 - "$ready_a_end" "$ready_b_end" "$journal" <<'PY'
+python3 - "$ready_a_end" "$ready_b_end" "$journal" "$successful_queries" "$failed_queries" "$mill_a_unit" "$mill_b_unit" <<'PY'
 import json, sys
 ra, rb, journal = int(sys.argv[1]), int(sys.argv[2]), json.loads(sys.argv[3])
+successes, failures = int(sys.argv[4]), int(sys.argv[5])
+busy_scope, quiet_scope = ("unit:" + value for value in sys.argv[6:8])
 by_scope = {}
 for e in journal.get("history", []):
     if e.get("kind") == "unload_idle_model" and e.get("state") == "confirmed":
         by_scope[e.get("scope", "?")] = by_scope.get(e.get("scope", "?"), 0) + 1
-busy_unloads = sum(n for scope, n in by_scope.items() if "-ma-" in scope)
-quiet_unloads = sum(n for scope, n in by_scope.items() if "-mb-" in scope)
+busy_unloads = by_scope.get(busy_scope, 0)
+quiet_unloads = by_scope.get(quiet_scope, 0)
 # End-state readiness is not protection: a query reloads an unloaded model on
 # demand, so a busy mill that was unloaded mid-window still ends up ready.
 # Protection means the busy mill was never unloaded at all.
@@ -168,14 +177,18 @@ result = {
     "busy_mill_still_ready": ra >= 1,
     "quiet_mill_still_ready": rb >= 1,
     "busy_mill_unloads": busy_unloads,
+    "successful_queries": successes,
+    "failed_queries": failures,
     "quiet_mill_unloads": quiet_unloads,
     "confirmed_unloads_by_scope": by_scope,
-    "busy_mill_protected": busy_unloads == 0,
-    "contention_resolved": busy_unloads == 0 and quiet_unloads >= 1 and rb < 1,
+    "busy_mill_protected": busy_unloads == 0 and ra >= 1 and successes == 30 and failures == 0,
+    "contention_resolved": busy_unloads == 0 and quiet_unloads >= 1 and rb < 1 and ra >= 1 and successes == 30 and failures == 0,
 }
 print(json.dumps(result))
 if busy_unloads:
     sys.exit(f"serving protection failed: busy mill was unloaded {busy_unloads} time(s) under continuous queries")
+if ra < 1 or successes != 30 or failures:
+    sys.exit("serving evidence failed: not all queries succeeded or busy model is not ready")
 if not (quiet_unloads >= 1 and rb < 1):
     sys.exit("quiet mill was not unloaded by policy")
 print("ok", file=sys.stderr)
