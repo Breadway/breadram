@@ -2,7 +2,8 @@
 
 Only called by bench-llamacpp.sh after it starts a bounded CPU-only service.
 Reports cgroup charge (including file cache) and summed process RSS separately.
-Device memory is unmeasured, not a fabricated zero. No daemon policy is driven.
+Device counters are whole-device context only, not provider-attributable savings.
+No daemon policy is driven.
 """
 
 import json
@@ -12,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 
+from device_memory import snapshot as device_snapshot
+
 
 def main():
     base, cg, model_path = sys.argv[1:]
@@ -19,8 +22,9 @@ def main():
 
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(base + path, data=data,
-                                     headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            base + path, data=data, headers={"Content-Type": "application/json"}
+        )
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.load(response)
 
@@ -40,8 +44,12 @@ def main():
                     rss += int(line.split()[1]) * 1024
         if not pids:
             raise RuntimeError("provider cgroup disappeared")
-        return {"cgroup_current_bytes": int((cg / "memory.current").read_text()),
-                "summed_process_rss_bytes": rss, "device_bytes": None}
+        return {
+            "cgroup_current_bytes": int((cg / "memory.current").read_text()),
+            "summed_process_rss_bytes": rss,
+            "device_bytes": None,
+            "whole_device_context": device_snapshot(),
+        }
 
     deadline = time.monotonic() + 20
     while True:
@@ -51,20 +59,26 @@ def main():
         except (OSError, urllib.error.URLError):
             if time.monotonic() >= deadline:
                 raise
-            time.sleep(.2)
+            time.sleep(0.2)
 
     def inference():
         start = time.monotonic()
-        result = request("/v1/chat/completions", {
-            "model": "bench-small",
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "max_tokens": 16,
-            "temperature": 0,
-        })
+        result = request(
+            "/v1/chat/completions",
+            {
+                "model": "bench-small",
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "max_tokens": 16,
+                "temperature": 0,
+            },
+        )
         if not result.get("choices"):
             raise RuntimeError("inference returned no choices")
-        return {"latency_s": time.monotonic() - start,
-                "usage": result.get("usage"), "memory": memory()}
+        return {
+            "latency_s": time.monotonic() - start,
+            "usage": result.get("usage"),
+            "memory": memory(),
+        }
 
     cold = inference()
     warm = inference()
@@ -84,21 +98,33 @@ def main():
             break
         if time.monotonic() >= deadline:
             raise RuntimeError(f"unload not confirmed: {listing}")
-        time.sleep(.1)
+        time.sleep(0.1)
     unload_s = time.monotonic() - start
-    time.sleep(.3)
+    time.sleep(0.3)
     after = memory()
     reloaded = inference()
-    print(json.dumps({
-        "scenario": "llamacpp_api_recovery", "cpu_only": True,
-        "daemon_policy_driven": False, "model_path": model_path,
-        "model_file_bytes": pathlib.Path(model_path).stat().st_size,
-        "cold": cold, "warm": warm, "reload": reloaded,
-        "unload_s": unload_s, "unload_confirmed": True,
-        "before_unload": before, "after_unload": after,
-        "rss_reclaimed_bytes": before["summed_process_rss_bytes"] - after["summed_process_rss_bytes"],
-        "cgroup_reclaimed_bytes": before["cgroup_current_bytes"] - after["cgroup_current_bytes"],
-    }))
+    print(
+        json.dumps(
+            {
+                "scenario": "llamacpp_api_recovery",
+                "cpu_only": True,
+                "daemon_policy_driven": False,
+                "model_path": model_path,
+                "model_file_bytes": pathlib.Path(model_path).stat().st_size,
+                "cold": cold,
+                "warm": warm,
+                "reload": reloaded,
+                "unload_s": unload_s,
+                "unload_confirmed": True,
+                "before_unload": before,
+                "after_unload": after,
+                "rss_reclaimed_bytes": before["summed_process_rss_bytes"]
+                - after["summed_process_rss_bytes"],
+                "cgroup_reclaimed_bytes": before["cgroup_current_bytes"]
+                - after["cgroup_current_bytes"],
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@
 #
 # Phase A: after 30 s of quiet (MIN_IDLE_MS) the daemon must unload the idle
 # model itself. Reports RSS before/after and reload latency on demand.
-# Phase B: continuous queries for 45 s must keep the reloaded model resident:
+# Phase B: repeated queries for at least 120 s must keep the model resident:
 # protection, not just efficacy. A second unload in that window fails the run.
 #
 # Never touches the installed breadmill socket, state, or index.
@@ -91,6 +91,9 @@ if ! rpc status 2>/dev/null | grep -q '"version":'; then
     exit 1
 fi
 rss_before_kib=$(bm_rss_kib)
+counter_available=$(rpc status | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("queries_served") is not None).lower())')
+daemon_sha256=$(sha256sum "$daemon" | cut -d ' ' -f 1)
+mill_sha256=$(sha256sum "$mill" | cut -d ' ' -f 1)
 
 # Private daemon: unload only, hair-trigger pressure, fast ticks.
 {
@@ -160,12 +163,22 @@ done
 reload_s=$(( $(date +%s) - reload_start ))
 [ "$reloaded" = 1 ] || { echo "demand reload never completed" >&2; exit 1; }
 
-# Phase B: continuous queries must protect the resident model for 45 s.
+# Phase B deliberately exceeds several idle periods. Record actual successful
+# requests: an error hidden by `|| true` is not serving evidence.
 unloads_before=$daemon_unloaded
-for _ in $(seq 1 15); do
-    rpc query "hello world" >/dev/null 2>&1 || true
+serving_start=$(date +%s)
+successful_queries=0
+failed_queries=0
+for _ in $(seq 1 40); do
+    if rpc query "hello world" >"$base/query.json" 2>"$base/query.err" &&
+        python3 -c 'import json,sys; sys.exit(json.load(sys.stdin).get("type") != "hits")' <"$base/query.json"; then
+        successful_queries=$((successful_queries + 1))
+    else
+        failed_queries=$((failed_queries + 1))
+    fi
     sleep 3
 done
+serving_s=$(( $(date +%s) - serving_start ))
 journal_b=$("$cli" --socket "$ramsock" actions --json)
 unloads_after=$(echo "$journal_b" | python3 -c "
 import json,sys
@@ -175,25 +188,31 @@ print(sum(1 for e in d.get('history', []) if e.get('kind') == 'unload_idle_model
 still_ready=$(rpc status 2>/dev/null | grep -c '"model_ready": *true' || true)
 kill "$hogjob" 2>/dev/null || true
 wait "$hogjob" 2>/dev/null || true
-python3 - "$rss_before_kib" "$rss_after_kib" "$reload_s" "$unloads_before" "$unloads_after" "$still_ready" <<'PY'
+python3 - "$rss_before_kib" "$rss_after_kib" "$reload_s" "$unloads_before" "$unloads_after" "$still_ready" "$successful_queries" "$failed_queries" "$serving_s" "$counter_available" "$daemon_sha256" "$mill_sha256" <<'PY'
 import json, sys
-before, after, reload_s, ub, ua, ready = (int(x) for x in sys.argv[1:])
+before, after, reload_s, ub, ua, ready, successes, failures, serving_s = (int(x) for x in sys.argv[1:10])
+counter_available, daemon_sha256, mill_sha256 = sys.argv[10:]
 result = {
     "scenario": "breadsearch_daemon_driven",
     "daemon_policy_driven": True,
+    "query_counter_available": counter_available == "true",
+    "daemon_sha256": daemon_sha256,
+    "breadmill_sha256": mill_sha256,
     "idle_unload_by_daemon": True,
     "rss_before_kib": before,
     "rss_after_kib": after,
     "rss_freed_kib": before - after,
     "reload_s": reload_s,
-    "serving_window_s": 45,
+    "serving_window_s": serving_s,
+    "successful_queries": successes,
+    "failed_queries": failures,
     "model_still_ready": ready >= 1,
     "unloads_before_window": ub,
     "unloads_after_window": ua,
-    "protection_held": ua == ub and ready >= 1,
+    "protection_held": ua == ub and ready >= 1 and successes == 40 and failures == 0,
 }
 print(json.dumps(result))
-if ua != ub or ready < 1:
+if ua != ub or ready < 1 or successes != 40 or failures:
     sys.exit("serving protection failed: model unloaded under continuous queries")
 print("ok", file=sys.stderr)
 PY

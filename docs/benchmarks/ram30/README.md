@@ -73,6 +73,32 @@ jitter follow-up discovered during review.
 
 ## Open gates
 
+### Extended single-mill investigation (2026-10-20)
+
+The original 45-second serving observation was too short to distinguish the
+polling-gap failure from protection. The harness now requires 40 successful
+query responses over at least 120 seconds and counts query errors as failures.
+The counter-aware experimental breadmill build (`7e5eef9`) with the integrated
+RAM-82 adapter completed 40 queries over 128 seconds with no errors and no
+additional journalled unloads (`long-window/counter-aware.jsonl`). This spans
+more than four 30-second idle periods instead of relying on end-state readiness.
+It is experimental evidence only: PR 16 reached its prerequisite branch,
+but breadsearch PR 12 still has not reached main, so RAM-82 stays unverified.
+
+The runner now records binary SHA256 values and whether the query counter is
+actually present, so an old or replaced provider binary cannot be mistaken
+for the fixed build. The first extended run predates those provenance fields.
+
+### Whole-device context
+
+`device_memory.py` reads DRM GTT and VRAM used/total counters separately from
+host cgroup/RSS samples. Missing, invalid or negative counters remain null;
+two unit tests exercise this. The CPU-only llama router run in
+`release/llamacpp-device-context.jsonl` includes these counters at each phase.
+They describe all workloads on the device, including the live desktop, so no
+provider-specific device savings are inferred from them. GTT is shared host
+RAM on this iGPU and must not be added to host memory as dedicated VRAM.
+
 ### Standalone observation smoke test
 
 `bench-standalone.sh` uses Bubblewrap with private PID/network namespaces and
