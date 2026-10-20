@@ -1,8 +1,11 @@
 # llama.cpp adapter (RAM-13)
 
-This build observes configured servers and, when automation is enabled, can
-unload one loaded router model through the documented `POST /models/unload`,
-confirmed by the exact model id and its status in the same `/models` listing.
+This build observes configured servers. Its low-level adapter implements the
+documented `POST /models/unload` API with exact model-id/status confirmation,
+but **daemon-driven unload of a loaded router model is currently unavailable**.
+Loaded residency reports unknown activity, and neither the adapter nor the
+daemon supplies a complete idle signal for this provider. Policy and executor
+both require confirmed idleness; enabling automation never bypasses them.
 Loading is left to the router's own demand-driven behaviour or to an explicit
 `POST /models/load`, both verified below against a real server.
 
@@ -29,8 +32,11 @@ Failed load and failed observation never prove idle.
 ## Administration
 
 The router documents `POST /models/load` and `POST /models/unload`. When
-automation is enabled, this adapter drives the documented unload for one loaded
-router model, and the effect is confirmed by the structured predicate: the exact
+automation is enabled, the low-level adapter can construct the documented
+unload operation for one loaded router model. This is not sufficient for daemon
+execution: loaded models remain activity-unknown and fail the idle gate.
+If an operation is exercised directly in adapter conformance tests, its effect
+is confirmed by the structured predicate: the exact
 model id must carry the `unloaded` status in the same `/models` entry, so a
 sibling model with a shared substring cannot cross-confirm it. The old
 body-substring confirmation is not used for this. Loading is left to the router's
@@ -62,7 +68,11 @@ scope = "unit:llama.service"
 
 Generic permitted Linux controls remain available without a provider. Registry
 diagnostics state whether router administration is available: unloaded only
-when automation enables the UnloadModel capability, otherwise observation only.
+at the protocol level when automation enables the UnloadModel capability.
+Runtime diagnostics explicitly state the missing activity gate. The automatic
+loaded-model relief path must remain unavailable until trustworthy request
+tracking is implemented; gateway in-flight leases alone only prove activity,
+not complete idleness between requests. Generic controls remain available.
 
 ## Verified against a real server
 
