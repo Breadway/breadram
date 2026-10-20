@@ -121,6 +121,13 @@ pub trait Executor: Send + Sync {
     /// Read-only confirmation that the effect is present.
     fn confirm(&self, request: &ActionRequest) -> Confirmation;
 
+    /// Whether fresh, read-only evidence proves a previously confirmed
+    /// transient effect no longer exists. Unknown stays false. This is not
+    /// permission to apply: all ordinary execution guards must still pass.
+    fn confirmed_effect_absent(&self, _request: &ActionRequest) -> bool {
+        false
+    }
+
     /// The memory the target holds, read before and after a change.
     fn observe(&self, target: &WorkloadId) -> MemoryObservation;
 
@@ -171,6 +178,11 @@ impl<'a> ChainedExecutor<'a> {
 impl Executor for ChainedExecutor<'_> {
     fn supports(&self, kind: ActionKind) -> bool {
         self.for_kind(kind).is_some()
+    }
+
+    fn confirmed_effect_absent(&self, request: &ActionRequest) -> bool {
+        self.for_kind(request.kind)
+            .is_some_and(|executor| executor.confirmed_effect_absent(request))
     }
 
     fn precondition(&self, request: &ActionRequest) -> Precondition {

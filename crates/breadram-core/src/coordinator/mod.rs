@@ -9,7 +9,9 @@
 //!
 //! 1. **Idempotent.** An action's id is derived from its target and kind, so a
 //!    repeated request carries the same id. If that id already has a confirmed
-//!    effect, the duplicate is skipped. A failure does not block a retry.
+//!    effect, the duplicate is skipped. A provider unload whose effect is
+//!    positively observed absent may retry through every normal safety guard;
+//!    generic controls remain deduplicated. A failure does not block a retry.
 //! 2. **Revalidated immediately before running.** The target generation is
 //!    re-checked against the current inventory and the executor is asked whether
 //!    it still supports the action, after planning and right before execution.
@@ -378,7 +380,10 @@ impl Coordinator {
             }};
         }
 
-        if self.journal.has_confirmed(id) {
+        let reloaded_provider = self.journal.has_confirmed(id)
+            && request.kind == ActionKind::UnloadIdleModel
+            && executor.confirmed_effect_absent(request);
+        if self.journal.has_confirmed(id) && !reloaded_provider {
             finish!(
                 ActionState::SkippedDuplicate,
                 "this action already has a confirmed effect".to_string(),

@@ -65,6 +65,13 @@ Activity is `Active` while queries run, files await indexing, or a load
 runs; fresh and quiet is `Idle` with the idle-since instant the policy
 debounces; stale is `Unknown`, which never unloads.
 
+A confirmed unload stays idempotent while the model remains absent or its
+state is unknown. Once fresh status positively reports a resident model again,
+the provider executor can prove the old unload effect absent, allowing another
+unload only through the normal target, capability, idle-grace and policy
+cooldown gates. This narrowly scoped rearming applies to breadmill; it does not
+reset generic cgroup duplicate guards or infer reload from missing data.
+
 ## Measured on this host
 
 Real breadmill (CPU backend, empty index roots, isolated state and socket):
