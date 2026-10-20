@@ -75,19 +75,35 @@ jitter follow-up discovered during review.
 
 ### Extended single-mill investigation (2026-10-20)
 
-The original 45-second serving observation was too short to distinguish the
-polling-gap failure from protection. The harness now requires 40 successful
-query responses over at least 120 seconds and counts query errors as failures.
-The counter-aware experimental breadmill build (`7e5eef9`) with the integrated
-RAM-82 adapter completed 40 queries over 128 seconds with no errors and no
-additional journalled unloads (`long-window/counter-aware.jsonl`). This spans
-more than four 30-second idle periods instead of relying on end-state readiness.
-It is experimental evidence only: PR 16 reached its prerequisite branch,
-but breadsearch PR 12 still has not reached main, so RAM-82 stays unverified.
+The original serving observation reused the journal from its first idle
+unload. Coordinator idempotency (`has_confirmed` for the same workload/action
+ID) suppresses further attempts even after demand reload (RAM-84). Extending
+that same-journal window alone cannot demonstrate protection: the counter-aware
+build stayed ready for 128 seconds, but the legacy control also stayed ready
+for 135 seconds without another unload. Both results are preserved under
+`long-window/` and are inconclusive for activity safety.
+
+The harness now starts a new private daemon with fresh state before the serving
+phase, leaving the provider intact. This removes duplicate suppression from
+the experiment without weakening the product guard. It requires 40 successful
+queries over at least 120 seconds and counts query errors as failures.
+Breadsearch PR 12 has now merged as `cce8e22`; integrated RAM-82 verification
+is being rerun using a binary built from that commit.
 
 The runner now records binary SHA256 values and whether the query counter is
 actually present, so an old or replaced provider binary cannot be mistaken
 for the fixed build. The first extended run predates those provenance fields.
+
+### Repeated paired CPU inference recovery
+
+Three private-router cycles in `paired-recovery/cpu-{1,2,3}.jsonl` compare
+warm inference, unload and reload inference on the same CPU model/config.
+Warm latency was 0.123, 0.125 and 0.198 seconds; reload was 0.890, 0.858 and
+0.879 seconds, with within-run penalties of 0.768, 0.733 and 0.681 seconds.
+Post-reload warm latency was 0.126, 0.129 and 0.115 seconds. This records the
+recovery cost explicitly rather than presenting unload as free relief.
+These are three host-specific API cycles, not daemon-driven model selection
+or a statistically established production latency threshold.
 
 ### Whole-device context
 

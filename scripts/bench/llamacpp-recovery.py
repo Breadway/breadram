@@ -103,6 +103,7 @@ def main():
     time.sleep(0.3)
     after = memory()
     reloaded = inference()
+    warm_after_reload = inference()
     print(
         json.dumps(
             {
@@ -114,6 +115,8 @@ def main():
                 "cold": cold,
                 "warm": warm,
                 "reload": reloaded,
+                "warm_after_reload": warm_after_reload,
+                "reload_penalty_s": reloaded["latency_s"] - warm["latency_s"],
                 "unload_s": unload_s,
                 "unload_confirmed": True,
                 "before_unload": before,
