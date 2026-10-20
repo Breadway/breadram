@@ -1,7 +1,9 @@
 //! The llama.cpp server adapter.
 //!
 //! This adapter observes documented idle-timer-exempt endpoints and, when
-//! automation is enabled, drives the router's documented unload API.
+//! automation is enabled, exposes the router's documented unload operation
+//! to conformance callers. Daemon policy still cannot unload a loaded model
+//! without complete idle evidence, which this adapter does not yet provide.
 //! Correlated per-model status confirmation is implemented and verified
 //! against a real server (see docs/LLAMACPP.md): unload, reload, inference
 //! after relief, and separately measured host and device effects.
@@ -815,6 +817,37 @@ mod tests {
                 format!("{ENDPOINT}{PROPS_PATH}"),
             ]
         );
+    }
+
+    #[test]
+    fn automation_never_turns_loaded_residency_into_confirmed_idleness() {
+        let adapter = adapter().with_capabilities(AdapterCapabilities::configured(&[
+            AdapterCapability::Discovery,
+            AdapterCapability::Inventory,
+            AdapterCapability::Activity,
+            AdapterCapability::UnloadModel,
+        ]));
+        for at in [1_000, 61_000, 121_000] {
+            observe_all(
+                &adapter,
+                at,
+                vec![
+                    (HEALTH_PATH, ok(r#"{"status":"ok"}"#)),
+                    (
+                        MODELS_PATH,
+                        ok(r#"{"data":[{"id":"m1","status":{"value":"loaded"}}]}"#),
+                    ),
+                ],
+            );
+            let evidence = adapter.activity(&workload(SCOPE));
+            assert_eq!(evidence, ActivityEvidence::Unknown);
+            assert!(!evidence.is_confirmed_idle(at, 30_000));
+        }
+        // The protocol operation remains implemented, but no idle evidence is
+        // fabricated merely to make that low-level API reachable in policy.
+        assert!(adapter
+            .operation(ActionKind::UnloadIdleModel, &workload(SCOPE))
+            .is_some());
     }
 
     #[test]

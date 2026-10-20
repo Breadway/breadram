@@ -544,7 +544,7 @@ impl AdapterRegistry {
                     ));
                     if provider.allow_automation {
                         notes.push(format!(
-                            "provider {} may unload a router model when automation allows it; the unload is confirmed by the exact model id and its status, and no host or device memory change is measured",
+                            "provider {} has a router unload API, but automatic unload of a loaded model is unavailable: residency does not prove idleness and this adapter has no complete request activity signal; native sleep remains observed, and no host or device memory change is measured",
                             provider.name
                         ));
                     } else {
@@ -837,6 +837,28 @@ impl ActivitySource for RegistryActivity<'_> {
 mod tests {
     use super::*;
     use crate::inventory::{ControlLevel, MemoryAccounting};
+
+    #[test]
+    fn llama_automation_note_does_not_claim_loaded_model_relief() {
+        let config = Config::from_toml(
+            r#"
+[[providers]]
+name = "llama"
+kind = "llama_cpp"
+url = "http://127.0.0.1:8080"
+scope = "unit:llama.service"
+allow_automation = true
+"#,
+        )
+        .expect("valid local provider");
+        let (_, notes) = AdapterRegistry::from_config(&config);
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("automatic unload of a loaded model is unavailable")));
+        assert!(!notes
+            .iter()
+            .any(|note| note.contains("may unload a router model")));
+    }
 
     fn workload(scope: &str) -> Workload {
         Workload {
