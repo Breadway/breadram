@@ -21,12 +21,12 @@ sample_scope() {
         current=$(cat "/sys/fs/cgroup${cg}/memory.current" 2>/dev/null || true)
         peak=$(cat "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null || true)
         if [ -r "/sys/fs/cgroup${cg}/memory.pressure" ]; then
-            pressure=$(awk '/^some/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure" 2>/dev/null || echo 0)
-            full=$(awk '/^full/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure" 2>/dev/null || echo 0)
+            pressure=$(awk '/^some/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure" 2>/dev/null || true)
+            full=$(awk '/^full/ { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { split($i, a, "="); print a[2] } }' "/sys/fs/cgroup${cg}/memory.pressure" 2>/dev/null || true)
         fi
         if [ -r "/sys/fs/cgroup${cg}/memory.stat" ]; then
-            pgfault=$(awk '/^pgfault / { print $2 }' "/sys/fs/cgroup${cg}/memory.stat" 2>/dev/null || echo 0)
-            pgmajfault=$(awk '/^pgmajfault / { print $2 }' "/sys/fs/cgroup${cg}/memory.stat" 2>/dev/null || echo 0)
+            pgfault=$(awk '/^pgfault / { print $2 }' "/sys/fs/cgroup${cg}/memory.stat" 2>/dev/null || true)
+            pgmajfault=$(awk '/^pgmajfault / { print $2 }' "/sys/fs/cgroup${cg}/memory.stat" 2>/dev/null || true)
         fi
     fi
     for metric in current peak pressure full pgfault pgmajfault; do
