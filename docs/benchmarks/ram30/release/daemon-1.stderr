@@ -1,0 +1,2 @@
+idle daemon rss=7008KiB jiffies=38 journal={} tight rounds=4409 p50=4.275ms journal={'rolled_back': 1, 'confirmed': 1}
+ok

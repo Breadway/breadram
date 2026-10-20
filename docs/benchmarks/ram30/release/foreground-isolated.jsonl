@@ -1,0 +1,2 @@
+{"scenario": "foreground", "samples": 400, "interval_ms": 20, "wall_s": 7.980266649999976, "p50_ms": 0.21537700104090618, "p95_ms": 0.30141000024741516, "p99_ms": 0.4285180002625566, "max_ms": 0.9179500002574059, "deadline_misses": 0, "label": "baseline"}
+{"scenario": "foreground", "samples": 400, "interval_ms": 20, "wall_s": 7.980276530000083, "p50_ms": 0.19486399924062425, "p95_ms": 0.28243499946256634, "p99_ms": 0.3924350003217114, "max_ms": 0.4173359993728809, "deadline_misses": 0, "label": "pressured"}

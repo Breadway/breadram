@@ -1,0 +1,1 @@
+{"scenario": "provider_reload_idle_cycle", "confirmed_unloads": 2, "same_daemon": true, "demand_reload_s": 1.054865207000148, "second_idle_s": 33.02316041599988, "passed": true}

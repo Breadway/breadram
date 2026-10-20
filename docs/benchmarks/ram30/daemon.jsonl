@@ -1,0 +1,2 @@
+{"scenario": "daemon", "label": "b", "budget_bytes": 0, "exit": 0, "rounds": 5288, "p50_ms": 3.235, "p95_ms": 4.115, "daemon_rss_start_kb": 14336, "daemon_rss_end_kb": 14736, "daemon_jiffies": 85, "journal_states": {}, "journal_len": 0, "reversal_observed": false}
+{"scenario": "daemon", "label": "e", "budget_bytes": 16777216, "exit": 0, "rounds": 4257, "p50_ms": 3.559, "p95_ms": 4.985, "daemon_rss_start_kb": 14288, "daemon_rss_end_kb": 14764, "daemon_jiffies": 100, "journal_states": {"confirmed": 1}, "journal_len": 1, "reversal_observed": false}

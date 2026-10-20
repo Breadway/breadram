@@ -1,0 +1,55 @@
+{
+  "plan": {
+    "state": "critical",
+    "channel": "automatic",
+    "would_execute": true,
+    "actions": [],
+    "explanation": [
+      "unit:bench-worker.service: CgroupSoftLimit already proved ineffective here, escalating past it",
+      "unit:systemd-journald.service: no eligible action for its current state",
+      "unit:bench-ram.service: no eligible action for its current state",
+      "unit:init.scope: no eligible action for its current state",
+      "unit:systemd-userdbd.service: no eligible action for its current state",
+      "unit:systemd-nsresourced.service: no eligible action for its current state",
+      "unit:systemd-logind.service: no eligible action for its current state",
+      "nothing eligible was planned, remaining in observation"
+    ],
+    "observed_at_ms": 9689019
+  },
+  "history": [
+    {
+      "id": 655131525538988321,
+      "scope": "systemd:bench-worker.service:MemoryHigh",
+      "kind": null,
+      "state": "rolled_back",
+      "at_ms": 9661020,
+      "reason": "restored systemd:bench-worker.service:MemoryHigh to its original value",
+      "requested_host_ram_delta": null,
+      "observed_host_ram_delta": null,
+      "requested_device_ram_delta": null,
+      "observed_device_ram_delta": null,
+      "owned_values": []
+    },
+    {
+      "id": 655131525538988321,
+      "scope": "unit:bench-worker.service",
+      "kind": "cgroup_soft_limit",
+      "state": "confirmed",
+      "at_ms": 9660020,
+      "reason": "it is 97021952 bytes over its 16777216 byte effective budget, a bounded limit reclaims that",
+      "requested_host_ram_delta": -97021952,
+      "observed_host_ram_delta": -53248,
+      "requested_device_ram_delta": 0,
+      "observed_device_ram_delta": null,
+      "owned_values": [
+        {
+          "key": "systemd:bench-worker.service:MemoryHigh",
+          "original": "infinity",
+          "last_applied": "16777216"
+        }
+      ]
+    }
+  ],
+  "history_capacity": 10000,
+  "history_note": null
+}

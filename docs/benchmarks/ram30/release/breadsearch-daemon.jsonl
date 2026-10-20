@@ -1,0 +1,1 @@
+{"scenario": "breadsearch_daemon_driven", "daemon_policy_driven": true, "idle_unload_by_daemon": true, "rss_before_kib": 872140, "rss_after_kib": 49348, "rss_freed_kib": 822792, "reload_s": 3, "serving_window_s": 45, "model_still_ready": true, "unloads_before_window": 1, "unloads_after_window": 1, "protection_held": true}

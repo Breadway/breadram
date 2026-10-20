@@ -1,0 +1,94 @@
+{
+  "mode": "monitor",
+  "version": "0.1.0",
+  "observed_at_ms": 11,
+  "available_bytes": 21824503808,
+  "total_bytes": 32891170816,
+  "workloads": 1,
+  "capabilities": {
+    "capabilities": [
+      {
+        "name": "meminfo",
+        "state": {
+          "state": "available"
+        }
+      },
+      {
+        "name": "psi",
+        "state": {
+          "state": "available"
+        }
+      },
+      {
+        "name": "swap_activity",
+        "state": {
+          "state": "available"
+        }
+      },
+      {
+        "name": "cgroup_v2",
+        "state": {
+          "state": "unavailable",
+          "reason": "cgroup v2 unified hierarchy not detected"
+        }
+      }
+    ]
+  }
+}
+{
+  "observed_at_ms": 11,
+  "workloads": [
+    {
+      "scope": "cgroup:/",
+      "generation": 875930,
+      "name": "",
+      "processes": 4,
+      "cgroup_bytes": null,
+      "rss_bytes": 13254656,
+      "estimated": true,
+      "control": "eligible",
+      "priority": "normal",
+      "priority_source": "standalone default; missing activity is not idle",
+      "limit_bytes": null
+    }
+  ],
+  "capabilities": {
+    "capabilities": [
+      {
+        "name": "proc_inventory",
+        "state": {
+          "state": "available"
+        }
+      }
+    ]
+  }
+}
+{
+  "capabilities": [
+    {
+      "name": "meminfo",
+      "state": {
+        "state": "available"
+      }
+    },
+    {
+      "name": "psi",
+      "state": {
+        "state": "available"
+      }
+    },
+    {
+      "name": "swap_activity",
+      "state": {
+        "state": "available"
+      }
+    },
+    {
+      "name": "cgroup_v2",
+      "state": {
+        "state": "unavailable",
+        "reason": "cgroup v2 unified hierarchy not detected"
+      }
+    }
+  ]
+}
