@@ -15,12 +15,14 @@ RestartSec=5
 # Hardening: breadram observes through /proc and cgroupfs and applies controls
 # through the user manager, so it needs no privilege and writes no cgroup file
 # directly. These options keep exactly that access (see docs/INSTALL.md).
+# ProtectKernelModules and ProtectKernelLogs are deliberately absent: a user
+# manager holds no capabilities, so systemd's pre-exec capability drop fails
+# with 218/CAPABILITIES on systemd 255 before ExecStart runs. They are only
+# valid in a unit started by a privileged system manager.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectControlGroups=yes
 ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
 RestrictSUIDSGID=true
 PrivateTmp=true
 # Writable by design: the socket under $XDG_RUNTIME_DIR, owned values under

@@ -69,12 +69,25 @@ when that is the intent.
 ## Hardening
 
 The unit sets `NoNewPrivileges`, `ProtectSystem=strict`,
-`ProtectControlGroups=yes`, and related options (see
+`ProtectControlGroups=yes`, `ProtectKernelTunables=true`, `RestrictSUIDSGID`,
+`PrivateTmp`, and explicit `ReadWritePaths` (see
 `packaging/breadram.service`). They were chosen so the three things breadram
 needs keep working: reading `/proc` and cgroupfs, talking to the user
 manager for controls, and writing its socket and state. If a hardened option
 ever blocks a platform, the failure surfaces as a degraded capability with a
 reason, not a silent no-op.
+
+`ProtectKernelModules` and `ProtectKernelLogs` are deliberately not part of the
+user unit. Both make systemd's pre-exec child drop capabilities from the
+bounding set with `prctl(PR_CAPBSET_DROP)`. A user manager runs without
+capabilities, so on systemd 255 the drop returns `EPERM` and the service fails
+before `ExecStart` with `218/CAPABILITIES` ("Failed to drop capabilities:
+Operation not permitted"). That is a start failure, not a sandbox that simply
+does less, so do not add either key to a user unit or user drop-in. They are
+valid only in a unit started by the privileged system manager; a system-scoped
+breadram unit, if one is ever shipped, may set them. The packaging test in
+`crates/breadramd/tests/packaging.rs` fails if a user-scoped unit or drop-in
+sets either property, and `bash ci/check.sh` runs it.
 
 ## Headless and standalone
 
@@ -94,5 +107,10 @@ opt into it explicitly with `--profile desktop` or by setting
 - The service fails right after editing the config: the file failed
   validation and the previous settings were kept. `journalctl --user -u
   breadram` shows the reason; fix the file and restart.
+- A start fails with `218/CAPABILITIES` and "Failed to drop capabilities:
+  Operation not permitted": a local drop-in has re-added
+  `ProtectKernelModules` or `ProtectKernelLogs` to the user unit. Remove the
+  key; see Hardening above for why the user manager cannot apply it.
 - `systemd-analyze verify ~/.config/systemd/user/breadram.service` checks
-  the unit without starting anything.
+  the unit without starting anything. It validates syntax and paths, not the
+  manager's capabilities, so it does not reproduce this failure.
