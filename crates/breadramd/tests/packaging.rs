@@ -89,6 +89,142 @@ fn the_unit_starts_breadramd_with_the_shipped_config() {
     );
 }
 
+/// Which manager reads a unit file: the per-user manager or the privileged
+/// system manager. A unit under a `system` directory, or one enabled for a
+/// system target, is system-scoped; everything else in packaging is installed
+/// into a user unit directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitScope {
+    User,
+    System,
+}
+
+const SYSTEM_ONLY_SANDBOX_KEYS: [&str; 2] = ["ProtectKernelModules", "ProtectKernelLogs"];
+
+fn unit_scope(path: &Path, text: &str) -> UnitScope {
+    if path
+        .components()
+        .any(|part| part.as_os_str() == std::ffi::OsStr::new("system"))
+    {
+        return UnitScope::System;
+    }
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = name.to_ascii_lowercase();
+            continue;
+        }
+        if section == "install" {
+            if let Some(targets) = line.strip_prefix("WantedBy=") {
+                if targets
+                    .split_whitespace()
+                    .any(|target| matches!(target, "multi-user.target" | "graphical.target"))
+                {
+                    return UnitScope::System;
+                }
+            }
+        }
+    }
+    UnitScope::User
+}
+
+/// The system-only sandbox key a unit or drop-in sets, if any. Any assignment
+/// counts, including `=false`: a user manager must not need these keys at all.
+fn system_only_sandbox_key(text: &str) -> Option<&'static str> {
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        for key in SYSTEM_ONLY_SANDBOX_KEYS {
+            if let Some(rest) = line.strip_prefix(key) {
+                if rest.trim_start().starts_with('=') {
+                    return Some(key);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn collect_unit_files(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read the packaging directory") {
+        let path = entry.expect("read a packaging entry").path();
+        if path.is_dir() {
+            collect_unit_files(&path, found);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                [".service", ".socket", ".target", ".timer", ".path", ".conf"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+            })
+        {
+            found.push(path);
+        }
+    }
+}
+
+#[test]
+fn the_user_unit_omits_system_only_sandbox_keys() {
+    let path = packaging_dir().join("breadram.service");
+    let text = read_unit();
+    assert_eq!(unit_scope(&path, &text), UnitScope::User);
+    if let Some(key) = system_only_sandbox_key(&text) {
+        panic!(
+            "{key} needs a privileged system manager; a user manager fails with \
+             218/CAPABILITIES on systemd 255"
+        );
+    }
+}
+
+#[test]
+fn shipped_user_units_and_drop_ins_omit_system_only_sandbox_keys() {
+    let root = packaging_dir();
+    let mut files = Vec::new();
+    collect_unit_files(&root, &mut files);
+    assert!(
+        files.iter().any(|path| path
+            .file_name()
+            .is_some_and(|name| name == "breadram.service")),
+        "the shipped unit is present"
+    );
+    let mut user_files = 0;
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("read a shipped unit file");
+        if unit_scope(&path, &text) == UnitScope::System {
+            continue;
+        }
+        user_files += 1;
+        if let Some(key) = system_only_sandbox_key(&text) {
+            panic!(
+                "{} is installed into a user manager but sets {key}; move it to a \
+                 system-scoped unit",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        user_files > 0,
+        "at least one user-scoped artifact is shipped"
+    );
+}
+
+#[test]
+fn system_scoped_units_may_keep_the_sandbox_keys() {
+    let text = "[Service]\n\
+                ProtectKernelModules=true\n\
+                ProtectKernelLogs=yes\n\
+                \n\
+                [Install]\n\
+                WantedBy=multi-user.target\n";
+    let path = Path::new("packaging/system/breadram.service");
+    assert_eq!(unit_scope(path, text), UnitScope::System);
+    assert_eq!(system_only_sandbox_key(text), Some("ProtectKernelModules"));
+}
+
 #[test]
 fn the_unit_passes_systemd_analyze_when_available() {
     if Command::new("systemd-analyze")
