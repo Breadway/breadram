@@ -1,4 +1,4 @@
-# breadram: bread event integration
+# ram: bread event integration
 
 breadram is a standalone memory manager: it works exactly the same with or
 without `breadd` running. When breadd *is* present and reports a compatible
